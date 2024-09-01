@@ -1,0 +1,71 @@
+// Whitespace and Comments
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!NEWLINE ~ ANY)*  ~ NEWLINE}        // Single-line comments
+BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" } // Block-style comments
+
+// Tokens
+IDENTIFIER      = @{ (ASCII_ALPHANUMERIC | "_")+ }
+INTEGER         = @{ ASCII_DIGIT+ }
+STRING_LITERAL  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+BOOLEAN_LITERAL = { "true" | "false" }
+
+KEYWORD         = { "if" | "else" | "for" | "match" | "function" | "return" }
+PUNCTUATION     = { "{" | "}" | "(" | ")" | "[" | "]" | ";" | "," | ":" }
+
+operation = _{ add | subtract | multiply | divide | power | and | or | lt | gt | eq}
+//     assign   = { "=" }
+    add      = { "+" }
+    subtract = { "-" }
+    multiply = { "*" }
+    divide   = { "/" }
+    power    = { "^" }
+    and      = { "&&" }
+    or       = { "||" }
+    lt       = { "<" }
+    gt       = { ">" }
+    eq       = { "==" }
+
+// Types
+type            = { "void" | "int" | "string" | "boolean" | IDENTIFIER }
+return_type     = { ":" ~ type }
+optional_return_type = _{ return_type? }
+// Grammar Rules
+empty             = _{ WHITESPACE* }
+program           = { SOI ~ statement* ~ EOI }
+statement         = { var_decl ~";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
+assignment        = { IDENTIFIER ~ "=" ~ expression }
+empty_params      = { "(" ~WHITESPACE*~ ")" }
+var_decl          = { IDENTIFIER ~ ":" ~ type ~ "=" ~ expression }
+func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
+param_list        = { (IDENTIFIER ~ ":" ~ type ~ ("," ~ IDENTIFIER ~ ":" ~ type)*) }
+struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ "}" }
+struct_field_decl = { IDENTIFIER ~ ":" ~ type ~ ";" }
+
+control_flow = {
+    if_expr | for_expr | match_expr
+}
+
+if_expr = { "if" ~ "(" ~ expression ~ ")" ~ "{" ~ statement* ~ "}" ~ else_if_expr* ~ else_expr? }
+else_if_expr = { "else" ~ "if" ~ "(" ~ expression ~ ")" ~ "{" ~ statement* ~ "}" }
+else_expr = { "else" ~ "{" ~ statement* ~ "}" }
+
+for_init     = { var_decl | assignment | empty }
+for_cond     = { expression | empty }
+for_update   = { assignment | empty }
+for_expr     = { "for" ~ (for_in | for_classic | for_infinite) ~ "{" ~ statement* ~ "}" }
+for_in       = { IDENTIFIER ~ "in" ~ expression }
+for_classic  = { "(" ~ for_init ~ ";" ~ for_cond ~ ";" ~ for_update ~ ")" }
+for_infinite = { "(" ~ expression? ~ ")" }
+match_expr   = { "match" ~ "(" ~ expression ~ ")" ~ "{" ~ match_case* ~ "}" }
+
+match_case      = { "case" ~ expression ~ ":" ~ "{" ~ statement* ~ "}" }
+
+print           = { "print" ~ "(" ~ expression ~ ")" ~ ";" }
+input           = { "input" ~ "(" ~ ")" ~ ";" }
+io              = { print | input }
+
+sk_return        = { "return" ~ expression ~ ";" }
+expression      = { primary ~ (operation ~ primary)* }
+primary         = { "(" ~ expression ~ ")" |  func_call | literal | IDENTIFIER }
+literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
+func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
