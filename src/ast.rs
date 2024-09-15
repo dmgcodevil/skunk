@@ -120,6 +120,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
             create_ast(pairs.next().unwrap())
         }
         Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
+        Rule::member_access => Node::Identifier(create_identifier(pair)),
         Rule::func_call => create_function_call(pair),
         Rule::sk_return => {
             let mut pairs = pair.into_inner();
@@ -292,7 +293,16 @@ fn create_expression(pair: Pair<Rule>) -> Node {
 /// panics if rule != Rule::IDENTIFIER
 fn create_identifier(pair: Pair<Rule>) -> String {
     match pair.as_rule() {
-        Rule::IDENTIFIER => pair.as_str().to_string(),
+        Rule::IDENTIFIER => {
+            pair.as_str().to_string()
+        }
+        Rule::member_access => {
+            let mut v: Vec<String> = Vec::new();
+            for p in pair.into_inner() {
+                v.push(create_identifier(p));
+            }
+            v.join(".")
+        }
         _ => panic!("not identifier rule {}", pair),
     }
 }
@@ -1164,6 +1174,32 @@ mod tests {
                     },
                     Node::EOI
                 ])
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_member_access() {
+        let source_code = r#"
+            f: Foo = Foo();
+            f.a = 1;
+        "#;
+        println!("{:?}", parse(source_code));
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        var_type: Type::Custom("Foo".to_string()),
+                        name: "f".to_string(),
+                        value: Box::new(Node::FunctionCall {
+                            name: "Foo".to_string(),
+                            arguments: Vec::new()
+                        })
+                    }, Node::Assignment {
+                        identifier: "f.a".to_string(),
+                        value: Box::new(Node::Literal(Literal::Integer(1)))
+                    }, Node::EOI])
             },
             parse(source_code)
         );

@@ -33,7 +33,7 @@ optional_return_type = _{ return_type? }
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
 statement         = { var_decl ~";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
-assignment        = { IDENTIFIER ~ "=" ~ expression }
+assignment        = { member_access ~ "=" ~ expression }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 var_decl          = { IDENTIFIER ~ ":" ~ type ~ "=" ~ expression }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
@@ -66,6 +66,8 @@ io              = { print | input }
 
 sk_return        = { "return" ~ expression ~ ";" }
 expression      = { primary ~ (operation ~ primary)* }
-primary         = { "(" ~ expression ~ ")" |  func_call | literal | IDENTIFIER }
+primary         = { literal | func_call | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
+
+member_access   = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
