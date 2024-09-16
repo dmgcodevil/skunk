@@ -1,3 +1,4 @@
+use crate::ast::Node::StructInitialization;
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -56,6 +57,10 @@ pub enum Node {
         name: String,         // The function name
         arguments: Vec<Node>, // The arguments are a list of expression nodes
     },
+    StructInitialization {
+        name: String,
+        fields: Vec<(String, Node)>, // List of field initializations (name, value)
+    },
     EOI,
     EMPTY,
 }
@@ -85,7 +90,7 @@ pub enum Operator {
     Not,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Type {
     Void,
     Int,
@@ -122,6 +127,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
         Rule::member_access => Node::Identifier(create_identifier(pair)),
         Rule::func_call => create_function_call(pair),
+        Rule::struct_init => create_struct_init(pair),
         Rule::sk_return => {
             let mut pairs = pair.into_inner();
             Node::Return(Box::new(create_ast(pairs.next().unwrap())))
@@ -190,6 +196,27 @@ fn create_function_call(pair: Pair<Rule>) -> Node {
         }
     }
     Node::FunctionCall { name, arguments }
+}
+
+fn create_struct_init(pair: Pair<Rule>) -> Node {
+    println!("{:?}", pair);
+    let mut inner_pairs = pair.into_inner();
+    let name_pair = inner_pairs.next().unwrap();
+    let name = create_identifier(name_pair);
+    let mut init_field_list = inner_pairs.next().unwrap().into_inner();
+    let mut fields: Vec<(String, Node)> = Vec::new();
+    while let Some(p) = init_field_list.next() {
+        match p.as_rule() {
+            Rule::init_field => {
+                let mut init_field_pairs = p.into_inner();
+                let field_name = init_field_pairs.next().unwrap().as_str().to_string();
+                let body = create_ast(init_field_pairs.next().unwrap());
+                fields.push((field_name, body));
+            }
+            _ => panic!("unsupported rule {}", p),
+        }
+    }
+    StructInitialization { name, fields }
 }
 
 fn create_type_from_str(s: &str) -> Type {
@@ -293,9 +320,7 @@ fn create_expression(pair: Pair<Rule>) -> Node {
 /// panics if rule != Rule::IDENTIFIER
 fn create_identifier(pair: Pair<Rule>) -> String {
     match pair.as_rule() {
-        Rule::IDENTIFIER => {
-            pair.as_str().to_string()
-        }
+        Rule::IDENTIFIER => pair.as_str().to_string(),
         Rule::member_access => {
             let mut v: Vec<String> = Vec::new();
             for p in pair.into_inner() {
@@ -453,7 +478,7 @@ fn create_for_classic(pair: Pair<Rule>) -> Node {
     }
 }
 
-fn parse(code: &str) -> Node {
+pub fn parse(code: &str) -> Node {
     match SkunkParser::parse(Rule::program, code) {
         Ok(pairs) => {
             pretty_print(pairs.clone().next().unwrap(), 0);
@@ -1185,7 +1210,6 @@ mod tests {
             f: Foo = Foo();
             f.a = 1;
         "#;
-        println!("{:?}", parse(source_code));
         assert_eq!(
             Node::Program {
                 statements: Vec::from([
@@ -1196,12 +1220,44 @@ mod tests {
                             name: "Foo".to_string(),
                             arguments: Vec::new()
                         })
-                    }, Node::Assignment {
+                    },
+                    Node::Assignment {
                         identifier: "f.a".to_string(),
                         value: Box::new(Node::Literal(Literal::Integer(1)))
-                    }, Node::EOI])
+                    },
+                    Node::EOI
+                ])
             },
             parse(source_code)
         );
+    }
+
+    #[test]
+    fn test_instance_creation() {
+        let source_code = r#"
+            p:Point = Point {
+                x: 0,
+                y: 1
+            };
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        var_type: Type::Custom("Point".to_string()),
+                        name: "p".to_string(),
+                        value: Box::new(Node::StructInitialization {
+                            name: "Point".to_string(),
+                            fields: Vec::from([
+                                ("x".to_string(), Node::Literal(Literal::Integer(0))),
+                                ("y".to_string(), Node::Literal(Literal::Integer(1)))
+                            ])
+                        })
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
     }
 }

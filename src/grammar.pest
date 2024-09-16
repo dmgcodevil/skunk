@@ -41,6 +41,11 @@ param_list        = { (IDENTIFIER ~ ":" ~ type ~ ("," ~ IDENTIFIER ~ ":" ~ type)
 struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ "}" }
 struct_field_decl = { IDENTIFIER ~ ":" ~ type ~ ";" }
 
+// Struct Initialization
+struct_init        = { IDENTIFIER ~ "{" ~ init_field_list? ~ "}" }
+init_field_list    = { init_field ~ ("," ~ init_field)* }
+init_field         = { IDENTIFIER ~ ":" ~ expression }
+
 control_flow = {
     if_expr | for_expr | match_expr
 }
@@ -66,7 +71,7 @@ io              = { print | input }
 
 sk_return        = { "return" ~ expression ~ ";" }
 expression      = { primary ~ (operation ~ primary)* }
-primary         = { literal | func_call | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { literal | func_call | struct_init | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
