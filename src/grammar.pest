@@ -12,7 +12,7 @@ BOOLEAN_LITERAL = { "true" | "false" }
 KEYWORD         = { "if" | "else" | "for" | "match" | "function" | "return" }
 PUNCTUATION     = { "{" | "}" | "(" | ")" | "[" | "]" | ";" | "," | ":" }
 
-operation = _{ add | subtract | multiply | divide | power | and | or | lt | gt | eq}
+operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt | gte| gt | eq }
 //     assign   = { "=" }
     add      = { "+" }
     subtract = { "-" }
@@ -22,7 +22,9 @@ operation = _{ add | subtract | multiply | divide | power | and | or | lt | gt |
     and      = { "&&" }
     or       = { "||" }
     lt       = { "<" }
+    lte      = { "<=" }
     gt       = { ">" }
+    gte      = { ">=" }
     eq       = { "==" }
 
 // Types

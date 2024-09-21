@@ -4,7 +4,7 @@ use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::Parser;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Node {
     Program {
         statements: Vec<Node>,
@@ -12,7 +12,7 @@ pub enum Node {
     // Statements
     StructDeclaration {
         name: String,
-        declarations: Vec<Node>,
+        declarations: Vec<(String, Type)>,
     },
     VariableDeclaration {
         var_type: Type,
@@ -65,14 +65,14 @@ pub enum Node {
     EMPTY,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Literal {
     Integer(i64),
     StringLiteral(String),
     Boolean(bool),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Operator {
     Add,
     Subtract,
@@ -97,6 +97,27 @@ pub enum Type {
     String,
     Boolean,
     Custom(String), // Custom types like structs
+}
+
+pub fn type_to_string(t: &Type) -> String {
+    match t {
+        Type::Void => "void".to_string(),
+        Type::Int => "int".to_string(),
+        Type::String => "string".to_string(),
+        Type::Boolean => "boolean".to_string(),
+        Type::Custom(v) => v.to_string(),
+    }
+}
+
+pub fn extract_struct_field(field: &Node) -> (String, Type) {
+    match field {
+        Node::VariableDeclaration {
+            name,
+            var_type,
+            value,
+        } => ((*name).clone(), (*var_type).clone()),
+        _ => panic!("expected VariableDeclaration node but: {:?}", field),
+    }
 }
 
 fn create_ast(pair: Pair<Rule>) -> Node {
@@ -168,7 +189,9 @@ lazy_static::lazy_static! {
             .op(Op::infix(or, Left))
             .op(Op::infix(and, Left))
             .op(Op::infix(lt, Left))
+            .op(Op::infix(lte, Left))
             .op(Op::infix(gt, Left))
+            .op(Op::infix(gte, Left))
             .op(Op::infix(eq, Left))
 };
 }
@@ -236,14 +259,21 @@ fn create_type(pair: Pair<Rule>) -> Type {
 fn create_struct_decl(pair: Pair<Rule>) -> Node {
     let mut inner_pairs = pair.into_inner();
     let name = inner_pairs.next().unwrap().as_str().to_string();
-    let mut declarations: Vec<Node> = Vec::new();
+    let mut declarations: Vec<(String, Type)> = Vec::new();
     while let Some(p) = inner_pairs.next() {
         match p.as_rule() {
-            Rule::struct_field_decl => declarations.push(create_var_decl(p)),
+            Rule::struct_field_decl => declarations.push(create_struct_field_dec(p)),
             _ => panic!("unsupported rule {}", p),
         }
     }
     Node::StructDeclaration { name, declarations }
+}
+
+fn create_struct_field_dec(pair: Pair<Rule>) -> (String, Type) {
+    let mut inner_pairs = pair.into_inner();
+    let field_name = inner_pairs.next().unwrap().as_str().to_string();
+    let field_type = create_type_from_str(inner_pairs.next().unwrap().as_str());
+    (field_name, field_type)
 }
 
 fn create_var_decl(pair: Pair<Rule>) -> Node {
@@ -302,8 +332,10 @@ fn create_expression(pair: Pair<Rule>) -> Node {
                 Rule::and => Operator::And,
                 Rule::or => Operator::Or,
                 Rule::lt => Operator::LessThan,
+                Rule::lte => Operator::LessThanOrEqual,
                 Rule::gt => Operator::GreaterThan,
                 Rule::eq => Operator::Equals,
+                Rule::gte => Operator::GreaterThanOrEqual,
                 _ => unreachable!(),
             };
 
@@ -788,21 +820,9 @@ mod tests {
                     Node::StructDeclaration {
                         name: "Foo".to_string(),
                         declarations: Vec::from([
-                            Node::VariableDeclaration {
-                                name: "i".to_string(),
-                                var_type: Type::Int,
-                                value: Box::new(Node::EMPTY)
-                            },
-                            Node::VariableDeclaration {
-                                name: "s".to_string(),
-                                var_type: Type::String,
-                                value: Box::new(Node::EMPTY)
-                            },
-                            Node::VariableDeclaration {
-                                name: "b".to_string(),
-                                var_type: Type::Boolean,
-                                value: Box::new(Node::EMPTY)
-                            },
+                            ("i".to_string(), Type::Int),
+                            ("s".to_string(), Type::String),
+                            ("b".to_string(), Type::Boolean),
                         ])
                     },
                     Node::EOI
