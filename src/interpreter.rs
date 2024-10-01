@@ -26,12 +26,16 @@ pub enum Value {
         parameters: Vec<(String, Type)>,
         return_type: Type,
     },
+    Return(Box<Value>),
+    Executed,
     Void,
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Value::Return(_) => write!(f, "return"),
+            Value::Executed => write!(f, "executed"),
             Value::Integer(v) => write!(f, "{}", v),
             Value::String(v) => write!(f, "{}", v),
             Value::Boolean(v) => write!(f, "{}", v),
@@ -262,7 +266,69 @@ pub fn evaluate_node(
                 .assign_variable(identifier, val.clone());
             val
         }
-        Node::FunctionCall { name, arguments } => Value::Void,
+        Node::FunctionCall { name, arguments } => {
+            let args_values: Vec<_> = arguments.into_iter().map(|arg| evaluate_node(arg, stack, global_environment)).collect();
+            let fun = global_environment.get_function(name).unwrap().clone();
+            let parameters: Vec<(&(String, Type), Value)> = fun.parameters.iter().zip(args_values.into_iter()).collect();
+            let mut frame = CallFrame {
+                name: name.to_string(),
+                locals: Environment::new(),
+            };
+            for p in parameters {
+                let first = p.0.clone().0;
+                let second = p.1;
+                frame.locals.variables.insert(first, second);
+            }
+            stack.push(frame);
+
+            let mut result = Value::Void;
+            for n in fun.body {
+                if let Value::Return(v) = evaluate_node(&n, stack, global_environment) {
+                    result = v.as_ref().clone();
+                }
+            }
+            stack.pop();
+
+            result
+        }
+        Node::If { condition, body, else_if_blocks, else_block } => {
+            if let Value::Boolean(ok) = evaluate_node(condition.as_ref(), stack, global_environment) {
+                if ok {
+                    for n in body {
+                        if let Value::Return(v) = evaluate_node(n, stack, global_environment) {
+                            return Value::Return(v);
+                        }
+                    }
+                    return Value::Executed;
+                }
+            } else {
+                panic!("non boolean expression: {:?}", condition.as_ref())
+            }
+
+            for n in else_if_blocks {
+                let v = evaluate_node(n, stack, global_environment);
+                if let Value::Return(result) = v {
+                    return Value::Return(result);
+                }
+                if let Value::Executed = v {
+                    return Value::Executed;
+                }
+            }
+
+            if let Some(nodes) = else_block {
+                for n in nodes {
+                    let v = evaluate_node(n, stack, global_environment);
+                    if let Value::Return(result) = v {
+                        return Value::Return(result);
+                    }
+                    if let Value::Executed = v {
+                        return Value::Executed;
+                    }
+                }
+            }
+
+            Void
+        }
         Node::BinaryOp {
             left,
             operator,
@@ -276,6 +342,10 @@ pub fn evaluate_node(
                     Operator::Subtract => Value::Integer(l - r),
                     Operator::Multiply => Value::Integer(l * r),
                     Operator::Divide => Value::Integer(l / r),
+                    Operator::LessThanOrEqual => Value::Boolean(l <= r),
+                    Operator::LessThan => Value::Boolean(l < r),
+                    Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
+                    Operator::GreaterThan => Value::Boolean(l > r),
                     _ => panic!("Unsupported operator"),
                 },
                 _ => panic!("Unsupported binary operation"),
@@ -288,6 +358,7 @@ pub fn evaluate_node(
         }
         Node::Identifier(name) => stack.current_frame().locals.get_variable(name),
         Node::EOI => Value::Void,
+        Node::Return(n) => Value::Return(Box::new(evaluate_node(n, stack, global_environment))),
         _ => panic!("Unexpected node type: {:?}", node),
     }
 }
@@ -295,7 +366,8 @@ pub fn evaluate_node(
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 use std::cmp;
-use std::fmt::Octal;
+use std::fmt::{write, Octal};
+use crate::interpreter::Value::Void;
 
 pub fn repl() -> Result<()> {
     let mut stack = CallStack::new();
@@ -385,15 +457,18 @@ mod tests {
     fn test_fn_declaration() {
         let source_code = r#"
             function max(a:int, b:int):int {
-                if (a <= b) {
+                if (a > b) {
                     return a;
-                } else {
+                } else if (b > a){
                     return b;
+                } else {
+                    return a;
                 }
             }
+            print(max(2, 2));
         "#;
         let program = ast::parse(source_code);
-        println!("{:?}", program);
+        // println!("{:?}", program);
         println!("{}", evaluate(&program));
     }
 }
