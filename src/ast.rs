@@ -61,6 +61,9 @@ pub enum Node {
         name: String,
         fields: Vec<(String, Node)>, // List of field initializations (name, value)
     },
+    Not {
+        body: Box<Node>
+    },
     EOI,
     EMPTY,
 }
@@ -140,6 +143,11 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::struct_decl => create_struct_decl(pair),
         Rule::var_decl => create_var_decl(pair),
         Rule::func_decl => create_func_decl(pair),
+        Rule::not => {
+            let mut pairs = pair.into_inner();
+            let inner = pairs.next().unwrap();
+            Node::Not { body: Box::new(create_ast(inner)) }
+        }
         Rule::literal => create_literal(pair),
         Rule::primary => {
             let mut pairs = pair.into_inner();
@@ -193,6 +201,8 @@ lazy_static::lazy_static! {
             .op(Op::infix(gt, Left))
             .op(Op::infix(gte, Left))
             .op(Op::infix(eq, Left))
+            .op(Op::infix(not_eq, Left))
+
 };
 }
 
@@ -331,10 +341,11 @@ fn create_expression(pair: Pair<Rule>) -> Node {
                 Rule::power => Operator::Power,
                 Rule::and => Operator::And,
                 Rule::or => Operator::Or,
+                Rule::not_eq => Operator::NotEquals,
+                // Rule::not => Operator::Not,
                 Rule::lt => Operator::LessThan,
                 Rule::lte => Operator::LessThanOrEqual,
                 Rule::gt => Operator::GreaterThan,
-                Rule::eq => Operator::Equals,
                 Rule::gte => Operator::GreaterThanOrEqual,
                 _ => unreachable!(),
             };
@@ -933,6 +944,39 @@ mod tests {
         assert_eq!(
             Node::Program {
                 statements: Vec::from([var_decl, Node::EOI])
+            },
+            parse(source_code)
+        )
+    }
+
+    #[test]
+    fn test_not() {
+        let source_code = r#"
+            a = !a;
+        "#;
+        assert_eq!(Node::Program {
+            statements: Vec::from([Node::Assignment {
+                identifier: "a".to_string(),
+                value: Box::new(Node::Not { body: Box::new(Node::Identifier("a".to_string())) })
+            },
+                Node::EOI])
+        }, parse(source_code));
+    }
+
+    #[test]
+    fn test_not_equals() {
+        let source_code = r#"
+            1!=2;
+        "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([Node::BinaryOp {
+                    left: Box::new(Node::Literal(Literal::Integer(1))),
+                    operator: Operator::NotEquals,
+                    right: Box::new(Node::Literal(Literal::Integer(2)))
+                },
+                    Node::EOI])
             },
             parse(source_code)
         )

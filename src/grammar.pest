@@ -12,8 +12,7 @@ BOOLEAN_LITERAL = { "true" | "false" }
 KEYWORD         = { "if" | "else" | "for" | "match" | "function" | "return" }
 PUNCTUATION     = { "{" | "}" | "(" | ")" | "[" | "]" | ";" | "," | ":" }
 
-operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt | gte| gt | eq }
-//     assign   = { "=" }
+operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt | gte| gt | eq | not_eq | not }
     add      = { "+" }
     subtract = { "-" }
     multiply = { "*" }
@@ -26,6 +25,7 @@ operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt 
     gt       = { ">" }
     gte      = { ">=" }
     eq       = { "==" }
+    not_eq   = { "!=" }
 
 // Types
 type            = { "void" | "int" | "string" | "boolean" | IDENTIFIER }
@@ -73,7 +73,8 @@ io              = { print | input }
 
 sk_return        = { "return" ~ expression ~ ";" }
 expression      = { primary ~ (operation ~ primary)* }
-primary         = { literal | func_call | struct_init | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+not             = { "!" ~ primary }
+primary         = { not | literal | func_call | struct_init | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 

@@ -27,7 +27,7 @@ pub enum Value {
         return_type: Type,
     },
     Return(Box<Value>),
-    Executed,
+    Executed, // indicates that a branch has been executed
     Void,
 }
 
@@ -39,13 +39,23 @@ impl fmt::Display for Value {
             Value::Integer(v) => write!(f, "{}", v),
             Value::String(v) => write!(f, "{}", v),
             Value::Boolean(v) => write!(f, "{}", v),
-            Value::Function { name, parameters, return_type } => {
+            Value::Function {
+                name,
+                parameters,
+                return_type,
+            } => {
                 let params_str = parameters
                     .into_iter()
                     .map(|(n, t)| format!("{}:{}", n, ast::type_to_string(t)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                write!(f, "function {}({}):{}", name.to_string(), params_str, ast::type_to_string(return_type))
+                write!(
+                    f,
+                    "function {}({}):{}",
+                    name.to_string(),
+                    params_str,
+                    ast::type_to_string(return_type)
+                )
             }
             Value::StructInstance {
                 name: struct_name,
@@ -267,9 +277,13 @@ pub fn evaluate_node(
             val
         }
         Node::FunctionCall { name, arguments } => {
-            let args_values: Vec<_> = arguments.into_iter().map(|arg| evaluate_node(arg, stack, global_environment)).collect();
+            let args_values: Vec<_> = arguments
+                .into_iter()
+                .map(|arg| evaluate_node(arg, stack, global_environment))
+                .collect();
             let fun = global_environment.get_function(name).unwrap().clone();
-            let parameters: Vec<(&(String, Type), Value)> = fun.parameters.iter().zip(args_values.into_iter()).collect();
+            let parameters: Vec<(&(String, Type), Value)> =
+                fun.parameters.iter().zip(args_values.into_iter()).collect();
             let mut frame = CallFrame {
                 name: name.to_string(),
                 locals: Environment::new(),
@@ -291,8 +305,14 @@ pub fn evaluate_node(
 
             result
         }
-        Node::If { condition, body, else_if_blocks, else_block } => {
-            if let Value::Boolean(ok) = evaluate_node(condition.as_ref(), stack, global_environment) {
+        Node::If {
+            condition,
+            body,
+            else_if_blocks,
+            else_block,
+        } => {
+            if let Value::Boolean(ok) = evaluate_node(condition.as_ref(), stack, global_environment)
+            {
                 if ok {
                     for n in body {
                         if let Value::Return(v) = evaluate_node(n, stack, global_environment) {
@@ -348,6 +368,11 @@ pub fn evaluate_node(
                     Operator::GreaterThan => Value::Boolean(l > r),
                     _ => panic!("Unsupported operator"),
                 },
+                (Value::Boolean(a), Value::Boolean(b)) => match operator {
+                    Operator::And => Value::Boolean(a && b),
+                    Operator::Or => Value::Boolean(a || b),
+                    _ => panic!("Unsupported operator"),
+                },
                 _ => panic!("Unsupported binary operation"),
             }
         }
@@ -363,11 +388,11 @@ pub fn evaluate_node(
     }
 }
 
+use crate::interpreter::Value::Void;
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 use std::cmp;
 use std::fmt::{write, Octal};
-use crate::interpreter::Value::Void;
 
 pub fn repl() -> Result<()> {
     let mut stack = CallStack::new();
