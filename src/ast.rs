@@ -62,7 +62,7 @@ pub enum Node {
         fields: Vec<(String, Node)>, // List of field initializations (name, value)
     },
     Not {
-        body: Box<Node>
+        body: Box<Node>,
     },
     EOI,
     EMPTY,
@@ -146,7 +146,9 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::not => {
             let mut pairs = pair.into_inner();
             let inner = pairs.next().unwrap();
-            Node::Not { body: Box::new(create_ast(inner)) }
+            Node::Not {
+                body: Box::new(create_ast(inner)),
+            }
         }
         Rule::literal => create_literal(pair),
         Rule::primary => {
@@ -236,19 +238,21 @@ fn create_struct_init(pair: Pair<Rule>) -> Node {
     let mut inner_pairs = pair.into_inner();
     let name_pair = inner_pairs.next().unwrap();
     let name = create_identifier(name_pair);
-    let mut init_field_list = inner_pairs.next().unwrap().into_inner();
     let mut fields: Vec<(String, Node)> = Vec::new();
-    while let Some(p) = init_field_list.next() {
-        match p.as_rule() {
-            Rule::init_field => {
-                let mut init_field_pairs = p.into_inner();
-                let field_name = init_field_pairs.next().unwrap().as_str().to_string();
-                let body = create_ast(init_field_pairs.next().unwrap());
-                fields.push((field_name, body));
+    if let Some(mut init_field_list) = inner_pairs.next().map(|p| p.into_inner()) {
+        while let Some(p) = init_field_list.next() {
+            match p.as_rule() {
+                Rule::init_field => {
+                    let mut init_field_pairs = p.into_inner();
+                    let field_name = init_field_pairs.next().unwrap().as_str().to_string();
+                    let body = create_ast(init_field_pairs.next().unwrap());
+                    fields.push((field_name, body));
+                }
+                _ => panic!("unsupported rule {}", p),
             }
-            _ => panic!("unsupported rule {}", p),
         }
     }
+
     StructInitialization { name, fields }
 }
 
@@ -954,13 +958,20 @@ mod tests {
         let source_code = r#"
             a = !a;
         "#;
-        assert_eq!(Node::Program {
-            statements: Vec::from([Node::Assignment {
-                identifier: "a".to_string(),
-                value: Box::new(Node::Not { body: Box::new(Node::Identifier("a".to_string())) })
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::Assignment {
+                        identifier: "a".to_string(),
+                        value: Box::new(Node::Not {
+                            body: Box::new(Node::Identifier("a".to_string()))
+                        })
+                    },
+                    Node::EOI
+                ])
             },
-                Node::EOI])
-        }, parse(source_code));
+            parse(source_code)
+        );
     }
 
     #[test]
@@ -971,12 +982,14 @@ mod tests {
 
         assert_eq!(
             Node::Program {
-                statements: Vec::from([Node::BinaryOp {
-                    left: Box::new(Node::Literal(Literal::Integer(1))),
-                    operator: Operator::NotEquals,
-                    right: Box::new(Node::Literal(Literal::Integer(2)))
-                },
-                    Node::EOI])
+                statements: Vec::from([
+                    Node::BinaryOp {
+                        left: Box::new(Node::Literal(Literal::Integer(1))),
+                        operator: Operator::NotEquals,
+                        right: Box::new(Node::Literal(Literal::Integer(2)))
+                    },
+                    Node::EOI
+                ])
             },
             parse(source_code)
         )
@@ -1271,7 +1284,7 @@ mod tests {
     #[test]
     fn test_member_access() {
         let source_code = r#"
-            f: Foo = Foo();
+            f: Foo = Foo{};
             f.a = 1;
         "#;
         assert_eq!(
@@ -1280,9 +1293,9 @@ mod tests {
                     Node::VariableDeclaration {
                         var_type: Type::Custom("Foo".to_string()),
                         name: "f".to_string(),
-                        value: Box::new(Node::FunctionCall {
+                        value: Box::new(Node::StructInitialization {
                             name: "Foo".to_string(),
-                            arguments: Vec::new()
+                            fields: Vec::from([])
                         })
                     },
                     Node::Assignment {

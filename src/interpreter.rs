@@ -13,6 +13,7 @@ pub enum Value {
     Integer(i64),
     String(String),
     Boolean(bool),
+    Variable(String),
     StructInstance {
         name: String,
         fields: HashMap<String, Value>,
@@ -36,6 +37,7 @@ impl fmt::Display for Value {
         match self {
             Value::Return(_) => write!(f, "return"),
             Value::Executed => write!(f, "executed"),
+            Value::Variable(v) => write!(f, "{}", v), // todo unwrap
             Value::Integer(v) => write!(f, "{}", v),
             Value::String(v) => write!(f, "{}", v),
             Value::Boolean(v) => write!(f, "{}", v),
@@ -117,6 +119,44 @@ struct Environment {
     variables: HashMap<String, Value>,
 }
 
+fn set_nested_field(instance: &mut Value, parts: &[&str], value: Value) {
+    if parts.len() == 1 {
+        // Base case: reached the field to set
+        if let Value::StructInstance { fields, .. } = instance {
+            if let Some(field) = fields.get_mut(parts[0]) {
+                *field = value;
+            } else {
+                panic!("field {} not found", parts[0]);
+            }
+        } else {
+            panic!("expected struct instance, found something else");
+        }
+    } else {
+        if let Value::StructInstance { fields, .. } = instance {
+            if let Some(nested_instance) = fields.get_mut(parts[0]) {
+                set_nested_field(nested_instance, &parts[1..], value);
+            } else {
+                panic!("field {} not found", parts[0]);
+            }
+        } else {
+            panic!("expected struct instance, found something else");
+        }
+    }
+}
+
+fn get_struct_field_value<'a>(instance: &'a Value, parts: & [&str]) -> &'a Value {
+    if let Value::StructInstance { fields, .. } = instance {
+        if parts.len() == 1 {
+            fields.get(parts[0]).unwrap()
+        } else {
+            get_struct_field_value(fields.get(parts[0]).unwrap(), &parts[1..])
+        }
+    } else {
+        panic!("expected struct instance, found {:?}", instance);
+    }
+}
+
+
 impl Environment {
     fn new() -> Self {
         Environment {
@@ -129,18 +169,42 @@ impl Environment {
     }
 
     fn assign_variable(&mut self, name: &str, value: Value) {
-        if self.variables.contains_key(name) {
-            self.variables.insert(name.to_string(), value);
+        let parts: Vec<&str> = name.split('.').collect();
+        let size = parts.len();
+
+        if size == 1 {
+            // Base case: if no nested fields, assign directly
+            if self.variables.contains_key(name) {
+                self.variables.insert(name.to_string(), value);
+            } else {
+                panic!("variable {} not declared", name);
+            }
         } else {
-            panic!("variable {} not declared", name);
+            let root_name = parts[0];
+            if let Some(root_instance) = self.variables.get_mut(root_name) {
+                set_nested_field(root_instance, &parts[1..], value);
+            } else {
+                panic!("variable {} not declared", root_name);
+            }
         }
     }
 
-    fn get_variable(&self, name: &str) -> Value {
-        self.variables
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| panic!("variable {} not found", name))
+    fn get_variable_value<'a>(&'a self, name: &'a str) -> &'a Value {
+        let parts: Vec<&str> = name.split(".").collect();
+        if parts.len() == 1 {
+            self.variables
+                .get(name)
+               // .cloned()
+                .unwrap_or_else(|| panic!("variable {} not found", name))
+        } else {
+            let root_name = parts[0];
+            if let Some(root_instance) = self.variables.get(root_name) {
+                get_struct_field_value(root_instance, &parts[1..])
+            } else {
+                panic!("variable {} not declared", root_name);
+            }
+        }
+
     }
 }
 
@@ -248,7 +312,7 @@ pub fn evaluate_node(
                 .current_frame()
                 .locals
                 .declare_variable(name, value.clone());
-            value
+            Value::Variable(name.to_string())
         }
         Node::StructInitialization { name, fields } => {
             let mut field_values: HashMap<String, Value> = HashMap::new();
@@ -262,10 +326,10 @@ pub fn evaluate_node(
                 name: name.to_string(),
                 fields: field_values,
             };
-            stack
-                .current_frame()
-                .locals
-                .declare_variable(name, value.clone());
+            // stack
+            //     .current_frame()
+            //     .locals
+            //     .declare_variable(name, value.clone());
             value
         }
         Node::Assignment { identifier, value } => {
@@ -381,7 +445,10 @@ pub fn evaluate_node(
             println!("{:?}", val);
             Value::Void
         }
-        Node::Identifier(name) => stack.current_frame().locals.get_variable(name),
+        Node::Identifier(name) => {
+            let v = stack.current_frame().locals.get_variable_value(name);
+            v.clone()   // todo get rid of clone()
+        },
         Node::EOI => Value::Void,
         Node::Return(n) => Value::Return(Box::new(evaluate_node(n, stack, global_environment))),
         _ => panic!("Unexpected node type: {:?}", node),
@@ -494,6 +561,21 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         // println!("{:?}", program);
+        println!("{}", evaluate(&program));
+    }
+
+    #[test]
+    fn test_assign_instance_field() {
+        let source_code = r#"
+            struct Foo {
+                i:int;
+            }
+            f:Foo = Foo{i:1};
+            f.i = 2;
+            print(f.i);
+        "#;
+        let program = ast::parse(source_code);
+        println!("{:?}", program);
         println!("{}", evaluate(&program));
     }
 }
