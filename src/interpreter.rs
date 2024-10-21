@@ -144,7 +144,7 @@ fn set_nested_field(instance: &mut Value, parts: &[&str], value: Value) {
     }
 }
 
-fn get_struct_field_value<'a>(instance: &'a Value, parts: & [&str]) -> &'a Value {
+fn get_struct_field_value<'a>(instance: &'a Value, parts: &[&str]) -> &'a Value {
     if let Value::StructInstance { fields, .. } = instance {
         if parts.len() == 1 {
             fields.get(parts[0]).unwrap()
@@ -194,7 +194,7 @@ impl Environment {
         if parts.len() == 1 {
             self.variables
                 .get(name)
-               // .cloned()
+                // .cloned()
                 .unwrap_or_else(|| panic!("variable {} not found", name))
         } else {
             let root_name = parts[0];
@@ -204,7 +204,6 @@ impl Environment {
                 panic!("variable {} not declared", root_name);
             }
         }
-
     }
 }
 
@@ -413,6 +412,33 @@ pub fn evaluate_node(
 
             Void
         }
+        Node::For {
+            init,
+            condition,
+            update,
+            body
+        } => {
+            if let Some(n) = init {
+                evaluate_node(n.as_ref(), stack, global_environment);
+            }
+            while condition.as_ref().map(|cond| {
+                let res = evaluate_node(cond.as_ref(), stack, global_environment);
+                match res {
+                    Value::Boolean(v) => v,
+                    _ => panic!("for condition in should be a boolean expression")
+                }
+            }).unwrap_or(true) {
+                for n in body {
+                    if let Value::Return(v) = evaluate_node(n, stack, global_environment) {
+                        return Value::Return(v);
+                    }
+                }
+                if let Some(n) = update {
+                    evaluate_node(n, stack, global_environment);
+                }
+            }
+            Value::Void
+        }
         Node::BinaryOp {
             left,
             operator,
@@ -442,13 +468,13 @@ pub fn evaluate_node(
         }
         Node::Print(value) => {
             let val = evaluate_node(value, stack, global_environment);
-            println!("{:?}", val);
+            println!("{}", val);
             Value::Void
         }
         Node::Identifier(name) => {
             let v = stack.current_frame().locals.get_variable_value(name);
             v.clone()   // todo get rid of clone()
-        },
+        }
         Node::EOI => Value::Void,
         Node::Return(n) => Value::Return(Box::new(evaluate_node(n, stack, global_environment))),
         _ => panic!("Unexpected node type: {:?}", node),
@@ -574,6 +600,51 @@ mod tests {
             f.i = 2;
             print(f.i);
         "#;
+        let program = ast::parse(source_code);
+        println!("{:?}", program);
+        println!("{}", evaluate(&program));
+    }
+    #[test]
+    fn test_early_return() {
+        let source_code = r#"
+
+        "#;
+    }
+
+    #[test]
+    fn test_for1() {
+        let source_code = r#"
+        for(i:int=0; i < 5; i = i + 1) {
+            print(i);
+        }
+      "#;
+        let program = ast::parse(source_code);
+        println!("{:?}", program);
+        println!("{}", evaluate(&program));
+    }
+
+    #[test]
+    fn test_for2() {
+        let source_code = r#"
+        i: int = 0;
+        for(i=1; i < 5; i = i + 1) {
+            print(i);
+        }
+      "#;
+        let program = ast::parse(source_code);
+        println!("{:?}", program);
+        println!("{}", evaluate(&program));
+    }
+
+    #[test]
+    fn test_for3() {
+        let source_code = r#"
+        i: int = 0;
+        for(i=1; i < 5;) {
+            print(i);
+            i = i + 1;
+        }
+      "#;
         let program = ast::parse(source_code);
         println!("{:?}", program);
         println!("{}", evaluate(&program));

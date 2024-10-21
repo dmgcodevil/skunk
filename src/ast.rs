@@ -516,7 +516,7 @@ fn create_for_classic(pair: Pair<Rule>) -> Node {
     println!("for-cond = {:?}", condition);
     println!("for-update= {:?}", update);
 
-    let body = create_body(inner_pairs.next().unwrap().into_inner());
+    let body = create_body(inner_pairs);
     Node::For {
         init: init.map(Box::new),
         condition: condition.map(Box::new),
@@ -1218,6 +1218,7 @@ mod tests {
         let source_code = r#"
             for (i:int=0; i<10;) {
                 print(i);
+                i = i + 1;
             }
         "#;
         assert_eq!(
@@ -1227,7 +1228,7 @@ mod tests {
                         init: Some(Box::new(int_var_decl("i", 0))),
                         condition: Some(Box::new(var_less_than_int("i", 10))),
                         update: None,
-                        body: Vec::from([print_var("i")])
+                        body: Vec::from([print_var("i"), inc_int_var("i")])
                     },
                     Node::EOI
                 ])
