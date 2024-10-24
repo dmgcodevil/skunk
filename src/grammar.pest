@@ -30,7 +30,7 @@ operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt 
 // Types
 size = { INTEGER }
 base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
-array_dim       = { "[" ~ "]" }
+array_dim       = { "[" ~ size ~ "]" }
 array_type      = { base_type ~ array_dim+ }
 _type           = { array_type | base_type | "void" }
 return_type     = { ":" ~ _type }
@@ -53,7 +53,10 @@ init_field_list    = { init_field ~ ("," ~ init_field)* }
 init_field         = { IDENTIFIER ~ ":" ~ expression }
 
 // Array initialization
-array_alloc = { base_type ~ ("[" ~ size ~ "]")+ }
+// array_alloc = { base_type ~ ("[" ~ size ~ "]")+ }
+
+// Static
+static_func_call = { _type ~ "::" ~ IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
 control_flow = {
     if_expr | for_expr | match_expr
@@ -81,7 +84,7 @@ io              = { print | input }
 sk_return        = { "return" ~ expression ~ ";" }
 expression      = { primary ~ (operation ~ primary)* }
 not             = { "!" ~ primary }
-primary         = { not | literal | func_call | struct_init | array_alloc | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { not | literal | static_func_call |func_call | struct_init | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 
 use crate::ast;
@@ -14,6 +15,10 @@ pub enum Value {
     String(String),
     Boolean(bool),
     Variable(String),
+    // Array {
+    //     arr: Vec<i64>,
+    //     dimensions: Vec<i64>
+    // },
     StructInstance {
         name: String,
         fields: HashMap<String, Value>,
@@ -331,6 +336,14 @@ pub fn evaluate_node(
             //     .declare_variable(name, value.clone());
             value
         }
+        /*
+
+        arr:int[][] = int[1][2]();
+        */
+        // Node::ArrayAllocation {elem_type, dimensions} => {
+        //
+        //     Value::Array {}
+        // }
         Node::Assignment { identifier, value } => {
             let val = evaluate_node(value, stack, global_environment);
             stack

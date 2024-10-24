@@ -19,10 +19,10 @@ pub enum Node {
         name: String,
         value: Box<Node>, // The value is an expression node
     },
-    ArrayAllocation {
-        elem_type: Type,
-        dimensions: Vec<i64>,
-    },
+    // ArrayAllocation {
+    //     elem_type: Type,
+    //     dimensions: Vec<i64>,
+    // },
     FunctionDeclaration {
         name: String,
         parameters: Vec<(String, Type)>,
@@ -65,6 +65,11 @@ pub enum Node {
         name: String,
         fields: Vec<(String, Node)>, // List of field initializations (name, value)
     },
+    StaticFunctionCall {
+        _type: Type,
+        name: String,
+        arguments: Vec<Node>
+    },
     Not {
         body: Box<Node>,
     },
@@ -105,7 +110,7 @@ pub enum Type {
     Boolean,
     Array {
         elem_type: Box<Type>,
-        dimensions: i64,
+        dimensions: Vec<i64>,
     },
     Custom(String), // Custom types like structs
 }
@@ -150,7 +155,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::expression => create_expression(pair),
         Rule::assignment => create_assignment(pair),
         Rule::struct_decl => create_struct_decl(pair),
-        Rule::array_alloc => create_array_alloc(pair),
+        // Rule::array_alloc => create_array_alloc(pair),
         Rule::var_decl => create_var_decl(pair),
         Rule::func_decl => create_func_decl(pair),
         Rule::not => {
@@ -161,6 +166,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
             }
         }
         Rule::literal => create_literal(pair),
+        Rule::size => create_literal(pair),
         Rule::primary => {
             let mut pairs = pair.into_inner();
             create_ast(pairs.next().unwrap())
@@ -168,6 +174,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
         Rule::member_access => Node::Identifier(create_identifier(pair)),
         Rule::func_call => create_function_call(pair),
+        Rule::static_func_call => create_static_func_call(pair),
         Rule::struct_init => create_struct_init(pair),
         Rule::sk_return => {
             let mut pairs = pair.into_inner();
@@ -234,13 +241,36 @@ fn create_function_call(pair: Pair<Rule>) -> Node {
     let mut inner_pairs = pair.into_inner();
     let name = inner_pairs.next().unwrap().as_str().to_string();
     let mut arguments = Vec::new();
-    if let Some(arg_pair) = inner_pairs.next() {
+    while let Some(arg_pair) = inner_pairs.next() {
         arguments.push(create_ast(arg_pair));
-        for arg in inner_pairs {
-            arguments.push(create_ast(arg));
-        }
     }
     Node::FunctionCall { name, arguments }
+}
+
+/*
+
+static_method_call: `int[]::new(1)`
+            _type: `int[]`
+              array_type: `int[]`
+                base_type: `int`
+                array_dim: `[]`
+            IDENTIFIER: `new`
+            expression: `1`
+              primary: `1`
+                literal: `1`
+                  INTEGER: `1`
+
+*/
+fn create_static_func_call(pair: Pair<Rule>) -> Node {
+    let mut inner_pairs = pair.into_inner();
+    let _type = create_type(inner_pairs.next().unwrap());
+    let name = inner_pairs.next().unwrap().as_str().to_string();
+    let mut arguments = Vec::new();
+    while let Some(arg_pair) = inner_pairs.next() {
+        arguments.push(create_ast(arg_pair));
+    }
+
+    Node::StaticFunctionCall { _type, name, arguments }
 }
 
 fn create_struct_init(pair: Pair<Rule>) -> Node {
@@ -286,14 +316,17 @@ fn create_type(pair: Pair<Rule>) -> Type {
             let elem_type = create_type(inner_pairs.next()
                 .filter(|x| matches!(x.as_rule(), Rule::base_type))
                 .unwrap_or_else(|| panic!("array type is missing")));
-            let mut dims = 0;
-            while let Some(_) = inner_pairs.next() {
-                dims = dims + 1;
+            let mut dimensions:Vec<i64> = Vec::new();
+            while let Some(dim_pair) = inner_pairs.next() {
+                let dim = create_ast(dim_pair.into_inner().next().unwrap());
+                match dim {
+                    Node::Literal(Literal::Integer(v)) => dimensions.push(v),
+                    _ => panic!("incorrect array size literal: {:?}", dim)
+                }
             }
-            assert!(dims > 0, "array dims should be > 0");
             Type::Array {
                 elem_type: Box::new(elem_type),
-                dimensions: dims,
+                dimensions
             }
         }
         Rule::_type => {
@@ -316,21 +349,21 @@ fn create_struct_decl(pair: Pair<Rule>) -> Node {
     Node::StructDeclaration { name, declarations }
 }
 
-fn create_array_alloc(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let elem_type = create_type(inner_pairs.next().unwrap());
-    let mut dimensions = Vec::new();
-    while let Some(n) = inner_pairs.next() {
-        match create_literal(n) {
-            Node::Literal(Literal::Integer(v)) => dimensions.push(v),
-            _ => panic!("expected int literal in array size")
-        }
-    }
-    Node::ArrayAllocation {
-        elem_type,
-        dimensions,
-    }
-}
+// fn create_array_alloc(pair: Pair<Rule>) -> Node {
+//     let mut inner_pairs = pair.into_inner();
+//     let elem_type = create_type(inner_pairs.next().unwrap());
+//     let mut dimensions = Vec::new();
+//     while let Some(n) = inner_pairs.next() {
+//         match create_literal(n) {
+//             Node::Literal(Literal::Integer(v)) => dimensions.push(v),
+//             _ => panic!("expected int literal in array size")
+//         }
+//     }
+//     Node::ArrayAllocation {
+//         elem_type,
+//         dimensions,
+//     }
+// }
 
 fn create_struct_field_dec(pair: Pair<Rule>) -> (String, Type) {
     let mut inner_pairs = pair.into_inner();
@@ -1386,55 +1419,27 @@ mod tests {
         )
     }
 
-    #[test] // remove
-    fn test_array_of_structs() {
-        let source_code = r#"
-            points: Point[][] = Point[2][3];
-        "#;
-        let array_alloc_node = Node::ArrayAllocation {
-            elem_type: Type::Custom("Point".to_string()),
-            dimensions: Vec::from([2, 3]),
-        };
-        assert_eq!(
-            Node::Program {
-                statements: Vec::from([Node::VariableDeclaration {
-                    var_type: Type::Array {
-                        elem_type: Box::new(Type::Custom("Point".to_string())),
-                        dimensions: 2
-                    },
-                    name: "points".to_string(),
-                    value: Box::new(array_alloc_node)
-                },
-                    Node::EOI])
-            },
-            parse(source_code)
-        );
-        println!("{:?}", parse(source_code))
-    }
-
     #[test]
-    fn test_2d_array_init() {
+    fn test_int_array() {
         let source_code = r#"
-            arr: int[][] = int[2][3];
+            arr: int[1] = int[1]::new(1);
         "#;
-        let array_alloc_node = Node::ArrayAllocation {
-            elem_type: Type::Int,
-            dimensions: Vec::from([2, 3]),
-        };
+        println!("{:?}", parse(source_code));
+
         assert_eq!(
             Node::Program {
-                statements: Vec::from([Node::VariableDeclaration {
-                    var_type: Type::Array {
-                        elem_type: Box::new(Type::Int),
-                        dimensions: 2
-                    },
-                    name: "arr".to_string(),
-                    value: Box::new(array_alloc_node)
-                },
-                    Node::EOI])
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        var_type: Type::Array { elem_type: Box::new(Type::Int), dimensions: Vec::from([1]) },
+                        name: "arr".to_string(),
+                        value: Box::new(Node::StaticFunctionCall {
+                            _type: Type::Array { elem_type: Box::new(Type::Int), dimensions: Vec::from([1]) },
+                            name: "new".to_string(),
+                            arguments: Vec::from([Node::Literal(Literal::Integer(1))])
+                        })
+                    }, Node::EOI])
             },
             parse(source_code)
-        );
-        println!("{:?}", parse(source_code))
+        )
     }
 }
