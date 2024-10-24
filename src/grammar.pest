@@ -4,7 +4,7 @@ COMMENT    = _{ "//" ~ (!NEWLINE ~ ANY)*  ~ NEWLINE}        // Single-line comme
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" } // Block-style comments
 
 // Tokens
-IDENTIFIER      = @{ (ASCII_ALPHANUMERIC | "_")+ }
+IDENTIFIER =     @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 INTEGER         = @{ ASCII_DIGIT+ }
 STRING_LITERAL  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 BOOLEAN_LITERAL = { "true" | "false" }
@@ -28,8 +28,12 @@ operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt 
     not_eq   = { "!=" }
 
 // Types
-type            = { "void" | "int" | "string" | "boolean" | IDENTIFIER }
-return_type     = { ":" ~ type }
+size = { INTEGER }
+base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
+array_dim       = { "[" ~ "]" }
+array_type      = { base_type ~ array_dim+ }
+_type           = { array_type | base_type | "void" }
+return_type     = { ":" ~ _type }
 optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
@@ -37,16 +41,19 @@ program           = { SOI ~ statement* ~ EOI }
 statement         = { var_decl ~";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
 assignment        = { member_access ~ "=" ~ expression }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
-var_decl          = { IDENTIFIER ~ ":" ~ type ~ "=" ~ expression }
+var_decl          = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ expression }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
-param_list        = { (IDENTIFIER ~ ":" ~ type ~ ("," ~ IDENTIFIER ~ ":" ~ type)*) }
+param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ "}" }
-struct_field_decl = { IDENTIFIER ~ ":" ~ type ~ ";" }
+struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }
 
 // Struct Initialization
 struct_init        = { IDENTIFIER ~ "{" ~ init_field_list? ~ "}" }
 init_field_list    = { init_field ~ ("," ~ init_field)* }
 init_field         = { IDENTIFIER ~ ":" ~ expression }
+
+// Array initialization
+array_alloc = { base_type ~ ("[" ~ size ~ "]")+ }
 
 control_flow = {
     if_expr | for_expr | match_expr
@@ -74,7 +81,7 @@ io              = { print | input }
 sk_return        = { "return" ~ expression ~ ";" }
 expression      = { primary ~ (operation ~ primary)* }
 not             = { "!" ~ primary }
-primary         = { not | literal | func_call | struct_init | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { not | literal | func_call | struct_init | array_alloc | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 

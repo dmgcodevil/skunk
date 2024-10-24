@@ -1,4 +1,4 @@
-use crate::ast::Node::StructInitialization;
+use crate::ast::Node::{StructInitialization};
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -18,6 +18,10 @@ pub enum Node {
         var_type: Type,
         name: String,
         value: Box<Node>, // The value is an expression node
+    },
+    ArrayAllocation {
+        elem_type: Type,
+        dimensions: Vec<i64>,
     },
     FunctionDeclaration {
         name: String,
@@ -99,6 +103,10 @@ pub enum Type {
     Int,
     String,
     Boolean,
+    Array {
+        elem_type: Box<Type>,
+        dimensions: i64,
+    },
     Custom(String), // Custom types like structs
 }
 
@@ -109,6 +117,7 @@ pub fn type_to_string(t: &Type) -> String {
         Type::String => "string".to_string(),
         Type::Boolean => "boolean".to_string(),
         Type::Custom(v) => v.to_string(),
+        _ => panic!("unsupported type {:?}", t)
     }
 }
 
@@ -141,6 +150,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::expression => create_expression(pair),
         Rule::assignment => create_assignment(pair),
         Rule::struct_decl => create_struct_decl(pair),
+        Rule::array_alloc => create_array_alloc(pair),
         Rule::var_decl => create_var_decl(pair),
         Rule::func_decl => create_func_decl(pair),
         Rule::not => {
@@ -256,7 +266,7 @@ fn create_struct_init(pair: Pair<Rule>) -> Node {
     StructInitialization { name, fields }
 }
 
-fn create_type_from_str(s: &str) -> Type {
+fn create_base_type_from_str(s: &str) -> Type {
     match s {
         "int" => Type::Int,
         "string" => Type::String,
@@ -267,7 +277,30 @@ fn create_type_from_str(s: &str) -> Type {
 }
 
 fn create_type(pair: Pair<Rule>) -> Type {
-    create_type_from_str(pair.as_str())
+    match pair.as_rule() {
+        Rule::base_type => {
+            create_base_type_from_str(pair.as_str())
+        }
+        Rule::array_type => {
+            let mut inner_pairs = pair.into_inner();
+            let elem_type = create_type(inner_pairs.next()
+                .filter(|x| matches!(x.as_rule(), Rule::base_type))
+                .unwrap_or_else(|| panic!("array type is missing")));
+            let mut dims = 0;
+            while let Some(_) = inner_pairs.next() {
+                dims = dims + 1;
+            }
+            assert!(dims > 0, "array dims should be > 0");
+            Type::Array {
+                elem_type: Box::new(elem_type),
+                dimensions: dims,
+            }
+        }
+        Rule::_type => {
+            create_type(pair.into_inner().next().unwrap())
+        }
+        _ => panic!("unexpected pair {:?}", pair)
+    }
 }
 
 fn create_struct_decl(pair: Pair<Rule>) -> Node {
@@ -283,17 +316,33 @@ fn create_struct_decl(pair: Pair<Rule>) -> Node {
     Node::StructDeclaration { name, declarations }
 }
 
+fn create_array_alloc(pair: Pair<Rule>) -> Node {
+    let mut inner_pairs = pair.into_inner();
+    let elem_type = create_type(inner_pairs.next().unwrap());
+    let mut dimensions = Vec::new();
+    while let Some(n) = inner_pairs.next() {
+        match create_literal(n) {
+            Node::Literal(Literal::Integer(v)) => dimensions.push(v),
+            _ => panic!("expected int literal in array size")
+        }
+    }
+    Node::ArrayAllocation {
+        elem_type,
+        dimensions,
+    }
+}
+
 fn create_struct_field_dec(pair: Pair<Rule>) -> (String, Type) {
     let mut inner_pairs = pair.into_inner();
     let field_name = inner_pairs.next().unwrap().as_str().to_string();
-    let field_type = create_type_from_str(inner_pairs.next().unwrap().as_str());
+    let field_type = create_type(inner_pairs.next().unwrap());
     (field_name, field_type)
 }
 
 fn create_var_decl(pair: Pair<Rule>) -> Node {
     let mut inner_pairs = pair.into_inner();
     let var_name = inner_pairs.next().unwrap().as_str().to_string();
-    let var_type = create_type_from_str(inner_pairs.next().unwrap().as_str());
+    let var_type = create_type(inner_pairs.next().unwrap());
 
     let body = if let Some(body_pair) = inner_pairs.next() {
         create_ast(body_pair)
@@ -319,7 +368,7 @@ fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
             pairs.chunks(2).for_each(|chunk| {
                 result.push((
                     chunk[0].as_str().to_string(),
-                    create_type_from_str(chunk[1].as_str()),
+                    create_type(chunk[1].clone()),
                 ));
             });
             result
@@ -387,15 +436,13 @@ fn create_func_decl(pair: Pair<Rule>) -> Node {
     let return_type = match inner_pairs.peek() {
         Some(p) => {
             if p.as_rule() == Rule::return_type {
-                // return_type -> type
-                create_type_from_str(
+                create_type(
                     inner_pairs
                         .next()
                         .unwrap()
                         .into_inner()
                         .next()
                         .unwrap()
-                        .as_str(),
                 )
             } else {
                 Type::Void
@@ -1337,5 +1384,57 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test] // remove
+    fn test_array_of_structs() {
+        let source_code = r#"
+            points: Point[][] = Point[2][3];
+        "#;
+        let array_alloc_node = Node::ArrayAllocation {
+            elem_type: Type::Custom("Point".to_string()),
+            dimensions: Vec::from([2, 3]),
+        };
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([Node::VariableDeclaration {
+                    var_type: Type::Array {
+                        elem_type: Box::new(Type::Custom("Point".to_string())),
+                        dimensions: 2
+                    },
+                    name: "points".to_string(),
+                    value: Box::new(array_alloc_node)
+                },
+                    Node::EOI])
+            },
+            parse(source_code)
+        );
+        println!("{:?}", parse(source_code))
+    }
+
+    #[test]
+    fn test_2d_array_init() {
+        let source_code = r#"
+            arr: int[][] = int[2][3];
+        "#;
+        let array_alloc_node = Node::ArrayAllocation {
+            elem_type: Type::Int,
+            dimensions: Vec::from([2, 3]),
+        };
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([Node::VariableDeclaration {
+                    var_type: Type::Array {
+                        elem_type: Box::new(Type::Int),
+                        dimensions: 2
+                    },
+                    name: "arr".to_string(),
+                    value: Box::new(array_alloc_node)
+                },
+                    Node::EOI])
+            },
+            parse(source_code)
+        );
+        println!("{:?}", parse(source_code))
     }
 }
