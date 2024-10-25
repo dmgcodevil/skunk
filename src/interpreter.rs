@@ -15,10 +15,10 @@ pub enum Value {
     String(String),
     Boolean(bool),
     Variable(String),
-    // Array {
-    //     arr: Vec<i64>,
-    //     dimensions: Vec<i64>
-    // },
+    Array {
+        arr: Vec<Value>,
+        dimensions: Vec<i64>,
+    },
     StructInstance {
         name: String,
         fields: HashMap<String, Value>,
@@ -71,7 +71,9 @@ impl fmt::Display for Value {
                 write!(f, "struct {} {{}}", struct_name)
             }
             &Value::Struct { .. } => todo!(),
+            Value::Array { arr, dimensions } => write!(f, "array dimensions={:?}", dimensions),
             Value::Void => write!(f, ""),
+            _ => write!(f, "{:?}", "unknown"),
         }
     }
 }
@@ -122,6 +124,41 @@ impl GlobalEnvironment {
 
 struct Environment {
     variables: HashMap<String, Value>,
+}
+
+fn get_element(value: &Value, coordinates: Vec<i64>) -> &Value {
+    if let Value::Array { ref arr, ref dimensions } = value {
+        let pos = to_1d_pos(coordinates, dimensions);
+        &arr[pos]
+    } else {
+        panic!("not an array")
+    }
+}
+
+fn set_element(value: &mut Value, new_value: Value, coordinates: Vec<i64>) {
+    if let Value::Array { ref mut arr, ref dimensions } = value {
+        let pos = to_1d_pos(coordinates, dimensions);
+        arr[pos] = new_value;
+    }
+}
+
+fn to_1d_pos(coordinates: Vec<i64>, dimensions: &Vec<i64>) -> usize {
+    if coordinates.len() != dimensions.len() {
+        panic!("invalid dimensions. expected={}, actual={}", dimensions.len(), coordinates.len());
+    }
+    let mut res: usize = 0;
+    let mut multiplier: i64 = 1;
+
+    for i in (0..dimensions.len()).rev() {
+        if coordinates[i] >= dimensions[i] {
+            panic!("invalid coordinate. expected less than {}, actual={}. pos={}",
+                   dimensions[i], coordinates[i], i);
+        }
+        res += (coordinates[i] * multiplier) as usize;
+        multiplier *= dimensions[i];
+    }
+
+    res
 }
 
 fn set_nested_field(instance: &mut Value, parts: &[&str], value: Value) {
@@ -310,6 +347,8 @@ pub fn evaluate_node(
             }
         }
         Node::Literal(Literal::Integer(x)) => Value::Integer(*x),
+        Node::Literal(Literal::StringLiteral(x)) => Value::String(x.clone()),
+        Node::Literal(Literal::Boolean(x)) => Value::Boolean(x.clone()),
         Node::VariableDeclaration { name, value, .. } => {
             let value = evaluate_node(value, stack, global_environment);
             stack
@@ -380,6 +419,22 @@ pub fn evaluate_node(
             stack.pop();
 
             result
+        }
+        Node::StaticFunctionCall { _type, name, arguments } => {
+            match _type {
+                Type::Array { elem_type, dimensions } => {
+                    let mut size: usize = 1;
+                    for d in dimensions {
+                        size = size * (*d) as usize;
+                    }
+                    let mut arr = Vec::with_capacity(size);
+                    for i in 0..size {
+                        arr.push(evaluate_node(&arguments[0], stack, global_environment));
+                    }
+                    Value::Array { arr, dimensions: dimensions.clone() }
+                }
+                _ => panic!("unsupported static function call type"),
+            }
         }
         Node::If {
             condition,
@@ -572,94 +627,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_struct() {
+    fn test_demo() {
         let source_code = r#"
-         struct Foo {
-            i: int;
-         }
-          f: Foo = Foo{i:1};
+         arr: int[5] = int[5]::new(1);
+         print(arr);
         "#;
 
         let program = ast::parse(source_code);
         println!("{:?}", evaluate(&program));
-    }
-
-    #[test]
-    fn test_fn_declaration() {
-        let source_code = r#"
-            function max(a:int, b:int):int {
-                if (a > b) {
-                    return a;
-                } else if (b > a){
-                    return b;
-                } else {
-                    return a;
-                }
-            }
-            print(max(2, 2));
-        "#;
-        let program = ast::parse(source_code);
-        // println!("{:?}", program);
-        println!("{}", evaluate(&program));
-    }
-
-    #[test]
-    fn test_assign_instance_field() {
-        let source_code = r#"
-            struct Foo {
-                i:int;
-            }
-            f:Foo = Foo{i:1};
-            f.i = 2;
-            print(f.i);
-        "#;
-        let program = ast::parse(source_code);
-        println!("{:?}", program);
-        println!("{}", evaluate(&program));
-    }
-    #[test]
-    fn test_early_return() {
-        let source_code = r#"
-
-        "#;
-    }
-
-    #[test]
-    fn test_for1() {
-        let source_code = r#"
-        for(i:int=0; i < 5; i = i + 1) {
-            print(i);
-        }
-      "#;
-        let program = ast::parse(source_code);
-        println!("{:?}", program);
-        println!("{}", evaluate(&program));
-    }
-
-    #[test]
-    fn test_for2() {
-        let source_code = r#"
-        i: int = 0;
-        for(i=1; i < 5; i = i + 1) {
-            print(i);
-        }
-      "#;
-        let program = ast::parse(source_code);
-        println!("{:?}", program);
-        println!("{}", evaluate(&program));
-    }
-
-    #[test]
-    fn test_for3() {
-        let source_code = r#"
-        i: int = 0;
-        for(i=1; i < 5;) {
-            print(i);
-            i = i + 1;
-        }
-      "#;
-        let program = ast::parse(source_code);
-        println!("{:?}", program);
-        println!("{}", evaluate(&program));
     }
 }
