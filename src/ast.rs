@@ -1,4 +1,4 @@
-use crate::ast::Node::{StructInitialization};
+use crate::ast::Node::{StructInitialization, EMPTY};
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -60,6 +60,10 @@ pub enum Node {
     FunctionCall {
         name: String,         // The function name
         arguments: Vec<Node>, // The arguments are a list of expression nodes
+    },
+    ArrayAccess {
+      name: String,
+      coordinates: Vec<i64>
     },
     StructInitialization {
         name: String,
@@ -173,6 +177,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         }
         Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
         Rule::member_access => Node::Identifier(create_identifier(pair)),
+        Rule::array_access => create_array_access(pair),
         Rule::func_call => create_function_call(pair),
         Rule::static_func_call => create_static_func_call(pair),
         Rule::struct_init => create_struct_init(pair),
@@ -234,6 +239,25 @@ fn create_literal(pair: Pair<Rule>) -> Node {
             Node::Literal(Literal::Boolean(literal.as_str().parse::<bool>().unwrap()))
         }
         _ => panic!("unsupported rule {:?}", literal),
+    }
+}
+
+fn create_array_access(pair:Pair<Rule>) -> Node {
+    let mut pairs = pair.into_inner();
+    let name = create_identifier(pairs.next().unwrap());
+    println!("{:?}", name);
+    let mut coordinates:Vec<i64> = Vec::new();
+    while let Some(dim_par) = pairs.next() {
+        assert_eq!(Rule::array_dim, dim_par.as_rule());
+        let size_pair = dim_par.into_inner().next().unwrap();
+        // let size_literal = size_pair.into_inner().next().unwrap();
+        match create_literal(size_pair) {
+            Node::Literal(Literal::Integer(size)) => coordinates.push(size),
+            _ => panic!("unsupported literal"),
+        }
+    }
+    Node::ArrayAccess {
+        name, coordinates
     }
 }
 
@@ -1441,5 +1465,33 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test]
+    fn array_1d_access() {
+        let source_code = r#"
+            arr[1];
+        "#;
+
+        assert_eq!(Node::Program { statements: Vec::from([
+            Node::ArrayAccess {
+                name: "arr".to_string(),
+                coordinates: [1].to_vec() },
+            Node::EOI]) },
+                   parse(source_code));
+    }
+
+    #[test]
+    fn array_2d_access() {
+        let source_code = r#"
+            arr[1][2];
+        "#;
+
+        assert_eq!(Node::Program { statements: Vec::from([
+            Node::ArrayAccess {
+                name: "arr".to_string(),
+                coordinates: [1, 2].to_vec() },
+            Node::EOI]) },
+            parse(source_code));
     }
 }

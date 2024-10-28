@@ -52,8 +52,9 @@ struct_init        = { IDENTIFIER ~ "{" ~ init_field_list? ~ "}" }
 init_field_list    = { init_field ~ ("," ~ init_field)* }
 init_field         = { IDENTIFIER ~ ":" ~ expression }
 
-// Array initialization
-// array_alloc = { base_type ~ ("[" ~ size ~ "]")+ }
+// Array rules
+array_access = {IDENTIFIER ~ array_dim+}
+
 
 // Static
 static_func_call = { _type ~ "::" ~ IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
@@ -84,7 +85,7 @@ io              = { print | input }
 sk_return        = { "return" ~ expression ~ ";" }
 expression      = { primary ~ (operation ~ primary)* }
 not             = { "!" ~ primary }
-primary         = { not | literal | static_func_call |func_call | struct_init | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { not | literal | static_func_call |func_call | struct_init | array_access | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 

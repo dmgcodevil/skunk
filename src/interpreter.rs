@@ -9,7 +9,7 @@ use ast::Type;
 use std::fmt;
 use std::io::BufRead;
 
-#[derive(Clone, Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value {
     Integer(i64),
     String(String),
@@ -92,6 +92,7 @@ struct FunctionDefinition {
     body: Vec<Node>,
 }
 
+// it should be scoped: module, package, struct, function
 struct GlobalEnvironment {
     structs: HashMap<String, StructDefinition>,
     functions: HashMap<String, FunctionDefinition>,
@@ -198,7 +199,6 @@ fn get_struct_field_value<'a>(instance: &'a Value, parts: &[&str]) -> &'a Value 
     }
 }
 
-
 impl Environment {
     fn new() -> Self {
         Environment {
@@ -285,13 +285,14 @@ pub fn evaluate(node: &Node) -> Value {
         name: "main".to_string(),
         locals: Environment::new(),
     });
-    evaluate_node(node, &mut stack, &mut ge)
+    evaluate_node(node, &mut stack, &mut ge, Scope::Global)
 }
 
 pub fn evaluate_node(
     node: &Node,
     stack: &mut CallStack,
     global_environment: &mut GlobalEnvironment,
+    scope: Scope
 ) -> Value {
     match node {
         Node::Program { statements } => {
@@ -543,6 +544,21 @@ pub fn evaluate_node(
             let v = stack.current_frame().locals.get_variable_value(name);
             v.clone()   // todo get rid of clone()
         }
+        Node::ArrayAccess { name, coordinates } => {
+            let mut pos: usize = 0;
+            let mut multiplier: i64 = 1;
+            if let Value::Array { ref arr, ref dimensions } = stack.current_frame().locals.get_variable_value(name) {
+                for i in (0..coordinates.len()).rev() {
+                    if coordinates[i] >= dimensions[i] {
+                        panic!("array out of bound. {} >= {}. dim={}", coordinates[i], dimensions[i], i);
+                    }
+                    pos += (coordinates[i] * multiplier) as usize;
+                    multiplier *= dimensions[i];
+                }
+                return arr[pos].clone();
+            }
+            panic!("expected array, actual={:?}", stack.current_frame().locals.get_variable_value(name))
+        }
         Node::EOI => Value::Void,
         Node::Return(n) => Value::Return(Box::new(evaluate_node(n, stack, global_environment))),
         _ => panic!("Unexpected node type: {:?}", node),
@@ -627,13 +643,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_demo() {
+    fn test_array_access() {
         let source_code = r#"
          arr: int[5] = int[5]::new(1);
-         print(arr);
+         arr[0];
         "#;
-
         let program = ast::parse(source_code);
-        println!("{:?}", evaluate(&program));
+        assert_eq!(Value::Integer(1), evaluate(&program));
     }
+
+    #[test]
+    fn test_array_dynamic_init() {
+        let source_code = r#"
+         i: int = 0;
+         function incAndGet():int {
+            i = i + 1;
+            return i;
+         }
+         arr: int[5] = int[5]::new(incAndGet());
+         arr[0];
+        "#;
+        let program = ast::parse(source_code);
+        assert_eq!(Value::Integer(1), evaluate(&program));
+    }
+
 }
