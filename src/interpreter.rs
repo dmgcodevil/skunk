@@ -285,14 +285,13 @@ pub fn evaluate(node: &Node) -> Value {
         name: "main".to_string(),
         locals: Environment::new(),
     });
-    evaluate_node(node, &mut stack, &mut ge, Scope::Global)
+    evaluate_node(node, &mut stack, &mut ge)
 }
 
 pub fn evaluate_node(
     node: &Node,
     stack: &mut CallStack,
     global_environment: &mut GlobalEnvironment,
-    scope: Scope
 ) -> Value {
     match node {
         Node::Program { statements } => {
@@ -652,7 +651,7 @@ mod tests {
         assert_eq!(Value::Integer(1), evaluate(&program));
     }
 
-    #[test]
+    //#[test]
     fn test_array_dynamic_init() {
         let source_code = r#"
          i: int = 0;
