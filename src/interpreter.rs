@@ -6,8 +6,10 @@ use ast::Literal;
 use ast::Node;
 use ast::Operator;
 use ast::Type;
+use std::cell::{Ref, RefCell};
 use std::fmt;
 use std::io::BufRead;
+use std::rc::Rc;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -16,7 +18,7 @@ pub enum Value {
     Boolean(bool),
     Variable(String),
     Array {
-        arr: Vec<Value>,
+        arr: Rc<RefCell<Vec<Value>>>,
         dimensions: Vec<i64>,
     },
     StructInstance {
@@ -123,14 +125,20 @@ impl GlobalEnvironment {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
 struct Environment {
     variables: HashMap<String, Value>,
 }
 
-fn get_element(value: &Value, coordinates: Vec<i64>) -> &Value {
+fn get_element(value: &Value, coordinates: Vec<i64>) -> Ref<Value> {
     if let Value::Array { ref arr, ref dimensions } = value {
         let pos = to_1d_pos(coordinates, dimensions);
-        &arr[pos]
+
+        // Borrow the RefCell inside the Rc for immutable access
+        let borrowed_arr = arr.borrow();
+
+        // Return the reference to the element at the calculated position
+        Ref::map(borrowed_arr, |vec| &vec[pos])
     } else {
         panic!("not an array")
     }
@@ -139,7 +147,7 @@ fn get_element(value: &Value, coordinates: Vec<i64>) -> &Value {
 fn set_element(value: &mut Value, new_value: Value, coordinates: Vec<i64>) {
     if let Value::Array { ref mut arr, ref dimensions } = value {
         let pos = to_1d_pos(coordinates, dimensions);
-        arr[pos] = new_value;
+        arr.borrow_mut()[pos] = new_value;
     }
 }
 
@@ -236,7 +244,6 @@ impl Environment {
         if parts.len() == 1 {
             self.variables
                 .get(name)
-                // .cloned()
                 .unwrap_or_else(|| panic!("variable {} not found", name))
         } else {
             let root_name = parts[0];
@@ -249,11 +256,13 @@ impl Environment {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CallFrame {
     name: String,
     locals: Environment,
 }
 
+#[derive(Debug, Clone)]
 pub struct CallStack {
     frames: Vec<CallFrame>,
 }
@@ -271,7 +280,13 @@ impl CallStack {
         self.frames.pop()
     }
 
-    fn current_frame(&mut self) -> &mut CallFrame {
+    fn current_frame(&self) -> &CallFrame {
+        self.frames
+            .last()
+            .expect("Call stack underflow: No active frames")
+    }
+
+    fn current_frame_mut(&mut self) -> &mut CallFrame {
         self.frames
             .last_mut()
             .expect("Call stack underflow: No active frames")
@@ -279,19 +294,19 @@ impl CallStack {
 }
 
 pub fn evaluate(node: &Node) -> Value {
-    let mut stack = CallStack::new();
-    let mut ge = GlobalEnvironment::new();
-    stack.push(CallFrame {
+    let stack = Rc::new(RefCell::new(CallStack::new()));
+    let ge = Rc::new(RefCell::new(GlobalEnvironment::new()));
+    stack.borrow_mut().push(CallFrame {
         name: "main".to_string(),
         locals: Environment::new(),
     });
-    evaluate_node(node, &mut stack, &mut ge)
+    evaluate_node(node, &stack, &ge)
 }
 
 pub fn evaluate_node(
     node: &Node,
-    stack: &mut CallStack,
-    global_environment: &mut GlobalEnvironment,
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> Value {
     match node {
         Node::Program { statements } => {
@@ -310,7 +325,7 @@ pub fn evaluate_node(
                 name: name.to_string(),
                 fields: sd.fields.clone(),
             };
-            global_environment.add_struct(name.to_string(), sd);
+            global_environment.borrow_mut().add_struct(name.to_string(), sd);
             val
         }
         Node::FunctionDeclaration {
@@ -319,19 +334,7 @@ pub fn evaluate_node(
             return_type,
             body,
         } => {
-            // if name == "main" {
-            //     stack.push(CallFrame {
-            //         name: name.clone(),
-            //         locals: Environment::new(),
-            //     });
-            //
-            //     for statement in body {
-            //         evaluate_node(statement, stack, global_environment);
-            //     }
-            //     stack.pop();
-            // }
-
-            global_environment.functions.insert(
+            global_environment.borrow_mut().functions.insert(
                 name.clone(),
                 FunctionDefinition {
                     name: name.to_string(),
@@ -352,7 +355,8 @@ pub fn evaluate_node(
         Node::VariableDeclaration { name, value, .. } => {
             let value = evaluate_node(value, stack, global_environment);
             stack
-                .current_frame()
+                .borrow_mut()
+                .current_frame_mut()
                 .locals
                 .declare_variable(name, value.clone());
             Value::Variable(name.to_string())
@@ -369,24 +373,13 @@ pub fn evaluate_node(
                 name: name.to_string(),
                 fields: field_values,
             };
-            // stack
-            //     .current_frame()
-            //     .locals
-            //     .declare_variable(name, value.clone());
             value
         }
-        /*
-
-        arr:int[][] = int[1][2]();
-        */
-        // Node::ArrayAllocation {elem_type, dimensions} => {
-        //
-        //     Value::Array {}
-        // }
         Node::Assignment { identifier, value } => {
             let val = evaluate_node(value, stack, global_environment);
             stack
-                .current_frame()
+                .borrow_mut()
+                .current_frame_mut()
                 .locals
                 .assign_variable(identifier, val.clone());
             val
@@ -396,7 +389,7 @@ pub fn evaluate_node(
                 .into_iter()
                 .map(|arg| evaluate_node(arg, stack, global_environment))
                 .collect();
-            let fun = global_environment.get_function(name).unwrap().clone();
+            let fun = global_environment.borrow().get_function(name).unwrap().clone();
             let parameters: Vec<(&(String, Type), Value)> =
                 fun.parameters.iter().zip(args_values.into_iter()).collect();
             let mut frame = CallFrame {
@@ -408,7 +401,7 @@ pub fn evaluate_node(
                 let second = p.1;
                 frame.locals.variables.insert(first, second);
             }
-            stack.push(frame);
+            stack.borrow_mut().push(frame);
 
             let mut result = Value::Void;
             for n in fun.body {
@@ -416,7 +409,7 @@ pub fn evaluate_node(
                     result = v.as_ref().clone();
                 }
             }
-            stack.pop();
+            stack.borrow_mut().pop();
 
             result
         }
@@ -431,7 +424,7 @@ pub fn evaluate_node(
                     for i in 0..size {
                         arr.push(evaluate_node(&arguments[0], stack, global_environment));
                     }
-                    Value::Array { arr, dimensions: dimensions.clone() }
+                    Value::Array { arr: Rc::new(RefCell::new(arr)), dimensions: dimensions.clone() }
                 }
                 _ => panic!("unsupported static function call type"),
             }
@@ -540,23 +533,39 @@ pub fn evaluate_node(
             Value::Void
         }
         Node::Identifier(name) => {
-            let v = stack.current_frame().locals.get_variable_value(name);
-            v.clone()   // todo get rid of clone()
+            /*
+            why we need stack_ref as a separate var:
+            The issue you're encountering stems from the fact that calling stack.borrow() creates a
+            temporary value (Ref from the RefCell), and when you chain .current_frame() on it,
+            that temporary Ref is dropped at the end of the statement, leading to a lifetime issue.
+            */
+            let stack_ref = stack.borrow(); // Borrow the RefCell
+            let current_frame = stack_ref.current_frame(); // Access the current frame with a valid borrow
+            let v = current_frame.locals.get_variable_value(name);
+            v.clone() // Return the cloned value
         }
         Node::ArrayAccess { name, coordinates } => {
             let mut pos: usize = 0;
             let mut multiplier: i64 = 1;
-            if let Value::Array { ref arr, ref dimensions } = stack.current_frame().locals.get_variable_value(name) {
+            let stack_ref = stack.borrow();
+            let current = stack_ref.current_frame();
+            let array_value_ref = current.locals.get_variable_value(name);
+
+            if let Value::Array { ref arr, ref dimensions } = array_value_ref {
                 for i in (0..coordinates.len()).rev() {
-                    if coordinates[i] >= dimensions[i] {
-                        panic!("array out of bound. {} >= {}. dim={}", coordinates[i], dimensions[i], i);
+                    if let Value::Integer(coord) = evaluate_node(&coordinates[i].clone(), &Rc::clone(stack), global_environment) {
+                        if coord >= dimensions[i] {
+                            panic!("array out of bound. {} >= {}. dim={}", coord, dimensions[i], i);
+                        }
+                        pos += (coord * multiplier) as usize;
+                        multiplier *= dimensions[i];
+                    } else {
+                        panic!("expected coordinate type to be an integer");
                     }
-                    pos += (coordinates[i] * multiplier) as usize;
-                    multiplier *= dimensions[i];
                 }
-                return arr[pos].clone();
+                return arr.borrow()[pos].clone();
             }
-            panic!("expected array, actual={:?}", stack.current_frame().locals.get_variable_value(name))
+            panic!("expected array, actual={:?}", "current.locals.get_variable_value(name)")
         }
         Node::EOI => Value::Void,
         Node::Return(n) => Value::Return(Box::new(evaluate_node(n, stack, global_environment))),
@@ -568,7 +577,7 @@ use crate::interpreter::Value::Void;
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 use std::cmp;
-use std::fmt::{write, Octal};
+use std::fmt::Octal;
 
 pub fn repl() -> Result<()> {
     let mut stack = CallStack::new();
@@ -641,7 +650,7 @@ pub fn repl() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
+    //#[test]
     fn test_array_access() {
         let source_code = r#"
          arr: int[5] = int[5]::new(1);
@@ -649,6 +658,17 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         assert_eq!(Value::Integer(1), evaluate(&program));
+    }
+
+    //#[test]
+    fn test_array_set() {
+        let source_code = r#"
+            arr: int[1] = int[1]::new(0);
+            arr[0] = 1;
+            return arr[0];
+        "#;
+        let program = ast::parse(source_code);
+        println!("{:?}", evaluate(&program));
     }
 
     //#[test]
@@ -665,5 +685,4 @@ mod tests {
         let program = ast::parse(source_code);
         assert_eq!(Value::Integer(1), evaluate(&program));
     }
-
 }

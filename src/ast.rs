@@ -19,10 +19,6 @@ pub enum Node {
         name: String,
         value: Box<Node>, // The value is an expression node
     },
-    // ArrayAllocation {
-    //     elem_type: Type,
-    //     dimensions: Vec<i64>,
-    // },
     FunctionDeclaration {
         name: String,
         parameters: Vec<(String, Type)>,
@@ -63,7 +59,7 @@ pub enum Node {
     },
     ArrayAccess {
       name: String,
-      coordinates: Vec<i64>
+      coordinates: Vec<Node>
     },
     StructInitialization {
         name: String,
@@ -246,15 +242,11 @@ fn create_array_access(pair:Pair<Rule>) -> Node {
     let mut pairs = pair.into_inner();
     let name = create_identifier(pairs.next().unwrap());
     println!("{:?}", name);
-    let mut coordinates:Vec<i64> = Vec::new();
+    let mut coordinates:Vec<Node> = Vec::new();
     while let Some(dim_par) = pairs.next() {
         assert_eq!(Rule::array_dim, dim_par.as_rule());
-        let size_pair = dim_par.into_inner().next().unwrap();
-        // let size_literal = size_pair.into_inner().next().unwrap();
-        match create_literal(size_pair) {
-            Node::Literal(Literal::Integer(size)) => coordinates.push(size),
-            _ => panic!("unsupported literal"),
-        }
+        let coord_expr = dim_par.into_inner().next().unwrap();
+        coordinates.push(create_ast(coord_expr));
     }
     Node::ArrayAccess {
         name, coordinates
@@ -469,8 +461,7 @@ fn create_expression(pair: Pair<Rule>) -> Node {
         .parse(pair.into_inner())
 }
 
-/// return identifier as String out of the pair
-/// panics if rule != Rule::IDENTIFIER
+
 fn create_identifier(pair: Pair<Rule>) -> String {
     match pair.as_rule() {
         Rule::IDENTIFIER => pair.as_str().to_string(),
@@ -1476,7 +1467,7 @@ mod tests {
         assert_eq!(Node::Program { statements: Vec::from([
             Node::ArrayAccess {
                 name: "arr".to_string(),
-                coordinates: [1].to_vec() },
+                coordinates: [Node::Literal(Literal::Integer(1))].to_vec() },
             Node::EOI]) },
                    parse(source_code));
     }
@@ -1490,8 +1481,55 @@ mod tests {
         assert_eq!(Node::Program { statements: Vec::from([
             Node::ArrayAccess {
                 name: "arr".to_string(),
-                coordinates: [1, 2].to_vec() },
+                coordinates: [Node::Literal(Literal::Integer(1)), Node::Literal(Literal::Integer(2))].to_vec() },
             Node::EOI]) },
             parse(source_code));
     }
+
+   #[test]
+    fn array_set_value() {
+        let source_code = r#"
+            arr[0] = 1;
+        "#;
+        println!("{:?}", parse(source_code));
+    }
+
+
+
+    /*
+    program: `
+            arr[0].a = 1;
+        `
+  statement: `arr[0].a = 1;`
+    assignment: `arr[0].a = 1`
+      member_access: `arr[0].a `
+        array_access: `arr[0]`
+          IDENTIFIER: `arr`
+          array_dim: `[0]`
+            expression: `0`
+              primary: `0`
+                literal: `0`
+                  INTEGER: `0`
+        IDENTIFIER: `a`
+      expression: `1`
+        primary: `1`
+          literal: `1`
+            INTEGER: `1`
+  EOI: ``
+    */
+    #[test]
+    fn array_set_struct_field() {
+        let source_code = r#"
+            arr[0].a = 1;
+        "#;
+        println!("{:?}", parse(source_code));
+    }
+
+   // #[test]
+   //  fn array_set_struct_field() {
+   //      let source_code = r#"
+   //          arr[0].a[0] = 1;
+   //      "#;
+   //      println!("{:?}", parse(source_code));
+   //  }
 }

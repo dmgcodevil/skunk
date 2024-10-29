@@ -9,10 +9,8 @@ INTEGER         = @{ ASCII_DIGIT+ }
 STRING_LITERAL  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 BOOLEAN_LITERAL = { "true" | "false" }
 
-KEYWORD         = { "if" | "else" | "for" | "match" | "function" | "return" }
-PUNCTUATION     = { "{" | "}" | "(" | ")" | "[" | "]" | ";" | "," | ":" }
-
-operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt | gte| gt | eq | not_eq | not }
+// Operations
+operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt | gte | gt | eq | not_eq | not }
     add      = { "+" }
     subtract = { "-" }
     multiply = { "*" }
@@ -30,16 +28,17 @@ operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt 
 // Types
 size = { INTEGER }
 base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
-array_dim       = { "[" ~ size ~ "]" }
+array_dim       = { "[" ~ expression ~ "]" }
 array_type      = { base_type ~ array_dim+ }
 _type           = { array_type | base_type | "void" }
 return_type     = { ":" ~ _type }
 optional_return_type = _{ return_type? }
+
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { var_decl ~";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
-assignment        = { member_access ~ "=" ~ expression }
+statement         = { var_decl ~ ";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
+assignment        = { (member_access | array_access | IDENTIFIER) ~ "=" ~ expression }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 var_decl          = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ expression }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
@@ -52,13 +51,14 @@ struct_init        = { IDENTIFIER ~ "{" ~ init_field_list? ~ "}" }
 init_field_list    = { init_field ~ ("," ~ init_field)* }
 init_field         = { IDENTIFIER ~ ":" ~ expression }
 
-// Array rules
-array_access = {IDENTIFIER ~ array_dim+}
+// Array Access and Initialization
+array_access = { IDENTIFIER ~ array_dim+ }
+array_init = { _type ~ "::new" ~ "(" ~ expression ~ ")" }
 
-
-// Static
+// Static function calls
 static_func_call = { _type ~ "::" ~ IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
+// Control Flow
 control_flow = {
     if_expr | for_expr | match_expr
 }
@@ -78,15 +78,20 @@ match_expr   = { "match" ~ "(" ~ expression ~ ")" ~ "{" ~ match_case* ~ "}" }
 
 match_case      = { "case" ~ expression ~ ":" ~ "{" ~ statement* ~ "}" }
 
+// I/O and Return
 print           = { "print" ~ "(" ~ expression ~ ")" ~ ";" }
 input           = { "input" ~ "(" ~ ")" ~ ";" }
 io              = { print | input }
 
 sk_return        = { "return" ~ expression ~ ";" }
+
+// Expressions
 expression      = { primary ~ (operation ~ primary)* }
 not             = { "!" ~ primary }
-primary         = { not | literal | static_func_call |func_call | struct_init | array_access | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { not | literal | static_func_call | func_call | struct_init | array_access | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
-member_access   = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
+// Member Access
+member_access = { (array_access | IDENTIFIER) ~ ("." ~ (array_access | IDENTIFIER))+ }
+
