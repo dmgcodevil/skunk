@@ -131,7 +131,11 @@ struct Environment {
 }
 
 fn get_element(value: &Value, coordinates: Vec<i64>) -> Ref<Value> {
-    if let Value::Array { ref arr, ref dimensions } = value {
+    if let Value::Array {
+        ref arr,
+        ref dimensions,
+    } = value
+    {
         let pos = to_1d_pos(coordinates, dimensions);
 
         // Borrow the RefCell inside the Rc for immutable access
@@ -145,7 +149,11 @@ fn get_element(value: &Value, coordinates: Vec<i64>) -> Ref<Value> {
 }
 
 fn set_element(value: &mut Value, new_value: Value, coordinates: Vec<i64>) {
-    if let Value::Array { ref mut arr, ref dimensions } = value {
+    if let Value::Array {
+        ref mut arr,
+        ref dimensions,
+    } = value
+    {
         let pos = to_1d_pos(coordinates, dimensions);
         arr.borrow_mut()[pos] = new_value;
     }
@@ -153,15 +161,21 @@ fn set_element(value: &mut Value, new_value: Value, coordinates: Vec<i64>) {
 
 fn to_1d_pos(coordinates: Vec<i64>, dimensions: &Vec<i64>) -> usize {
     if coordinates.len() != dimensions.len() {
-        panic!("invalid dimensions. expected={}, actual={}", dimensions.len(), coordinates.len());
+        panic!(
+            "invalid dimensions. expected={}, actual={}",
+            dimensions.len(),
+            coordinates.len()
+        );
     }
     let mut res: usize = 0;
     let mut multiplier: i64 = 1;
 
     for i in (0..dimensions.len()).rev() {
         if coordinates[i] >= dimensions[i] {
-            panic!("invalid coordinate. expected less than {}, actual={}. pos={}",
-                   dimensions[i], coordinates[i], i);
+            panic!(
+                "invalid coordinate. expected less than {}, actual={}. pos={}",
+                dimensions[i], coordinates[i], i
+            );
         }
         res += (coordinates[i] * multiplier) as usize;
         multiplier *= dimensions[i];
@@ -325,7 +339,9 @@ pub fn evaluate_node(
                 name: name.to_string(),
                 fields: sd.fields.clone(),
             };
-            global_environment.borrow_mut().add_struct(name.to_string(), sd);
+            global_environment
+                .borrow_mut()
+                .add_struct(name.to_string(), sd);
             val
         }
         Node::FunctionDeclaration {
@@ -375,21 +391,74 @@ pub fn evaluate_node(
             };
             value
         }
-        Node::Assignment { identifier, value } => {
+/*
+        Node::Assignment { var, value } => {
             let val = evaluate_node(value, stack, global_environment);
-            stack
-                .borrow_mut()
-                .current_frame_mut()
-                .locals
-                .assign_variable(identifier, val.clone());
-            val
+            match var {
+                Node::Access { mut nodes } => {
+                    assert!(nodes.len() > 0);
+                    /*
+struct C {
+    d:int;
+}
+struct B {
+    c:C;
+}
+struct A {
+    b: B[];
+}
+a: A[1] = A[1]::new();
+a[0].b[0].c.d = 1;
+
+
+we need to interpret Assigment node:
+
+Assignment {
+    var: Access {
+        nodes: [
+            ArrayAccess { name: "a", coordinates: [Literal(Integer(0))] },
+            ArrayAccess { name: "b", coordinates: [Literal(Integer(0))] },
+            Identifier("c"), Identifier("d")] },
+    value: Literal(Integer(1))
+}
+
+1. evaluate `a[0]` => gives struct A instance
+2. evaluate `b[0]` => gives struct B instance
+3. evaluate `c` => gives struct C instance
+4. `d` is last
+
+
+   function set_value(stack, access:Node)->&Value {
+        match access {
+            Node::ArrayAccess =>
+            Node::Identifier =>
         }
+
+   }
+
+                    */
+
+                    let mut it = nodes.iter_mut();
+                    let curr = Value::Void;
+                    while let Some(access_node) = it.next() {
+
+                    }
+
+
+                }
+                _ => panic!("var should be Node::Access. given={}", var),
+            }
+        }*/
         Node::FunctionCall { name, arguments } => {
             let args_values: Vec<_> = arguments
                 .into_iter()
                 .map(|arg| evaluate_node(arg, stack, global_environment))
                 .collect();
-            let fun = global_environment.borrow().get_function(name).unwrap().clone();
+            let fun = global_environment
+                .borrow()
+                .get_function(name)
+                .unwrap()
+                .clone();
             let parameters: Vec<(&(String, Type), Value)> =
                 fun.parameters.iter().zip(args_values.into_iter()).collect();
             let mut frame = CallFrame {
@@ -413,22 +482,30 @@ pub fn evaluate_node(
 
             result
         }
-        Node::StaticFunctionCall { _type, name, arguments } => {
-            match _type {
-                Type::Array { elem_type, dimensions } => {
-                    let mut size: usize = 1;
-                    for d in dimensions {
-                        size = size * (*d) as usize;
-                    }
-                    let mut arr = Vec::with_capacity(size);
-                    for i in 0..size {
-                        arr.push(evaluate_node(&arguments[0], stack, global_environment));
-                    }
-                    Value::Array { arr: Rc::new(RefCell::new(arr)), dimensions: dimensions.clone() }
+        Node::StaticFunctionCall {
+            _type,
+            name,
+            arguments,
+        } => match _type {
+            Type::Array {
+                elem_type,
+                dimensions,
+            } => {
+                let mut size: usize = 1;
+                for d in dimensions {
+                    size = size * (*d) as usize;
                 }
-                _ => panic!("unsupported static function call type"),
+                let mut arr = Vec::with_capacity(size);
+                for i in 0..size {
+                    arr.push(evaluate_node(&arguments[0], stack, global_environment));
+                }
+                Value::Array {
+                    arr: Rc::new(RefCell::new(arr)),
+                    dimensions: dimensions.clone(),
+                }
             }
-        }
+            _ => panic!("unsupported static function call type"),
+        },
         Node::If {
             condition,
             body,
@@ -477,18 +554,22 @@ pub fn evaluate_node(
             init,
             condition,
             update,
-            body
+            body,
         } => {
             if let Some(n) = init {
                 evaluate_node(n.as_ref(), stack, global_environment);
             }
-            while condition.as_ref().map(|cond| {
-                let res = evaluate_node(cond.as_ref(), stack, global_environment);
-                match res {
-                    Value::Boolean(v) => v,
-                    _ => panic!("for condition in should be a boolean expression")
-                }
-            }).unwrap_or(true) {
+            while condition
+                .as_ref()
+                .map(|cond| {
+                    let res = evaluate_node(cond.as_ref(), stack, global_environment);
+                    match res {
+                        Value::Boolean(v) => v,
+                        _ => panic!("for condition in should be a boolean expression"),
+                    }
+                })
+                .unwrap_or(true)
+            {
                 for n in body {
                     if let Value::Return(v) = evaluate_node(n, stack, global_environment) {
                         return Value::Return(v);
@@ -551,11 +632,22 @@ pub fn evaluate_node(
             let current = stack_ref.current_frame();
             let array_value_ref = current.locals.get_variable_value(name);
 
-            if let Value::Array { ref arr, ref dimensions } = array_value_ref {
+            if let Value::Array {
+                ref arr,
+                ref dimensions,
+            } = array_value_ref
+            {
                 for i in (0..coordinates.len()).rev() {
-                    if let Value::Integer(coord) = evaluate_node(&coordinates[i].clone(), &Rc::clone(stack), global_environment) {
+                    if let Value::Integer(coord) = evaluate_node(
+                        &coordinates[i].clone(),
+                        &Rc::clone(stack),
+                        global_environment,
+                    ) {
                         if coord >= dimensions[i] {
-                            panic!("array out of bound. {} >= {}. dim={}", coord, dimensions[i], i);
+                            panic!(
+                                "array out of bound. {} >= {}. dim={}",
+                                coord, dimensions[i], i
+                            );
                         }
                         pos += (coord * multiplier) as usize;
                         multiplier *= dimensions[i];
@@ -565,7 +657,10 @@ pub fn evaluate_node(
                 }
                 return arr.borrow()[pos].clone();
             }
-            panic!("expected array, actual={:?}", "current.locals.get_variable_value(name)")
+            panic!(
+                "expected array, actual={:?}",
+                "current.locals.get_variable_value(name)"
+            )
         }
         Node::EOI => Value::Void,
         Node::Return(n) => Value::Return(Box::new(evaluate_node(n, stack, global_environment))),

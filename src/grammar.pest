@@ -38,7 +38,7 @@ optional_return_type = _{ return_type? }
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
 statement         = { var_decl ~ ";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
-assignment        = { (member_access | array_access | IDENTIFIER) ~ "=" ~ expression }
+assignment        = { access  ~ "=" ~ expression }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 var_decl          = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ expression }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
@@ -88,10 +88,15 @@ sk_return        = { "return" ~ expression ~ ";" }
 // Expressions
 expression      = { primary ~ (operation ~ primary)* }
 not             = { "!" ~ primary }
-primary         = { not | literal | static_func_call | func_call | struct_init | array_access | member_access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { not | literal | static_func_call | func_call | struct_init | access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
-// Member Access
-member_access = { (array_access | IDENTIFIER) ~ ("." ~ (array_access | IDENTIFIER))+ }
+// Member or array Access
+// nested
+// member_access =   { (array_access | IDENTIFIER)+  ~ ("." ~  (access | IDENTIFIER))+ }
+// access = { member_access | array_access | IDENTIFIER }
+
+// flat
+access =   { (array_access | IDENTIFIER)+  ~ ("." ~  (array_access | IDENTIFIER))* }
 

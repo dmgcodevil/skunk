@@ -1,4 +1,4 @@
-use crate::ast::Node::{StructInitialization, EMPTY};
+use crate::ast::Node::{Identifier, StructInitialization};
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -26,7 +26,7 @@ pub enum Node {
         body: Vec<Node>, // The function body is a list of nodes (statements or expressions)
     },
     Assignment {
-        identifier: String,
+        var: Box<Node>,
         value: Box<Node>,
     },
     If {
@@ -58,8 +58,14 @@ pub enum Node {
         arguments: Vec<Node>, // The arguments are a list of expression nodes
     },
     ArrayAccess {
-      name: String,
-      coordinates: Vec<Node>
+        name: String,
+        coordinates: Vec<Node>,
+    },
+    MemberAccess {
+        identifier: String,
+    },
+    Access {
+        nodes: Vec<Node>,
     },
     StructInitialization {
         name: String,
@@ -68,7 +74,7 @@ pub enum Node {
     StaticFunctionCall {
         _type: Type,
         name: String,
-        arguments: Vec<Node>
+        arguments: Vec<Node>,
     },
     Not {
         body: Box<Node>,
@@ -122,7 +128,7 @@ pub fn type_to_string(t: &Type) -> String {
         Type::String => "string".to_string(),
         Type::Boolean => "boolean".to_string(),
         Type::Custom(v) => v.to_string(),
-        _ => panic!("unsupported type {:?}", t)
+        _ => panic!("unsupported type {:?}", t),
     }
 }
 
@@ -172,8 +178,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
             create_ast(pairs.next().unwrap())
         }
         Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
-        Rule::member_access => Node::Identifier(create_identifier(pair)),
-        Rule::array_access => create_array_access(pair),
+        Rule::access => create_access(pair),
         Rule::func_call => create_function_call(pair),
         Rule::static_func_call => create_static_func_call(pair),
         Rule::struct_init => create_struct_init(pair),
@@ -238,19 +243,31 @@ fn create_literal(pair: Pair<Rule>) -> Node {
     }
 }
 
-fn create_array_access(pair:Pair<Rule>) -> Node {
+fn create_array_access(pair: Pair<Rule>) -> Node {
+    assert_eq!(Rule::array_access, pair.as_rule());
     let mut pairs = pair.into_inner();
     let name = create_identifier(pairs.next().unwrap());
     println!("{:?}", name);
-    let mut coordinates:Vec<Node> = Vec::new();
+    let mut coordinates: Vec<Node> = Vec::new();
     while let Some(dim_par) = pairs.next() {
         assert_eq!(Rule::array_dim, dim_par.as_rule());
         let coord_expr = dim_par.into_inner().next().unwrap();
         coordinates.push(create_ast(coord_expr));
     }
-    Node::ArrayAccess {
-        name, coordinates
+    Node::ArrayAccess { name, coordinates }
+}
+
+fn create_access(pair: Pair<Rule>) -> Node {
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut inner_pairs = pair.into_inner();
+    while let Some(inner_pair) = inner_pairs.next() {
+        nodes.push(match inner_pair.as_rule() {
+            Rule::array_access => create_array_access(inner_pair),
+            Rule::IDENTIFIER => Identifier(inner_pair.as_str().to_string()),
+            _ => panic!("unsupported rule {:?}", inner_pair),
+        })
     }
+    Node::Access { nodes }
 }
 
 fn create_function_call(pair: Pair<Rule>) -> Node {
@@ -263,20 +280,6 @@ fn create_function_call(pair: Pair<Rule>) -> Node {
     Node::FunctionCall { name, arguments }
 }
 
-/*
-
-static_method_call: `int[]::new(1)`
-            _type: `int[]`
-              array_type: `int[]`
-                base_type: `int`
-                array_dim: `[]`
-            IDENTIFIER: `new`
-            expression: `1`
-              primary: `1`
-                literal: `1`
-                  INTEGER: `1`
-
-*/
 fn create_static_func_call(pair: Pair<Rule>) -> Node {
     let mut inner_pairs = pair.into_inner();
     let _type = create_type(inner_pairs.next().unwrap());
@@ -286,7 +289,11 @@ fn create_static_func_call(pair: Pair<Rule>) -> Node {
         arguments.push(create_ast(arg_pair));
     }
 
-    Node::StaticFunctionCall { _type, name, arguments }
+    Node::StaticFunctionCall {
+        _type,
+        name,
+        arguments,
+    }
 }
 
 fn create_struct_init(pair: Pair<Rule>) -> Node {
@@ -324,31 +331,30 @@ fn create_base_type_from_str(s: &str) -> Type {
 
 fn create_type(pair: Pair<Rule>) -> Type {
     match pair.as_rule() {
-        Rule::base_type => {
-            create_base_type_from_str(pair.as_str())
-        }
+        Rule::base_type => create_base_type_from_str(pair.as_str()),
         Rule::array_type => {
             let mut inner_pairs = pair.into_inner();
-            let elem_type = create_type(inner_pairs.next()
-                .filter(|x| matches!(x.as_rule(), Rule::base_type))
-                .unwrap_or_else(|| panic!("array type is missing")));
-            let mut dimensions:Vec<i64> = Vec::new();
+            let elem_type = create_type(
+                inner_pairs
+                    .next()
+                    .filter(|x| matches!(x.as_rule(), Rule::base_type))
+                    .unwrap_or_else(|| panic!("array type is missing")),
+            );
+            let mut dimensions: Vec<i64> = Vec::new();
             while let Some(dim_pair) = inner_pairs.next() {
                 let dim = create_ast(dim_pair.into_inner().next().unwrap());
                 match dim {
                     Node::Literal(Literal::Integer(v)) => dimensions.push(v),
-                    _ => panic!("incorrect array size literal: {:?}", dim)
+                    _ => panic!("incorrect array size literal: {:?}", dim),
                 }
             }
             Type::Array {
                 elem_type: Box::new(elem_type),
-                dimensions
+                dimensions,
             }
         }
-        Rule::_type => {
-            create_type(pair.into_inner().next().unwrap())
-        }
-        _ => panic!("unexpected pair {:?}", pair)
+        Rule::_type => create_type(pair.into_inner().next().unwrap()),
+        _ => panic!("unexpected pair {:?}", pair),
     }
 }
 
@@ -364,22 +370,6 @@ fn create_struct_decl(pair: Pair<Rule>) -> Node {
     }
     Node::StructDeclaration { name, declarations }
 }
-
-// fn create_array_alloc(pair: Pair<Rule>) -> Node {
-//     let mut inner_pairs = pair.into_inner();
-//     let elem_type = create_type(inner_pairs.next().unwrap());
-//     let mut dimensions = Vec::new();
-//     while let Some(n) = inner_pairs.next() {
-//         match create_literal(n) {
-//             Node::Literal(Literal::Integer(v)) => dimensions.push(v),
-//             _ => panic!("expected int literal in array size")
-//         }
-//     }
-//     Node::ArrayAllocation {
-//         elem_type,
-//         dimensions,
-//     }
-// }
 
 fn create_struct_field_dec(pair: Pair<Rule>) -> (String, Type) {
     let mut inner_pairs = pair.into_inner();
@@ -415,10 +405,7 @@ fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
             let pairs: Vec<Pair<Rule>> = pair.into_inner().collect();
             assert_eq!(pairs.len() % 2, 0);
             pairs.chunks(2).for_each(|chunk| {
-                result.push((
-                    chunk[0].as_str().to_string(),
-                    create_type(chunk[1].clone()),
-                ));
+                result.push((chunk[0].as_str().to_string(), create_type(chunk[1].clone())));
             });
             result
         }
@@ -461,17 +448,10 @@ fn create_expression(pair: Pair<Rule>) -> Node {
         .parse(pair.into_inner())
 }
 
-
+//todo return Node
 fn create_identifier(pair: Pair<Rule>) -> String {
     match pair.as_rule() {
         Rule::IDENTIFIER => pair.as_str().to_string(),
-        Rule::member_access => {
-            let mut v: Vec<String> = Vec::new();
-            for p in pair.into_inner() {
-                v.push(create_identifier(p));
-            }
-            v.join(".")
-        }
         _ => panic!("not identifier rule {}", pair),
     }
 }
@@ -484,14 +464,7 @@ fn create_func_decl(pair: Pair<Rule>) -> Node {
     let return_type = match inner_pairs.peek() {
         Some(p) => {
             if p.as_rule() == Rule::return_type {
-                create_type(
-                    inner_pairs
-                        .next()
-                        .unwrap()
-                        .into_inner()
-                        .next()
-                        .unwrap()
-                )
+                create_type(inner_pairs.next().unwrap().into_inner().next().unwrap())
             } else {
                 Type::Void
             }
@@ -570,12 +543,9 @@ fn create_body(pairs: pest::iterators::Pairs<Rule>) -> Vec<Node> {
 fn create_assignment(pair: Pair<Rule>) -> Node {
     assert_eq!(Rule::assignment, pair.as_rule());
     let mut inner_pairs = pair.into_inner();
-    let identifier = create_identifier(inner_pairs.next().unwrap());
-    let value = create_ast(inner_pairs.next().unwrap());
-    Node::Assignment {
-        identifier,
-        value: Box::new(value),
-    }
+    let var = Box::new(create_access(inner_pairs.next().unwrap()));
+    let value = Box::new(create_ast(inner_pairs.next().unwrap()));
+    Node::Assignment { var, value }
 }
 
 fn create_for_classic(pair: Pair<Rule>) -> Node {
@@ -607,9 +577,6 @@ fn create_for_classic(pair: Pair<Rule>) -> Node {
     } else {
         None
     };
-    println!("for-init = {:?}", init);
-    println!("for-cond = {:?}", condition);
-    println!("for-update= {:?}", update);
 
     let body = create_body(inner_pairs);
     Node::For {
@@ -634,6 +601,7 @@ pub fn parse(code: &str) -> Node {
 
 mod tests {
     use super::*;
+    use crate::ast::Node::Access;
 
     fn int_var_decl(name: &str, value: i64) -> Node {
         Node::VariableDeclaration {
@@ -645,14 +613,14 @@ mod tests {
 
     fn int_var_assign(name: &str, value: i64) -> Node {
         Node::Assignment {
-            identifier: name.to_string(),
+            var: Box::new(access_var(name)),
             value: Box::new(Node::Literal(Literal::Integer(value))),
         }
     }
 
     fn var_less_than_int(name: &str, value: i64) -> Node {
         Node::BinaryOp {
-            left: Box::new(Node::Identifier(name.to_string())),
+            left: Box::new(access_var(name)),
             operator: Operator::LessThan,
             right: Box::new(Node::Literal(Literal::Integer(value))),
         }
@@ -660,20 +628,32 @@ mod tests {
 
     fn inc_int_var(name: &str) -> Node {
         Node::Assignment {
-            identifier: name.to_string(),
+            var: Box::new(access_var(name)),
             value: Box::new(Node::BinaryOp {
-                left: Box::new(Node::Identifier(name.to_string())),
+                left: Box::new(access_var(name)),
                 operator: Operator::Add,
                 right: Box::new(Node::Literal(Literal::Integer(1))),
             }),
         }
     }
 
+    // todo support complex access: <first>"."<second>
+    fn access_var(name: &str) -> Node {
+        Access {
+            nodes: name
+                .split(".")
+                .map(|i| Node::Identifier(i.to_string()))
+                .collect(),
+        }
+    }
+
     fn print_int(i: i64) -> Node {
-        Node::Print(Box::new(Node::Literal(Literal::Integer(i))))
+        Node::Print(Box::new(Access {
+            nodes: [Node::Literal(Literal::Integer(i))].to_vec(),
+        }))
     }
     fn print_var(name: &str) -> Node {
-        Node::Print(Box::new(Node::Identifier(name.to_string())))
+        Node::Print(Box::new(access_var(name)))
     }
 
     #[test]
@@ -768,7 +748,7 @@ mod tests {
         i = i + 1;
         "#;
         let add = Node::BinaryOp {
-            left: Box::new(Node::Identifier("i".to_string())),
+            left: Box::new(access_var("i")),
             operator: Operator::Add,
             right: Box::new(Node::Literal(Literal::Integer(1))),
         };
@@ -777,7 +757,9 @@ mod tests {
             Node::Program {
                 statements: Vec::from([
                     Node::Assignment {
-                        identifier: "i".to_string(),
+                        var: Box::new(Node::Access {
+                            nodes: [Node::Identifier("i".to_string())].to_vec()
+                        }),
                         value: Box::new(add)
                     },
                     Node::EOI
@@ -887,9 +869,9 @@ mod tests {
                         ]),
                         return_type: Type::Int,
                         body: Vec::from([Node::Return(Box::new(Node::BinaryOp {
-                            left: Box::new(Node::Identifier("a".to_string())),
+                            left: Box::new(access_var("a")),
                             operator: Operator::Add,
-                            right: Box::new(Node::Identifier("b".to_string()))
+                            right: Box::new(access_var("b"))
                         }))]),
                     },
                     Node::FunctionDeclaration {
@@ -978,9 +960,9 @@ mod tests {
             c: boolean = a && b;
         "#;
         let and = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(access_var("a")),
             operator: Operator::And,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(access_var("b")),
         };
         let var_decl = Node::VariableDeclaration {
             var_type: Type::Boolean,
@@ -1001,9 +983,9 @@ mod tests {
             c: boolean = a || b;
         "#;
         let and = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(access_var("a")),
             operator: Operator::Or,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(access_var("b")),
         };
         let var_declr = Node::VariableDeclaration {
             var_type: Type::Boolean,
@@ -1025,12 +1007,12 @@ mod tests {
             d: boolean = a || b && c;
         "#;
         let and = Node::BinaryOp {
-            left: Box::new(Node::Identifier("b".to_string())),
+            left: Box::new(access_var("b")),
             operator: Operator::And,
-            right: Box::new(Node::Identifier("c".to_string())),
+            right: Box::new(access_var("c")),
         };
         let or = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(access_var("a")),
             operator: Operator::Or,
             right: Box::new(and),
         };
@@ -1057,9 +1039,9 @@ mod tests {
             Node::Program {
                 statements: Vec::from([
                     Node::Assignment {
-                        identifier: "a".to_string(),
+                        var: Box::new(access_var("a")),
                         value: Box::new(Node::Not {
-                            body: Box::new(Node::Identifier("a".to_string()))
+                            body: Box::new(access_var("a"))
                         })
                     },
                     Node::EOI
@@ -1098,9 +1080,9 @@ mod tests {
             }
         "#;
         let lt = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(access_var("a")),
             operator: Operator::LessThan,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(access_var("b")),
         };
         let body = Vec::from([Node::Print(Box::new(Node::Literal(
             Literal::StringLiteral("\"a < b\"".to_string()),
@@ -1128,15 +1110,17 @@ mod tests {
                 print("a > b");
             }
         "#;
+        let var_a = access_var("a");
+        let var_b = access_var("b");
         let lt = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(var_a.clone()),
             operator: Operator::LessThan,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(var_b.clone()),
         };
         let gt = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(var_a.clone()),
             operator: Operator::GreaterThan,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(var_b.clone()),
         };
         let if_body = Vec::from([Node::Print(Box::new(Node::Literal(
             Literal::StringLiteral("\"a < b\"".to_string()),
@@ -1174,20 +1158,22 @@ mod tests {
                 print("a == b");
             }
         "#;
+        let var_a = access_var("a");
+        let var_b = access_var("b");
         let lt = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(var_a.clone()),
             operator: Operator::LessThan,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(var_b.clone()),
         };
         let gt = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(var_a.clone()),
             operator: Operator::GreaterThan,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(var_b.clone()),
         };
         let eq = Node::BinaryOp {
-            left: Box::new(Node::Identifier("a".to_string())),
+            left: Box::new(var_a.clone()),
             operator: Operator::Equals,
-            right: Box::new(Node::Identifier("b".to_string())),
+            right: Box::new(var_b.clone()),
         };
         let if_body = Vec::from([Node::Print(Box::new(Node::Literal(
             Literal::StringLiteral("\"a < b\"".to_string()),
@@ -1395,7 +1381,7 @@ mod tests {
                         })
                     },
                     Node::Assignment {
-                        identifier: "f.a".to_string(),
+                        var: Box::new(access_var("f.a")),
                         value: Box::new(Node::Literal(Literal::Integer(1)))
                     },
                     Node::EOI
@@ -1445,14 +1431,22 @@ mod tests {
             Node::Program {
                 statements: Vec::from([
                     Node::VariableDeclaration {
-                        var_type: Type::Array { elem_type: Box::new(Type::Int), dimensions: Vec::from([1]) },
+                        var_type: Type::Array {
+                            elem_type: Box::new(Type::Int),
+                            dimensions: Vec::from([1])
+                        },
                         name: "arr".to_string(),
                         value: Box::new(Node::StaticFunctionCall {
-                            _type: Type::Array { elem_type: Box::new(Type::Int), dimensions: Vec::from([1]) },
+                            _type: Type::Array {
+                                elem_type: Box::new(Type::Int),
+                                dimensions: Vec::from([1])
+                            },
                             name: "new".to_string(),
                             arguments: Vec::from([Node::Literal(Literal::Integer(1))])
                         })
-                    }, Node::EOI])
+                    },
+                    Node::EOI
+                ])
             },
             parse(source_code)
         )
@@ -1464,12 +1458,21 @@ mod tests {
             arr[1];
         "#;
 
-        assert_eq!(Node::Program { statements: Vec::from([
-            Node::ArrayAccess {
-                name: "arr".to_string(),
-                coordinates: [Node::Literal(Literal::Integer(1))].to_vec() },
-            Node::EOI]) },
-                   parse(source_code));
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::Access {
+                        nodes: [Node::ArrayAccess {
+                            name: "arr".to_string(),
+                            coordinates: [Node::Literal(Literal::Integer(1))].to_vec()
+                        }]
+                        .to_vec()
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
     }
 
     #[test]
@@ -1478,58 +1481,115 @@ mod tests {
             arr[1][2];
         "#;
 
-        assert_eq!(Node::Program { statements: Vec::from([
-            Node::ArrayAccess {
-                name: "arr".to_string(),
-                coordinates: [Node::Literal(Literal::Integer(1)), Node::Literal(Literal::Integer(2))].to_vec() },
-            Node::EOI]) },
-            parse(source_code));
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Access {
+                        nodes: [Node::ArrayAccess {
+                            name: "arr".to_string(),
+                            coordinates: [
+                                Node::Literal(Literal::Integer(1)),
+                                Node::Literal(Literal::Integer(2))
+                            ]
+                            .to_vec()
+                        }]
+                        .to_vec()
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
     }
 
-   #[test]
-    fn array_set_value() {
-        let source_code = r#"
-            arr[0] = 1;
-        "#;
-        println!("{:?}", parse(source_code));
-    }
-
-
-
-    /*
-    program: `
-            arr[0].a = 1;
-        `
-  statement: `arr[0].a = 1;`
-    assignment: `arr[0].a = 1`
-      member_access: `arr[0].a `
-        array_access: `arr[0]`
-          IDENTIFIER: `arr`
-          array_dim: `[0]`
-            expression: `0`
-              primary: `0`
-                literal: `0`
-                  INTEGER: `0`
-        IDENTIFIER: `a`
-      expression: `1`
-        primary: `1`
-          literal: `1`
-            INTEGER: `1`
-  EOI: ``
-    */
     #[test]
-    fn array_set_struct_field() {
+    fn test_array_1d_assignment() {
         let source_code = r#"
-            arr[0].a = 1;
-        "#;
-        println!("{:?}", parse(source_code));
+        arr[0] = 1;
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::Assignment {
+                        var: Box::new(Node::Access {
+                            nodes: vec![Node::ArrayAccess {
+                                name: "arr".to_string(),
+                                coordinates: vec![Node::Literal(Literal::Integer(0))],
+                            }]
+                        }),
+                        value: Box::new(Node::Literal(Literal::Integer(1))),
+                    },
+                    Node::EOI,
+                ])
+            },
+            parse(source_code)
+        );
     }
 
-   // #[test]
-   //  fn array_set_struct_field() {
-   //      let source_code = r#"
-   //          arr[0].a[0] = 1;
-   //      "#;
-   //      println!("{:?}", parse(source_code));
-   //  }
+    #[test]
+    fn test_array_member_assignment() {
+        let source_code = r#"
+        arr[0].a = 1;
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::Assignment {
+                        var: Box::new(Node::Access {
+                            nodes: vec![
+                                Node::ArrayAccess {
+                                    name: "arr".to_string(),
+                                    coordinates: vec![Node::Literal(Literal::Integer(0))],
+                                },
+                                Node::Identifier("a".to_string()),
+                            ]
+                        }),
+                        value: Box::new(Node::Literal(Literal::Integer(1))),
+                    },
+                    Node::EOI,
+                ])
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_nested_array_member_assignment() {
+        let source_code = r#"
+        a[0].b[1].c = 1;
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::Assignment {
+                        var: Box::new(Node::Access {
+                            nodes: vec![
+                                Node::ArrayAccess {
+                                    name: "a".to_string(),
+                                    coordinates: vec![Node::Literal(Literal::Integer(0))],
+                                },
+                                Node::ArrayAccess {
+                                    name: "b".to_string(),
+                                    coordinates: vec![Node::Literal(Literal::Integer(1))],
+                                },
+                                Node::Identifier("c".to_string()),
+                            ]
+                        }),
+                        value: Box::new(Node::Literal(Literal::Integer(1))),
+                    },
+                    Node::EOI,
+                ])
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn complex_assignment() {
+        let source_code = r#"
+            a[0].b[0].c.d = 1;
+        "#;
+
+        println!("{:?}", parse(source_code));
+    }
 }
