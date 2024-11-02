@@ -93,10 +93,10 @@ literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
 // Member or array Access
-// nested
-// member_access =   { (array_access | IDENTIFIER)+  ~ ("." ~  (access | IDENTIFIER))+ }
+// nested alternative to flat, experimental
+// member_access =   { (array_access | func_call | IDENTIFIER)+  ~ ("." ~ access)+ }
 // access = { member_access | array_access | IDENTIFIER }
 
 // flat
-access =   { (array_access | IDENTIFIER)+  ~ ("." ~  (array_access | IDENTIFIER))* }
+access =   { (array_access | IDENTIFIER)  ~ ("." ~  (array_access | IDENTIFIER))* }
 

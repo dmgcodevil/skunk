@@ -57,6 +57,9 @@ pub enum Node {
         name: String,         // The function name
         arguments: Vec<Node>, // The arguments are a list of expression nodes
     },
+    /*
+    todo support access an array returned from a function: foo()[0]
+    */
     ArrayAccess {
         name: String,
         coordinates: Vec<Node>,
