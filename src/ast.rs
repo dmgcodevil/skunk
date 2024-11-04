@@ -261,7 +261,7 @@ fn create_member_access(pair: Pair<Rule>) -> Node {
                 Rule::func_call => create_function_call(inner),
                 Rule::IDENTIFIER => Identifier(inner.as_str().to_string()),
                 _ => panic!("unsupported member access rule: {:?}", inner),
-            })
+            }),
         }
     } else {
         panic!("member access tree is empty")
@@ -343,7 +343,9 @@ fn create_struct_init(pair: Pair<Rule>) -> Node {
 
     if let Identifier(s) = name {
         StructInitialization { name: s, fields } // todo
-    } else { unreachable!() }
+    } else {
+        unreachable!()
+    }
 }
 
 fn create_base_type_from_str(s: &str) -> Type {
@@ -505,14 +507,17 @@ fn create_func_decl(pair: Pair<Rule>) -> Node {
     while let Some(statement) = inner_pairs.next() {
         body.push(create_ast(statement))
     }
-    if let Identifier(s) = name { // todo
+    if let Identifier(s) = name {
+        // todo
         Node::FunctionDeclaration {
             name: s,
             parameters,
             return_type,
             body,
         }
-    } else { unreachable!() }
+    } else {
+        unreachable!()
+    }
 }
 
 /// Recursive function to pretty print the parse tree
@@ -669,7 +674,6 @@ mod tests {
         }
     }
 
-
     fn access_var(name: &str) -> Node {
         Access {
             nodes: name
@@ -683,7 +687,11 @@ mod tests {
         Access {
             nodes: [
                 Identifier(name.to_string()),
-                MemberAccess { member: Box::new(Identifier(field_name.to_string())) }].to_vec()
+                MemberAccess {
+                    member: Box::new(Identifier(field_name.to_string())),
+                },
+            ]
+            .to_vec(),
         }
     }
 
@@ -1421,7 +1429,7 @@ mod tests {
                         })
                     },
                     Node::Assignment {
-                        var: Box::new(field_access("f","a")),
+                        var: Box::new(field_access("f", "a")),
                         value: Box::new(Node::Literal(Literal::Integer(1)))
                     },
                     Node::EOI
@@ -1532,8 +1540,11 @@ mod tests {
                                 coordinates: [
                                     Node::Literal(Literal::Integer(1)),
                                     Node::Literal(Literal::Integer(2))
-                                ].to_vec()
-                            }].to_vec()
+                                ]
+                                .to_vec()
+                            }
+                        ]
+                        .to_vec()
                     },
                     Node::EOI
                 ])
@@ -1555,9 +1566,10 @@ mod tests {
                             nodes: vec![
                                 Node::Identifier("arr".to_string()),
                                 Node::ArrayAccess {
-                                // name: "arr".to_string(),
-                                coordinates: vec![Node::Literal(Literal::Integer(0))],
-                            }]
+                                    // name: "arr".to_string(),
+                                    coordinates: vec![Node::Literal(Literal::Integer(0))],
+                                }
+                            ]
                         }),
                         value: Box::new(Node::Literal(Literal::Integer(1))),
                     },
@@ -1583,7 +1595,9 @@ mod tests {
                                 Node::ArrayAccess {
                                     coordinates: vec![Node::Literal(Literal::Integer(0))],
                                 },
-                                MemberAccess {member: Box::new(Node::Identifier("a".to_string()))},
+                                MemberAccess {
+                                    member: Box::new(Node::Identifier("a".to_string()))
+                                },
                             ]
                         }),
                         value: Box::new(Node::Literal(Literal::Integer(1))),
@@ -1610,11 +1624,15 @@ mod tests {
                                 Node::ArrayAccess {
                                     coordinates: vec![Node::Literal(Literal::Integer(0))],
                                 },
-                                Node::MemberAccess {member: Box::new(Node::Identifier("b".to_string()))},
+                                Node::MemberAccess {
+                                    member: Box::new(Node::Identifier("b".to_string()))
+                                },
                                 Node::ArrayAccess {
                                     coordinates: vec![Node::Literal(Literal::Integer(1))],
                                 },
-                                Node::MemberAccess {member: Box::new(Node::Identifier("c".to_string()))},
+                                Node::MemberAccess {
+                                    member: Box::new(Node::Identifier("c".to_string()))
+                                },
                             ]
                         }),
                         value: Box::new(Node::Literal(Literal::Integer(1))),
@@ -1640,9 +1658,16 @@ mod tests {
                             Node::Identifier("a".to_string()),
                             Node::MemberAccess {
                                 member: Box::new(Node::FunctionCall {
-                                    name: "f".to_string(), arguments: [].to_vec() }) }].to_vec()
+                                    name: "f".to_string(),
+                                    arguments: [].to_vec()
+                                })
+                            }
+                        ]
+                        .to_vec()
                     },
-                    Node::EOI].to_vec()
+                    Node::EOI
+                ]
+                .to_vec()
             },
             parse(source_code)
         )
