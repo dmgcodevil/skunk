@@ -29,7 +29,7 @@ operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt 
 size = { INTEGER }
 base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
 array_dim       = { "[" ~ expression ~ "]" }
-array_type      = { base_type ~ array_dim+ }
+array_type      = { base_type ~ array_dim+ } // todo in array type dims cannot be expressions, they should be literals: integers
 _type           = { array_type | base_type | "void" }
 return_type     = { ":" ~ _type }
 optional_return_type = _{ return_type? }
@@ -38,7 +38,7 @@ optional_return_type = _{ return_type? }
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
 statement         = { var_decl ~ ";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
-assignment        = { access  ~ "=" ~ expression }
+assignment        = { access ~ "=" ~ expression }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 var_decl          = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ expression }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
@@ -52,7 +52,7 @@ init_field_list    = { init_field ~ ("," ~ init_field)* }
 init_field         = { IDENTIFIER ~ ":" ~ expression }
 
 // Array Access and Initialization
-array_access = { IDENTIFIER ~ array_dim+ }
+array_access = { ("[" ~ expression ~ "]" )+ }
 array_init = { _type ~ "::new" ~ "(" ~ expression ~ ")" }
 
 // Static function calls
@@ -97,6 +97,7 @@ func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")"
 // member_access =   { (array_access | func_call | IDENTIFIER)+  ~ ("." ~ access)+ }
 // access = { member_access | array_access | IDENTIFIER }
 
-// flat
-access =   { (array_access | IDENTIFIER)  ~ ("." ~  (array_access | IDENTIFIER))* }
+member_access = { "." ~ (func_call | IDENTIFIER) }
+chained_access = {  ( func_call | IDENTIFIER ) ~ (array_access | member_access)+ }
+access = { chained_access | IDENTIFIER }
 

@@ -75,7 +75,7 @@ impl fmt::Display for Value {
             }
             &Value::Struct { .. } => todo!(),
             Value::Array { arr, dimensions } => write!(f, "array dimensions={:?}", dimensions),
-            Value::Void => write!(f, ""),
+            Void => write!(f, ""),
             _ => write!(f, "{:?}", "unknown"),
         }
     }
@@ -131,7 +131,7 @@ struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
 }
 
-fn get_element_from_array(value: &Value, coordinates: Vec<i64>) -> Rc<RefCell<Value>> {
+fn get_element_from_array(value: &Value, coordinates: &Vec<i64>) -> Rc<RefCell<Value>> {
     if let Value::Array {
         ref arr,
         ref dimensions,
@@ -144,18 +144,18 @@ fn get_element_from_array(value: &Value, coordinates: Vec<i64>) -> Rc<RefCell<Va
     }
 }
 
-fn set_array_element(value: &mut Value, new_value: &Rc<RefCell<Value>>, coordinates: Vec<i64>) {
+fn set_array_element(value: &mut Value, new_value: Rc<RefCell<Value>>, coordinates: &Vec<i64>) {
     if let Value::Array {
         ref mut arr,
         ref dimensions,
     } = value
     {
         let pos = to_1d_pos(coordinates, dimensions);
-        arr[pos] = Rc::clone(new_value);
+        arr[pos] = new_value;
     }
 }
 
-fn to_1d_pos(coordinates: Vec<i64>, dimensions: &Vec<i64>) -> usize {
+fn to_1d_pos(coordinates: &Vec<i64>, dimensions: &Vec<i64>) -> usize {
     if coordinates.len() != dimensions.len() {
         panic!(
             "invalid dimensions. expected={}, actual={}",
@@ -225,28 +225,12 @@ impl Environment {
     }
 
     fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+        // todo asserts
         self.variables.insert(name.to_string(), value);
     }
-
-    fn assign_variable(&mut self, name: &str, value: Value) {
-        let parts: Vec<&str> = name.split('.').collect();
-        let size = parts.len();
-
-        if size == 1 {
-            // Base case: if no nested fields, assign directly
-            if self.variables.contains_key(name) {
-                self.variables.insert(name.to_string(), Rc::new(RefCell::new(value)));
-            } else {
-                panic!("variable {} not declared", name);
-            }
-        } else {
-            let root_name = parts[0];
-            if let Some(root_instance) = self.variables.get_mut(root_name) {
-                set_nested_field(root_instance, &parts[1..], value);
-            } else {
-                panic!("variable {} not declared", root_name);
-            }
-        }
+    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+        // todo asserts
+        self.variables.insert(name.to_string(), value);
     }
 
     fn get_variable_value(&self, name: &str) -> Rc<RefCell<Value>> {
@@ -256,7 +240,6 @@ impl Environment {
             panic!("variable {} not declared", name);
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -317,82 +300,106 @@ fn get_value_by_name(
         Value::Undefined => {
             Rc::new(RefCell::new(Value::Undefined))
         }
-        Value::StructInstance { name, fields} =>
+        Value::StructInstance { name, fields } =>
             Rc::clone(fields.get(name).unwrap()),
         _ => panic!("expected current_value={:?}", current_value),
     }
 }
 
-fn get_value_nested(stack: &Rc<RefCell<CallStack>>,
-                    global_environment: &Rc<RefCell<GlobalEnvironment>>,
-                    current_value: Rc<RefCell<Value>>,
-                    access_node: &Node
-) -> Rc<RefCell<Value>> {
-    let stack_ref = stack.borrow();
-    let frame = stack_ref.current_frame();
-    match access_node {
-        Node::ArrayAccess {name, coordinates} => {
-            match current_value.borrow().deref()  {
-                Value::Undefined => Rc::clone(&frame.locals.get_variable_value(name)),
-                Value::StructInstance { name, fields} =>
-                    Rc::clone(fields.get(name).unwrap()),
-                _ => panic!("expected current_value={:?}", current_value.borrow().deref()),
-            }
-        }
-        Node::Identifier(name) => {
-            match current_value.borrow().deref() {
-                Value::Undefined => Rc::clone(&frame.locals.get_variable_value(name)),
-                Value::StructInstance { name, fields} =>
-                    Rc::clone(fields.get(name).unwrap()),
-                _ => panic!("expected current_value={:?}", current_value.borrow().deref()),
-            }
-        }
-        Node::FunctionCall { name, arguments } => {
-            match current_value.borrow().deref()  {
-                Value::Undefined => evaluate_node(access_node, stack, global_environment),
-                _ => panic!("function cannot be called on {:?}", current_value.borrow().deref()),
-            }
-        }
-        _ => panic!("unsupported access node={:?}", access_node),
+fn assert_value_is_struct(v: &Value) {
+    if !matches!(v, StructInstance { .. }) {
+        panic!("expected struct instance, found {:?}", v);
     }
 }
-fn evaluate_assigment(stack: &Rc<RefCell<CallStack>>,
-                      global_environment: &Rc<RefCell<GlobalEnvironment>>,
-                      current_value: Rc<RefCell<Value>>,
-                      i: usize, access_nodes: &Vec<Node>,
-                      new_value: Rc<RefCell<Value>>) {
-    let frame = stack.borrow().current_frame();
-    let access = &access_nodes[i];
-    if i == access_nodes.len() - 1 {
-        match access {
-            Node::ArrayAccess { name, coordinates } => {
-                if let Value::Array { arr, .. } = current_value.borrow().deref() {
-                    let _coordinates: Vec<i64> = coordinates.iter().map(|n| {
-                        match evaluate_node(n, stack, global_environment).borrow().deref() {
-                            Value::Integer(i) => *i,
-                            _ => panic!("array access expected int")
-                        }
-                    }).collect();
-                    set_array_element(current_value.borrow_mut().deref_mut(),
-                                      &new_value, _coordinates);
-                } else {
-                    panic!("expected array value. actual={}", current_value.borrow().deref())
-                }
-            }
-            Node::Identifier(name) => {
-                if let Value::StructInstance { name, ref mut fields } =
-                    current_value.borrow_mut().deref_mut() {
-                    fields.insert(name.to_string(), new_value.clone());
-                } else {
-                    panic!("expected struct instance, found: {:?}", current_value.borrow().deref());
-                }
-            }
-            _ => panic!("expected or unsupported access node. actual={:?}", access)
-        }
+
+fn get_struct_fields_mut(v: &mut Value) -> &mut HashMap<String, Rc<RefCell<Value>>> {
+    if let StructInstance { name, fields } = v {
+        fields
     } else {
-
+        panic!("expected struct instance, found {:?}", v);
     }
+}
 
+fn set_or_get_value(
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+    current_value: Rc<RefCell<Value>>,
+    i: usize,
+    access_nodes: &Vec<Node>,
+    new_value_opt: Option<Rc<RefCell<Value>>>,
+) -> Rc<RefCell<Value>> {
+    let mut current_value_borrow = current_value.borrow_mut();
+    let access_node = &access_nodes[i];
+    if let Node::MemberAccess { member } = access_node {
+        assert_value_is_struct(current_value_borrow.deref());
+        let mut struct_fields = get_struct_fields_mut(current_value_borrow.deref_mut());
+        if let Node::Identifier(name) = member.as_ref() {
+            if i == access_nodes.len() - 1 {
+                if let Some(new_value) = new_value_opt {
+                    struct_fields.insert(name.to_string(), new_value.clone());
+                    return Rc::new(RefCell::new(Undefined)); // todo return new value or struct instance ?
+                } else {
+                    struct_fields.get(name).unwrap().clone();
+                }
+            }
+            return set_or_get_value(stack, global_environment,
+                                    struct_fields.get(name).unwrap().clone(),
+                                    i + 1, access_nodes, new_value_opt);
+        } else if let Node::FunctionCall { name, arguments } = member.as_ref() {
+            if new_value_opt.is_some() {
+                // not allowed to do `f() = new_val`
+                panic!("Cannot assign value to function call");
+            }
+            if i == access_nodes.len() - 1 {
+                // todo
+                // or introduce scopes...
+                // call function within struct instance scope
+                return evaluate_node(member.as_ref(), stack, global_environment);
+            }
+            return set_or_get_value(stack, global_environment,
+                                    evaluate_node(member.as_ref(), stack, global_environment).clone(),
+                                    i + 1, access_nodes, new_value_opt);
+        }
+    } else if let Node::ArrayAccess { coordinates } = access_node {
+        let _coordinates: Vec<i64> = coordinates
+            .iter()
+            .map(|c| match evaluate_node(c, stack, global_environment).borrow().deref() {
+                Value::Integer(dim) => *dim,
+                _ => panic!("expected a number to access array"),
+            })
+            .collect();
+        if let Value::Array { .. } = current_value_borrow.deref() {
+            if i == access_nodes.len() - 1 {
+                if let Some(new_value) = new_value_opt {
+                    set_array_element(current_value_borrow.deref_mut(), Rc::clone(&new_value), &_coordinates);
+                    return Rc::new(RefCell::new(Undefined)); // or return new_value or array
+                } else {
+                    return Rc::clone(&get_element_from_array(current_value_borrow.deref(), &_coordinates));
+                }
+            }
+            return set_or_get_value(stack, global_environment,
+                                    Rc::clone(&get_element_from_array(current_value_borrow.deref(), &_coordinates)),
+                                    i + 1, access_nodes, new_value_opt);
+        } else {
+            panic!("expected array value, found {:?}", current_value_borrow.deref());
+        }
+    } else if let Node::Identifier(name) = access_node {
+        println!("name={:?}", name);
+        let mut stack_ref = stack.borrow_mut();
+        let mut frame = stack_ref.current_frame_mut();
+        if i == access_nodes.len() - 1 {
+            if let Some(new_value) = new_value_opt {
+                frame.locals.assign_variable(name, Rc::clone(&new_value));
+                return Rc::new(RefCell::new(Undefined)); // todo return new value ?
+            } else {
+                return Rc::clone(&frame.locals.get_variable_value(name));
+            }
+        } else {
+            return set_or_get_value(stack, global_environment, Rc::clone(&frame.locals.get_variable_value(name)),
+                                    i + 1, access_nodes, new_value_opt);
+        }
+    }
+    panic!("unreachable code")
 }
 
 pub fn evaluate_node(
@@ -402,7 +409,7 @@ pub fn evaluate_node(
 ) -> Rc<RefCell<Value>> {
     match node {
         Node::Program { statements } => {
-            let mut last  = Rc::new(RefCell::new(Void));
+            let mut last = Rc::new(RefCell::new(Void));
             for i in 0..statements.len() - 1 {
                 last = evaluate_node(&statements[i], stack, global_environment);
             }
@@ -470,42 +477,35 @@ pub fn evaluate_node(
             Rc::new(RefCell::new(value))
         }
         Node::Access { nodes } => {
-            /*
-struct C {
-    d:int;
-}
-struct B {
-    c:C;
-}
-struct A {
-    b: B[];
-}
-a: A[1] = A[1]::new();
-a[0].b[0].c.d = 1;
-
-
-we need to interpret Assigment node:
-
-Assignment {
-    var: Access {
-        nodes: [
-            ArrayAccess { name: "a", coordinates: [Literal(Integer(0))] },
-            ArrayAccess { name: "b", coordinates: [Literal(Integer(0))] },
-            Identifier("c"), Identifier("d")] },
-    value: Literal(Integer(1))
-}
-
-1. evaluate `a[0]` => gives struct A instance
-2. evaluate `b[0]` => gives struct B instance
-3. evaluate `c` => gives struct C instance
-4. `d` is last
-
-            */
-            Rc::new(RefCell::new(Undefined))
-
+            set_or_get_value(
+                stack, global_environment,
+                Rc::new(RefCell::new(Undefined)),
+                0,
+                nodes,
+                None,
+            ).clone()
         }
         Node::Assignment { var, value } => {
-            Rc::new(RefCell::new(Undefined))
+            match var.as_ref() {
+                Node::Access { nodes } =>
+                    set_or_get_value(
+                        stack, global_environment,
+                        Rc::new(RefCell::new(Undefined)),
+                        0,
+                        nodes,
+                        Some(Rc::clone(&evaluate_node(value.as_ref(), stack, global_environment))),
+                    ).clone(),
+                _ => panic!("expected access to assignment node "),
+            }
+        }
+        Node::Access { nodes } => {
+            set_or_get_value(
+                stack, global_environment,
+                Rc::new(RefCell::new(Undefined)),
+                0,
+                nodes,
+                None,
+            ).clone()
         }
         Node::FunctionCall { name, arguments } => {
             let args_values: Vec<_> = arguments
@@ -577,7 +577,7 @@ Assignment {
                         let n_val = evaluate_node(n, stack, global_environment);
                         let val = n_val.borrow().deref().clone();
                         if let Value::Return(v) = val {
-                            return Rc::new(RefCell::new(Value::Return(v.clone()) ))
+                            return Rc::new(RefCell::new(Value::Return(v.clone())));
                         }
                     }
                     return Rc::new(RefCell::new(Value::Executed));
@@ -593,7 +593,7 @@ Assignment {
                     return Rc::clone(&val_ref);
                 }
                 if let Value::Executed = val {
-                    return  Rc::clone(&val_ref);
+                    return Rc::clone(&val_ref);
                 }
             }
 
@@ -610,7 +610,7 @@ Assignment {
                 }
             }
 
-            Rc::new(RefCell::new(Value::Void))
+            Rc::new(RefCell::new(Void))
         }
         Node::For {
             init,
@@ -627,17 +627,17 @@ Assignment {
                     let binding = evaluate_node(cond.as_ref(), stack, global_environment);
                     let res = binding.borrow().deref().clone();
                     match res {
-                        Value::Boolean(v) =>v,
+                        Value::Boolean(v) => v,
                         _ => panic!("for condition in should be a boolean expression"),
                     }
                 })
                 .unwrap_or(true)
             {
                 for n in body {
-                    let val_ref = evaluate_node(n, stack, global_environment);
-                    let val_borrowed = val_ref.borrow();
-                    if matches!(val_borrowed.deref(), Value::Return(_)) {
-                        return Rc::clone(&val_ref);
+                    let val = evaluate_node(n, stack, global_environment);
+                    let val_ref = val.borrow();
+                    if matches!(val_ref.deref(), Value::Return(_)) {
+                        return Rc::clone(&val);
                     }
                 }
                 if let Some(n) = update {
@@ -651,11 +651,11 @@ Assignment {
             operator,
             right,
         } => {
-            let left_val_ref = evaluate_node(left, stack, global_environment);
-            let right_val_ref = evaluate_node(right, stack, global_environment);
-            let left_val_borrowed = left_val_ref.borrow();
-            let right_val_borrowed = right_val_ref.borrow();
-            match (left_val_borrowed.deref(), right_val_borrowed.deref()) {
+            let left_val = evaluate_node(left, stack, global_environment);
+            let right_val = evaluate_node(right, stack, global_environment);
+            let left_val_ref = left_val.borrow();
+            let right_val_ref = right_val.borrow();
+            match (left_val_ref.deref(), right_val_ref.deref()) {
                 (Value::Integer(l), Value::Integer(r)) => match operator {
                     Operator::Add => Rc::new(RefCell::new(Value::Integer(l + r))),
                     Operator::Subtract => Rc::new(RefCell::new(Value::Integer(l - r))),
@@ -692,52 +692,17 @@ Assignment {
             let v = current_frame.locals.get_variable_value(name);
             v.clone() // Return the cloned value
         }
-        Node::ArrayAccess { name, coordinates } => {
-            let mut pos: usize = 0;
-            let mut multiplier: i64 = 1;
-            let stack_ref = stack.borrow();
-            let current = stack_ref.current_frame();
-            let array_value_ref = current.locals.get_variable_value(name);
-
-            if let Value::Array {
-                ref arr,
-                ref dimensions,
-            } = array_value_ref.borrow().deref()
-            {
-                for i in (0..coordinates.len()).rev() {
-                    if let Value::Integer(coord) = *evaluate_node(
-                        &coordinates[i].clone(),
-                        &Rc::clone(stack),
-                        global_environment,
-                    ).borrow().deref() {
-                        if coord >= dimensions[i] {
-                            panic!(
-                                "array out of bound. {} >= {}. dim={}",
-                                coord, dimensions[i], i
-                            );
-                        }
-                        pos += (coord * multiplier) as usize;
-                        multiplier *= dimensions[i];
-                    } else {
-                        panic!("expected coordinate type to be an integer");
-                    }
-                }
-                return arr[pos].clone();
-            }
-            panic!(
-                "expected array, actual={:?}",
-                "current.locals.get_variable_value(name)"
-            )
-        }
         Node::EOI => Rc::new(RefCell::new(Void)),
-        Node::Return(n) =>
-            Rc::new(RefCell::new(
-            Value::Return(Box::new(evaluate_node(n, stack, global_environment).borrow().deref().clone())))),
+        Node::Return(n) => {
+            let val = evaluate_node(n, stack, global_environment);
+            let val_ref = val.borrow();
+            Rc::new(RefCell::new(Value::Return(Box::new(val_ref.clone()))))
+        }
         _ => panic!("Unexpected node type: {:?}", node),
     }
 }
 
-use crate::interpreter::Value::{Undefined, Void};
+use crate::interpreter::Value::{StructInstance, Undefined, Void};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 use std::cmp;
@@ -816,27 +781,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_array_access() {
+    fn test_array_modify() {
         let source_code = r#"
          arr: int[5] = int[5]::new(1);
+         arr[0] = 2;
          arr[0];
         "#;
         let program = ast::parse(source_code);
-        println!("{:?}", program);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(2), *res_ref.deref());
     }
 
-    //#[test]
-    fn test_array_set() {
+    #[test]
+    fn test_2d_array_modify() {
         let source_code = r#"
-            arr: int[1] = int[1]::new(0);
-            arr[0] = 1;
-            return arr[0];
+         arr: int[2][3] = int[2][3]::new(1);
+         arr[1][2] = 2;
+         arr[1][2];
         "#;
         let program = ast::parse(source_code);
-        println!("{:?}", evaluate(&program));
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(2), *res_ref.deref());
     }
 
-    //#[test]
+    #[test]
+    fn test_struct_int_field_modify() {
+        let source_code = r#"
+            struct Point {
+                x:int;
+                y:int;
+            }
+            p: Point = Point{x:1, y:2};
+            p.x = 3;
+            p.y = 4;
+            p;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::StructInstance {
+            name: "Point".to_string(),
+            fields: HashMap::from([
+                ("x".to_string(), Rc::new(RefCell::new(Value::Integer(3)))),
+                ("y".to_string(), Rc::new(RefCell::new(Value::Integer(4))))])
+        }, *res_ref.deref())
+    }
+
+    #[test]
+    fn test_struct_arr_field_modify() {
+        let source_code = r#"
+            struct Point {
+                c: int[2];
+            }
+            p: Point = Point{ c: int[2]::new(0) };
+            p.c[0] = 1;
+            p.c[1] = 2;
+            p;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(
+            StructInstance {
+                name: "Point".to_string(),
+                fields: HashMap::from([("c".to_string(), Rc::new(RefCell::new(Value::Array {
+                    arr: [Rc::new(RefCell::new(Value::Integer(1))), Rc::new(RefCell::new(Value::Integer(2)))
+                    ].to_vec(),
+                    dimensions: [2].to_vec()
+                })))])
+            }, *res_ref
+        )
+    }
+
+    // fixme introduce scopes
+    // #[test]
     fn test_array_dynamic_init() {
         let source_code = r#"
          i: int = 0;
