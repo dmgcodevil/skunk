@@ -489,7 +489,11 @@ pub fn evaluate_node(
         }
         Node::Literal(Literal::Boolean(x)) => Rc::new(RefCell::new(Value::Boolean(*x))),
         Node::VariableDeclaration { name, value, .. } => {
-            let value = evaluate_node(value, stack, global_environment);
+            let value = if let Some(body) = value {
+                evaluate_node(body, stack, global_environment)
+            } else {
+                Rc::new(RefCell::new(Undefined))
+            };
             stack
                 .borrow_mut()
                 .current_frame_mut()

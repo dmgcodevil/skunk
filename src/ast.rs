@@ -17,7 +17,7 @@ pub enum Node {
     VariableDeclaration {
         var_type: Type,
         name: String,
-        value: Box<Node>, // The value is an expression node
+        value: Option<Box<Node>>,
     },
     FunctionDeclaration {
         name: String,
@@ -413,15 +413,15 @@ fn create_var_decl(pair: Pair<Rule>) -> Node {
     let var_type = create_type(inner_pairs.next().unwrap());
 
     let body = if let Some(body_pair) = inner_pairs.next() {
-        create_ast(body_pair)
+        Some(Box::new(create_ast(body_pair)))
     } else {
-        Node::EMPTY
+        None
     };
 
     Node::VariableDeclaration {
         var_type,
         name: var_name,
-        value: Box::new(body),
+        value: body,
     }
 }
 
@@ -440,10 +440,6 @@ fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
         }
         _ => panic!("unexpected  rule {}", pair),
     }
-}
-
-fn stub() -> Node {
-    Node::EMPTY
 }
 
 fn create_expression(pair: Pair<Rule>) -> Node {
@@ -644,7 +640,7 @@ mod tests {
         Node::VariableDeclaration {
             name: name.to_string(),
             var_type: Type::Int,
-            value: Box::new(Node::Literal(Literal::Integer(value))),
+            value: Some(Box::new(Node::Literal(Literal::Integer(value)))),
         }
     }
 
@@ -781,7 +777,27 @@ mod tests {
                     Node::VariableDeclaration {
                         name: "a".to_string(),
                         var_type: Type::Int,
-                        value: Box::new(Node::Literal(Literal::Integer(0)))
+                        value: Some(Box::new(Node::Literal(Literal::Integer(0))))
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
+    #[test]
+    fn test_var_dec() {
+        let source_code = r#"
+        a:int;
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        name: "a".to_string(),
+                        var_type: Type::Int,
+                        value: None
                     },
                     Node::EOI
                 ])
@@ -828,11 +844,11 @@ mod tests {
                     Node::VariableDeclaration {
                         name: "a".to_string(),
                         var_type: Type::Int,
-                        value: Box::new(Node::BinaryOp {
+                        value: Some(Box::new(Node::BinaryOp {
                             left: Box::new(Node::Literal(Literal::Integer(2))),
                             operator: Operator::Add,
                             right: Box::new(Node::Literal(Literal::Integer(3)))
-                        })
+                        }))
                     },
                     Node::EOI
                 ])
@@ -851,7 +867,7 @@ mod tests {
                     Node::VariableDeclaration {
                         name: "a".to_string(),
                         var_type: Type::Int,
-                        value: Box::new(Node::BinaryOp {
+                        value: Some(Box::new(Node::BinaryOp {
                             left: Box::new(Node::Literal(Literal::Integer(2))),
                             operator: Operator::Add,
                             right: Box::new(Node::BinaryOp {
@@ -859,7 +875,7 @@ mod tests {
                                 operator: Operator::Divide,
                                 right: Box::new(Node::Literal(Literal::Integer(4))),
                             })
-                        })
+                        }))
                     },
                     Node::EOI
                 ])
@@ -878,7 +894,7 @@ mod tests {
                     Node::VariableDeclaration {
                         name: "a".to_string(),
                         var_type: Type::Int,
-                        value: Box::new(Node::BinaryOp {
+                        value: Some(Box::new(Node::BinaryOp {
                             left: Box::new(Node::BinaryOp {
                                 left: Box::new(Node::Literal(Literal::Integer(2))),
                                 operator: Operator::Add,
@@ -886,7 +902,7 @@ mod tests {
                             }),
                             operator: Operator::Divide,
                             right: Box::new(Node::Literal(Literal::Integer(4)))
-                        })
+                        }))
                     },
                     Node::EOI
                 ])
@@ -929,13 +945,13 @@ mod tests {
                         body: Vec::from([Node::VariableDeclaration {
                             name: "res".to_string(),
                             var_type: Type::Int,
-                            value: Box::new(Node::FunctionCall {
+                            value: Some(Box::new(Node::FunctionCall {
                                 name: "sum".to_string(),
                                 arguments: Vec::from([
                                     Node::Literal(Literal::Integer(1)),
                                     Node::Literal(Literal::Integer(2))
                                 ])
-                            })
+                            }))
                         }]),
                     },
                     Node::EOI
@@ -1015,7 +1031,7 @@ mod tests {
         let var_decl = Node::VariableDeclaration {
             var_type: Type::Boolean,
             name: "c".to_string(),
-            value: Box::new(and),
+            value: Some(Box::new(and)),
         };
 
         assert_eq!(
@@ -1038,7 +1054,7 @@ mod tests {
         let var_declr = Node::VariableDeclaration {
             var_type: Type::Boolean,
             name: "c".to_string(),
-            value: Box::new(and),
+            value: Some(Box::new(and)),
         };
 
         assert_eq!(
@@ -1067,7 +1083,7 @@ mod tests {
         let var_decl = Node::VariableDeclaration {
             var_type: Type::Boolean,
             name: "d".to_string(),
-            value: Box::new(or),
+            value: Some(Box::new(or)),
         };
 
         assert_eq!(
@@ -1216,11 +1232,6 @@ mod tests {
         let gt = Node::BinaryOp {
             left: Box::new(var_a.clone()),
             operator: Operator::GreaterThan,
-            right: Box::new(var_b.clone()),
-        };
-        let eq = Node::BinaryOp {
-            left: Box::new(var_a.clone()),
-            operator: Operator::Equals,
             right: Box::new(var_b.clone()),
         };
         let if_body = Vec::from([Node::Print(Box::new(Node::Literal(
@@ -1423,10 +1434,10 @@ mod tests {
                     Node::VariableDeclaration {
                         var_type: Type::Custom("Foo".to_string()),
                         name: "f".to_string(),
-                        value: Box::new(Node::StructInitialization {
+                        value: Some(Box::new(Node::StructInitialization {
                             name: "Foo".to_string(),
                             fields: Vec::from([])
-                        })
+                        }))
                     },
                     Node::Assignment {
                         var: Box::new(field_access("f", "a")),
@@ -1453,13 +1464,13 @@ mod tests {
                     Node::VariableDeclaration {
                         var_type: Type::Custom("Point".to_string()),
                         name: "p".to_string(),
-                        value: Box::new(Node::StructInitialization {
+                        value: Some(Box::new(Node::StructInitialization {
                             name: "Point".to_string(),
                             fields: Vec::from([
                                 ("x".to_string(), Node::Literal(Literal::Integer(0))),
                                 ("y".to_string(), Node::Literal(Literal::Integer(1)))
                             ])
-                        })
+                        }))
                     },
                     Node::EOI
                 ])
@@ -1484,14 +1495,14 @@ mod tests {
                             dimensions: Vec::from([1])
                         },
                         name: "arr".to_string(),
-                        value: Box::new(Node::StaticFunctionCall {
+                        value: Some(Box::new(Node::StaticFunctionCall {
                             _type: Type::Array {
                                 elem_type: Box::new(Type::Int),
                                 dimensions: Vec::from([1])
                             },
                             name: "new".to_string(),
                             arguments: Vec::from([Node::Literal(Literal::Integer(1))])
-                        })
+                        }))
                     },
                     Node::EOI
                 ])
@@ -1566,7 +1577,6 @@ mod tests {
                             nodes: vec![
                                 Node::Identifier("arr".to_string()),
                                 Node::ArrayAccess {
-                                    // name: "arr".to_string(),
                                     coordinates: vec![Node::Literal(Literal::Integer(0))],
                                 }
                             ]

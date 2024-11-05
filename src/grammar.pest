@@ -40,7 +40,7 @@ program           = { SOI ~ statement* ~ EOI }
 statement         = { var_decl ~ ";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" }
 assignment        = { access ~ "=" ~ expression }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
-var_decl          = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ expression }
+var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ("=" ~ expression)? }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ "}" }
