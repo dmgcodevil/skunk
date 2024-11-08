@@ -292,39 +292,26 @@ fn set_or_get_value(
     let access_node = &access_nodes[i];
     if let Node::MemberAccess { member } = access_node {
         assert_value_is_struct(current_value_borrow.deref());
-        let mut struct_fields = get_struct_fields_mut(current_value_borrow.deref_mut());
+        let struct_fields = get_struct_fields_mut(current_value_borrow.deref_mut());
         if let Node::Identifier(name) = member.as_ref() {
             if i == access_nodes.len() - 1 {
                 return if let Some(new_value) = new_value_opt {
                     struct_fields.insert(name.to_string(), new_value.clone());
-                    Rc::new(RefCell::new(Undefined)) // todo return new value or struct instance ?
+                    Rc::new(RefCell::new(Value::Undefined))
                 } else {
-                    struct_fields.get(name).unwrap().clone()
+                    struct_fields
+                        .get(name)
+                        .unwrap_or_else(|| panic!("field `{}` not found", name))
+                        .clone()
                 };
             }
             return set_or_get_value(
                 stack,
                 global_environment,
-                struct_fields.get(name).unwrap().clone(),
-                i + 1,
-                access_nodes,
-                new_value_opt,
-            );
-        } else if let Node::FunctionCall { name, arguments } = member.as_ref() {
-            if new_value_opt.is_some() {
-                // not allowed to do `f() = new_val`
-                panic!("Cannot assign value to function call");
-            }
-            if i == access_nodes.len() - 1 {
-                // todo
-                // or introduce scopes...
-                // call function within struct instance scope
-                return evaluate_node(member.as_ref(), stack, global_environment);
-            }
-            return set_or_get_value(
-                stack,
-                global_environment,
-                evaluate_node(member.as_ref(), stack, global_environment).clone(),
+                struct_fields
+                    .get(name)
+                    .unwrap_or_else(|| panic!("field `{}` not found", name))
+                    .clone(),
                 i + 1,
                 access_nodes,
                 new_value_opt,
@@ -336,25 +323,25 @@ fn set_or_get_value(
             .map(
                 |c| match evaluate_node(c, stack, global_environment).borrow().deref() {
                     Value::Integer(dim) => *dim,
-                    _ => panic!("expected a number to access array"),
+                    _ => panic!("expected integer index for array access"),
                 },
             )
             .collect();
         if let Value::Array { .. } = current_value_borrow.deref() {
             if i == access_nodes.len() - 1 {
-                if let Some(new_value) = new_value_opt {
+                return if let Some(new_value) = new_value_opt {
                     set_array_element(
                         current_value_borrow.deref_mut(),
                         Rc::clone(&new_value),
                         &_coordinates,
                     );
-                    return Rc::new(RefCell::new(Undefined)); // or return new_value or array
+                    Rc::new(RefCell::new(Value::Undefined))
                 } else {
-                    return Rc::clone(&get_element_from_array(
+                    Rc::clone(&get_element_from_array(
                         current_value_borrow.deref(),
                         &_coordinates,
-                    ));
-                }
+                    ))
+                };
             }
             return set_or_get_value(
                 stack,
@@ -546,13 +533,14 @@ pub fn evaluate_node(
             }
             stack.borrow_mut().push(frame);
 
-            let mut result = Rc::new(RefCell::new(Void));
+            let mut result = Rc::new(RefCell::new(Undefined));
             for n in &fun.body {
                 if let Value::Return(v) = evaluate_node(&n, stack, global_environment)
                     .borrow()
                     .deref()
                 {
                     result = Rc::clone(v);
+                    break;
                 }
             }
             stack.borrow_mut().pop();
@@ -668,6 +656,16 @@ pub fn evaluate_node(
             }
             Rc::new(RefCell::new(Void))
         }
+        Node::UnaryOp { operator, operand } => {
+            let operand_val = evaluate_node(operand, stack, global_environment);
+            match operator {
+                ast::UnaryOperator::Plus => operand_val, // unary `+` doesn't change the value
+                ast::UnaryOperator::Minus => match *operand_val.borrow() {
+                    Value::Integer(val) => Rc::new(RefCell::new(Value::Integer(-val))),
+                    _ => panic!("Unary minus is only supported for integers"),
+                },
+            }
+        }
         Node::BinaryOp {
             left,
             operator,
@@ -683,6 +681,8 @@ pub fn evaluate_node(
                     Operator::Subtract => Rc::new(RefCell::new(Value::Integer(l - r))),
                     Operator::Multiply => Rc::new(RefCell::new(Value::Integer(l * r))),
                     Operator::Divide => Rc::new(RefCell::new(Value::Integer(l / r))),
+                    Operator::Mod => Rc::new(RefCell::new(Value::Integer(l % r))),
+                    Operator::Equals => Rc::new(RefCell::new(Value::Boolean(l == r))),
                     Operator::LessThanOrEqual => Rc::new(RefCell::new(Value::Boolean(l <= r))),
                     Operator::LessThan => Rc::new(RefCell::new(Value::Boolean(l < r))),
                     Operator::GreaterThanOrEqual => Rc::new(RefCell::new(Value::Boolean(l >= r))),
@@ -694,7 +694,10 @@ pub fn evaluate_node(
                     Operator::Or => Rc::new(RefCell::new(Value::Boolean(*a || *b))),
                     _ => panic!("Unsupported operator"),
                 },
-                _ => panic!("Unsupported binary operation"),
+                _ => panic!(
+                    "Unsupported binary operation={:?}, left={:?}, right={:?}",
+                    operator, left_val_ref, right_val_ref
+                ),
             }
         }
         Node::Print(value) => {
@@ -1112,5 +1115,219 @@ mod tests {
             let res_ref = res.borrow();
             assert_eq!(Value::Integer(10), *res_ref.deref());
         }
+    }
+
+    #[test]
+    fn test_mod() {
+        let source_code = r#"
+            function isEven(i: int):boolean {
+                if (i % 2 == 0) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            isEven(3);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        println!("{:?}", res);
+    }
+
+    #[test]
+    fn test_return_from_for_loop() {
+        let source_code = r#"
+            function findFirstEven(limit: int): int {
+                for (i:int = 0; i < limit; i = i + 1) {
+                    if (i % 2 == 0) {
+                        return i;
+                    }
+                }
+                return -1;
+            }
+            findFirstEven(5);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(0), *res_ref.deref());
+    }
+
+    #[test]
+    fn test_return_from_nested_for_loop() {
+        let source_code = r#"
+            function findFirstMatch(): int {
+                for (i:int = 0; i < 3; i = i + 1) {
+                    for (j:int = 0; j < 3; j = j + 1) {
+                        if (i + j == 2) {
+                            return i * 10 + j;
+                        }
+                    }
+                }
+                return -1;
+            }
+            findFirstMatch();
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(2), *res_ref.deref());
+    }
+
+    #[test]
+    fn test_for_with_nested_if() {
+        let source_code = r#"
+            function countEvenOdds(limit: int): int {
+                even_count: int = 0;
+                odd_count: int = 0;
+                for (i:int = 0; i < limit; i = i + 1) {
+                    if (i % 2 == 0) {
+                        even_count = even_count + 1;
+                    } else {
+                        odd_count = odd_count + 1;
+                    }
+                }
+                return even_count * 10 + odd_count;
+            }
+            countEvenOdds(5);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(30 + 2), *res_ref.deref());
+    }
+
+    #[test]
+    fn test_for_inside_if() {
+        let source_code = r#"
+            function conditionalLoop(cond: bool): int {
+                sum: int = 0;
+                if (cond) {
+                    for (i:int = 1; i <= 3; i = i + 1) {
+                        sum = sum + i;
+                    }
+                } else {
+                    sum = -1;
+                }
+                return sum;
+            }
+            conditionalLoop(true);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(6), *res_ref.deref());
+    }
+
+    #[test]
+    fn test_nested_for_with_early_return_in_if() {
+        let source_code = r#"
+            function complexLoop(): int {
+                for (i:int = 0; i < 4; i = i + 1) {
+                    for (j:int = 0; j < 4; j = j + 1) {
+                        if (i * j == 6) {
+                            return i * 10 + j;
+                        }
+                    }
+                }
+                return -1;
+            }
+            complexLoop();
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(23), *res_ref.deref()); // i=2, j=3 gives 6
+    }
+
+    #[test]
+    fn test_for_loop_with_if_break_condition() {
+        let source_code = r#"
+            function sumUntilLimit(limit: int): int {
+                sum: int = 0;
+                for (i:int = 1; i < 10; i = i + 1) {
+                    if (sum + i > limit) {
+                        return sum;
+                    }
+                    sum = sum + i;
+                }
+                return sum;
+            }
+            sumUntilLimit(10);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(10), *res_ref.deref()); // Sum is 1+2+3 before hitting limit
+    }
+
+    #[test]
+    fn test_for_with_nested_for_and_if_with_else() {
+        let source_code = r#"
+            function complexLoopWithElse(): int {
+                sum: int = 0;
+                for (i:int = 1; i <= 3; i = i + 1) {
+                    for (j:int = 1; j <= 3; j = j + 1) {
+                        if (i == j) {
+                            sum = sum + 10 * i;
+                        } else {
+                            sum = sum + j;
+                        }
+                    }
+                }
+                return sum;
+            }
+            complexLoopWithElse();
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(72), *res_ref.deref());
+    }
+
+    #[test]
+    fn test_return_in_for_inside_if_with_fallback() {
+        let source_code = r#"
+            function loopInsideIfWithFallback(cond: bool): int {
+                if (cond) {
+                    for (i:int = 1; i <= 5; i = i + 1) {
+                        if (i == 3) {
+                            return i * 10;
+                        }
+                    }
+                }
+                return -1;
+            }
+            loopInsideIfWithFallback(true);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(30), *res_ref.deref());
+    }
+
+    #[test]
+    fn test_for_with_multiple_if_conditions() {
+        let source_code = r#"
+            function classifyNumbers(limit: int): int {
+                even_sum: int = 0;
+                odd_sum: int = 0;
+                for (i:int = 1; i <= limit; i = i + 1) {
+                    if (i % 2 == 0) {
+                        even_sum = even_sum + i;
+                    } else if (i % 3 == 0) {
+                        odd_sum = odd_sum + i * 2;
+                    } else {
+                        odd_sum = odd_sum + i;
+                    }
+                }
+                return even_sum * 100 + odd_sum;
+            }
+            classifyNumbers(6);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        assert_eq!(Value::Integer(1212), *res_ref.deref()); // even_sum = 12, odd_sum = 6
     }
 }

@@ -10,20 +10,24 @@ STRING_LITERAL  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 BOOLEAN_LITERAL = { "true" | "false" }
 
 // Operations
-operation = _{ add | subtract | multiply | divide | power | and | or | lte | lt | gte | gt | eq | not_eq | not }
-    add      = { "+" }
-    subtract = { "-" }
-    multiply = { "*" }
-    divide   = { "/" }
-    power    = { "^" }
-    and      = { "&&" }
-    or       = { "||" }
-    lt       = { "<" }
-    lte      = { "<=" }
-    gt       = { ">" }
-    gte      = { ">=" }
-    eq       = { "==" }
-    not_eq   = { "!=" }
+operation = _{ add | subtract | multiply | divide | modulus | power | and | or | lte | lt | gte | gt | eq | not_eq | not }
+    add             = { "+" }
+    subtract        = { "-" }
+    multiply        = { "*" }
+    divide          = { "/" }
+    modulus         = { "%" }
+    power           = { "^" }
+    and             = { "&&" }
+    or              = { "||" }
+    lt              = { "<" }
+    lte             = { "<=" }
+    gt              = { ">" }
+    gte             = { ">=" }
+    eq              = { "==" }
+    not_eq          = { "!=" }
+    unary_plus      = { "+" }
+    unary_minus     = { "-" }
+
 
 // Types
 size = { INTEGER }
@@ -88,7 +92,7 @@ sk_return        = { "return" ~ expression ~ ";" }
 // Expressions
 expression      = { primary ~ (operation ~ primary)* }
 not             = { "!" ~ primary }
-primary         = { not | literal | static_func_call | func_call | struct_init | access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { not | (unary_plus | unary_minus)? ~ literal | static_func_call | func_call | struct_init | access | "(" ~ expression ~ ")" | IDENTIFIER }
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 

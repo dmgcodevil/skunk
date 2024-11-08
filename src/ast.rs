@@ -53,6 +53,10 @@ pub enum Node {
         operator: Operator, // The operator
         right: Box<Node>,   // The right operand is an expression node
     },
+    UnaryOp {
+        operator: UnaryOperator,
+        operand: Box<Node>,
+    },
     FunctionCall {
         name: String,         // The function name
         arguments: Vec<Node>, // The arguments are a list of expression nodes
@@ -95,6 +99,7 @@ pub enum Operator {
     Subtract,
     Multiply,
     Divide,
+    Mod,
     Power,
     Equals,
     NotEquals,
@@ -105,6 +110,12 @@ pub enum Operator {
     And,
     Or,
     Not,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum UnaryOperator {
+    Plus,
+    Minus,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -213,20 +224,18 @@ lazy_static::lazy_static! {
       static ref PRATT_PARSER: PrattParser<Rule> = {
         use Rule::*;
         use Assoc::*;
-
         PrattParser::new()
-            .op(Op::infix(add, Left) | Op::infix(subtract, Left))
-            .op(Op::infix(multiply, Left) | Op::infix(divide, Left))
-            .op(Op::infix(power, Right))
-            .op(Op::infix(or, Left))
-            .op(Op::infix(and, Left))
+            .op(Op::infix(eq, Left))
+            .op(Op::infix(not_eq, Left))
             .op(Op::infix(lt, Left))
             .op(Op::infix(lte, Left))
             .op(Op::infix(gt, Left))
             .op(Op::infix(gte, Left))
-            .op(Op::infix(eq, Left))
-            .op(Op::infix(not_eq, Left))
-
+            .op(Op::infix(add, Left) | Op::infix(subtract, Left))
+            .op(Op::infix(multiply, Left) | Op::infix(divide, Left) | Op::infix(modulus, Left))
+            .op(Op::infix(power, Right))
+            .op(Op::infix(or, Left))
+            .op(Op::infix(and, Left))
 };
 }
 
@@ -444,7 +453,21 @@ fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
 
 fn create_expression(pair: Pair<Rule>) -> Node {
     PRATT_PARSER
-        .map_primary(|primary| create_ast(primary))
+        .map_primary(|primary| {
+            let mut inner_pairs = primary.into_inner();
+            let inner = inner_pairs.next().unwrap();
+            match inner.as_rule() {
+                Rule::unary_plus => Node::UnaryOp {
+                    operator: UnaryOperator::Plus,
+                    operand: Box::new(create_ast(inner_pairs.next().unwrap())),
+                },
+                Rule::unary_minus => Node::UnaryOp {
+                    operator: UnaryOperator::Minus,
+                    operand: Box::new(create_ast(inner_pairs.next().unwrap())),
+                },
+                _ => create_ast(inner), // todo verify should we pass inner or primary
+            }
+        })
         .map_infix(|lhs, op, rhs| {
             let operator = match op.as_rule() {
                 // Rule::assign => Operator::Assign,
@@ -452,16 +475,18 @@ fn create_expression(pair: Pair<Rule>) -> Node {
                 Rule::subtract => Operator::Subtract,
                 Rule::multiply => Operator::Multiply,
                 Rule::divide => Operator::Divide,
+                Rule::modulus => Operator::Mod,
                 Rule::power => Operator::Power,
                 Rule::and => Operator::And,
                 Rule::or => Operator::Or,
+                Rule::eq => Operator::Equals,
                 Rule::not_eq => Operator::NotEquals,
                 // Rule::not => Operator::Not,
                 Rule::lt => Operator::LessThan,
                 Rule::lte => Operator::LessThanOrEqual,
                 Rule::gt => Operator::GreaterThan,
                 Rule::gte => Operator::GreaterThanOrEqual,
-                _ => unreachable!(),
+                _ => panic!("unsupported operator {:?}", op),
             };
 
             Node::BinaryOp {
@@ -473,13 +498,9 @@ fn create_expression(pair: Pair<Rule>) -> Node {
         .parse(pair.into_inner())
 }
 
-//todo return Node
 fn create_identifier(pair: Pair<Rule>) -> Node {
     match pair.as_rule() {
-        Rule::IDENTIFIER => {
-            println!("create_identifier={:?}", pair);
-            Identifier(pair.as_str().to_string())
-        }
+        Rule::IDENTIFIER => Identifier(pair.as_str().to_string()),
         _ => panic!("not identifier rule {}", pair),
     }
 }
@@ -698,6 +719,44 @@ mod tests {
     }
     fn print_var(name: &str) -> Node {
         Node::Print(Box::new(access_var(name)))
+    }
+
+    #[test]
+    fn test_test_unary_minus() {
+        let source_code = r#"
+           -1;
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::UnaryOp {
+                        operator: UnaryOperator::Minus,
+                        operand: Box::new(Node::Literal(Literal::Integer(1))),
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_test_unary_plus() {
+        let source_code = r#"
+           +1;
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::UnaryOp {
+                        operator: UnaryOperator::Plus,
+                        operand: Box::new(Node::Literal(Literal::Integer(1))),
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
     }
 
     #[test]
@@ -1681,5 +1740,15 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test]
+    fn test_mod() {
+        let source_code = r#"
+            if (i % 2 == 0) {
+                return i;
+            }
+        "#;
+        println!("{:?}", parse(source_code));
     }
 }
