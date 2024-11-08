@@ -151,6 +151,45 @@ pub fn extract_struct_field(field: &Node) -> (String, Type) {
     }
 }
 
+fn create_primary(pair: Pair<Rule>) -> Node {
+    assert_eq!(pair.as_rule(), Rule::primary);
+    let mut primary_inner_pairs = pair.into_inner();
+    assert_eq!(
+        primary_inner_pairs.len(),
+        1,
+        "primary should have exactly one child"
+    );
+    let primary_child = primary_inner_pairs.next().unwrap();
+    match primary_child.as_rule() {
+        Rule::unary_op => {
+            let mut unary_pairs = primary_child.into_inner();
+            assert_eq!(
+                unary_pairs.len(),
+                2,
+                "unary pair should have exactly two children"
+            );
+            let unary_op_pair = unary_pairs.next().unwrap();
+            let unary_operand_pair = unary_pairs.next().unwrap();
+            match unary_op_pair.as_rule() {
+                Rule::unary_plus => Node::UnaryOp {
+                    operator: UnaryOperator::Plus,
+                    operand: Box::new(create_ast(unary_operand_pair)),
+                },
+                Rule::unary_minus => Node::UnaryOp {
+                    operator: UnaryOperator::Minus,
+                    operand: Box::new(create_ast(unary_operand_pair)),
+                },
+                Rule::negate => Node::UnaryOp {
+                    operator: UnaryOperator::Negate,
+                    operand: Box::new(create_ast(unary_operand_pair)),
+                },
+                _ => panic!("unsupported unary operator {:?}", unary_op_pair),
+            }
+        }
+        _ => create_ast(primary_child),
+    }
+}
+
 fn create_ast(pair: Pair<Rule>) -> Node {
     let r = pair.as_rule();
     match r {
@@ -169,22 +208,11 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::expression => create_expression(pair),
         Rule::assignment => create_assignment(pair),
         Rule::struct_decl => create_struct_decl(pair),
-        // Rule::array_alloc => create_array_alloc(pair),
         Rule::var_decl => create_var_decl(pair),
         Rule::func_decl => create_func_decl(pair),
-        // Rule::not => {
-        //     let mut pairs = pair.into_inner();
-        //     let inner = pairs.next().unwrap();
-        //     Node::Not {
-        //         body: Box::new(create_ast(inner)),
-        //     }
-        // }
         Rule::literal => create_literal(pair),
         Rule::size => create_literal(pair),
-        Rule::primary => {
-            let mut pairs = pair.into_inner();
-            create_ast(pairs.next().unwrap())
-        }
+        Rule::primary => create_primary(pair),
         Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
         Rule::access => create_access(pair),
         Rule::func_call => create_function_call(pair),
@@ -449,47 +477,9 @@ fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
     }
 }
 
-/*
-
-      expression: `!a`
-        primary: `!a`
-          unary_op: `!a`
-            negate: `!`
-            primary: `a`
-              access: `a`
-                IDENTIFIER: `a`
-*/
-
 fn create_expression(pair: Pair<Rule>) -> Node {
     PRATT_PARSER
-        .map_primary(|primary| {
-            let mut inner_pairs = primary.clone().into_inner();
-            let inner = inner_pairs.next().unwrap();
-            match inner.as_rule() {
-                Rule::unary_op => {
-                    let mut unary_pairs = inner.into_inner();
-                    let unary_op_pair = unary_pairs.next().unwrap();
-                    let unary_operand_pair = unary_pairs.next().unwrap();
-                    match unary_op_pair.as_rule() {
-                        Rule::unary_plus => Node::UnaryOp {
-                            operator: UnaryOperator::Plus,
-                            operand: Box::new(create_ast(unary_operand_pair)),
-                        },
-                        Rule::unary_minus => Node::UnaryOp {
-                            operator: UnaryOperator::Minus,
-                            operand: Box::new(create_ast(unary_operand_pair)),
-                        },
-                        Rule::negate => Node::UnaryOp {
-                            operator: UnaryOperator::Negate,
-                            operand: Box::new(create_ast(unary_operand_pair)),
-                        },
-                        _ => panic!("unsupported unary operator {:?}", unary_op_pair),
-                    }
-                }
-
-                _ => create_ast(primary), // todo verify should we pass inner or primary
-            }
-        })
+        .map_primary(|primary| create_primary(primary))
         .map_infix(|lhs, op, rhs| {
             let operator = match op.as_rule() {
                 // Rule::assign => Operator::Assign,
@@ -1505,6 +1495,89 @@ mod tests {
     }
 
     #[test]
+    fn test_return_in_nested_for_and_if() {
+        let source_code = r#"
+        function test(): int {
+            for (i = 0; i < 5; i = i + 1) {
+                if (i % 2 == 0) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+        test();
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::FunctionDeclaration {
+                        name: "test".to_string(),
+                        parameters: vec![],
+                        return_type: Type::Int,
+                        body: vec![
+                            Node::For {
+                                init: Some(Box::new(Node::Assignment {
+                                    var: Box::new(Node::Access {
+                                        nodes: vec![Node::Identifier("i".to_string())],
+                                    }),
+                                    value: Box::new(Node::Literal(Literal::Integer(0))),
+                                })),
+                                condition: Some(Box::new(Node::BinaryOp {
+                                    left: Box::new(Node::Access {
+                                        nodes: vec![Node::Identifier("i".to_string())],
+                                    }),
+                                    operator: Operator::LessThan,
+                                    right: Box::new(Node::Literal(Literal::Integer(5))),
+                                })),
+                                update: Some(Box::new(Node::Assignment {
+                                    var: Box::new(Node::Access {
+                                        nodes: vec![Node::Identifier("i".to_string())],
+                                    }),
+                                    value: Box::new(Node::BinaryOp {
+                                        left: Box::new(Node::Access {
+                                            nodes: vec![Node::Identifier("i".to_string())],
+                                        }),
+                                        operator: Operator::Add,
+                                        right: Box::new(Node::Literal(Literal::Integer(1))),
+                                    }),
+                                })),
+                                body: vec![Node::If {
+                                    condition: Box::new(Node::BinaryOp {
+                                        left: Box::new(Node::BinaryOp {
+                                            left: Box::new(Node::Access {
+                                                nodes: vec![Node::Identifier("i".to_string())],
+                                            }),
+                                            operator: Operator::Mod,
+                                            right: Box::new(Node::Literal(Literal::Integer(2))),
+                                        }),
+                                        operator: Operator::Equals,
+                                        right: Box::new(Node::Literal(Literal::Integer(0))),
+                                    }),
+                                    body: vec![Node::Return(Box::new(Node::Access {
+                                        nodes: vec![Node::Identifier("i".to_string())],
+                                    })),],
+                                    else_if_blocks: vec![],
+                                    else_block: None,
+                                },],
+                            },
+                            Node::Return(Box::new(Node::UnaryOp {
+                                operator: UnaryOperator::Minus,
+                                operand: Box::new(Node::Literal(Literal::Integer(1))),
+                            })),
+                        ],
+                    },
+                    Node::FunctionCall {
+                        name: "test".to_string(),
+                        arguments: vec![]
+                    },
+                    Node::EOI
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
     fn test_member_access() {
         let source_code = r#"
             f: Foo = Foo{};
@@ -1929,34 +2002,6 @@ mod tests {
         );
     }
 
-    // #[test] todo --i not supported and it's not unary operator
-    // fn test_nested_unary_operations_with_arithmetic() {
-    //     let source_code = r#"
-    //     --i + 2;
-    // "#;
-    //     assert_eq!(
-    //         Node::Program {
-    //             statements: vec![
-    //                 Node::BinaryOp {
-    //                     left: Box::new(Node::UnaryOp {
-    //                         operator: UnaryOperator::Negate,
-    //                         operand: Box::new(Node::UnaryOp {
-    //                             operator: UnaryOperator::Negate,
-    //                             operand: Box::new(Access {
-    //                                 nodes: vec![Identifier("i".to_string())]
-    //                             }),
-    //                         }),
-    //                     }),
-    //                     operator: Operator::Add,
-    //                     right: Box::new(Node::Literal(Literal::Integer(2))),
-    //                 },
-    //                 Node::EOI,
-    //             ]
-    //         },
-    //         parse(source_code)
-    //     );
-    // }
-
     #[test]
     fn test_add_subtract_multiply_divide() {
         let source_code = r#"
@@ -1988,6 +2033,84 @@ mod tests {
                         right: Box::new(Node::Literal(Literal::Integer(3))),
                     },
                     Node::EOI,
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_nested_unary_operations() {
+        let source_code = r#"
+        !!(a && !b);
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::UnaryOp {
+                        operator: UnaryOperator::Negate,
+                        operand: Box::new(Node::UnaryOp {
+                            operator: UnaryOperator::Negate,
+                            operand: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("a".to_string())],
+                                }),
+                                operator: Operator::And,
+                                right: Box::new(Node::UnaryOp {
+                                    operator: UnaryOperator::Negate,
+                                    operand: Box::new(Node::Access {
+                                        nodes: vec![Node::Identifier("b".to_string())],
+                                    })
+                                })
+                            })
+                        })
+                    },
+                    Node::EOI
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_complex_unary_operations() {
+        let source_code = r#"
+        -a * +b / !(c - d);
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::BinaryOp {
+                        left: Box::new(Node::BinaryOp {
+                            left: Box::new(Node::UnaryOp {
+                                operator: UnaryOperator::Minus,
+                                operand: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("a".to_string())],
+                                })
+                            }),
+                            operator: Operator::Multiply,
+                            right: Box::new(Node::UnaryOp {
+                                operator: UnaryOperator::Plus,
+                                operand: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("b".to_string())],
+                                })
+                            })
+                        }),
+                        operator: Operator::Divide,
+                        right: Box::new(Node::UnaryOp {
+                            operator: UnaryOperator::Negate,
+                            operand: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("c".to_string())],
+                                }),
+                                operator: Operator::Subtract,
+                                right: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("d".to_string())],
+                                })
+                            })
+                        })
+                    },
+                    Node::EOI
                 ]
             },
             parse(source_code)
