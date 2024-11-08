@@ -664,6 +664,7 @@ pub fn evaluate_node(
                     Value::Integer(val) => Rc::new(RefCell::new(Value::Integer(-val))),
                     _ => panic!("Unary minus is only supported for integers"),
                 },
+                _ => panic!("unsupported unary operator: {:?}", operator),
             }
         }
         Node::BinaryOp {

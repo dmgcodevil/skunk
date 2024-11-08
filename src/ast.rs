@@ -79,9 +79,6 @@ pub enum Node {
         name: String,
         arguments: Vec<Node>,
     },
-    Not {
-        body: Box<Node>,
-    },
     EOI,
     EMPTY,
 }
@@ -109,13 +106,14 @@ pub enum Operator {
     GreaterThanOrEqual,
     And,
     Or,
-    Not,
+    // Not,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum UnaryOperator {
     Plus,
     Minus,
+    Negate,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -174,13 +172,13 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         // Rule::array_alloc => create_array_alloc(pair),
         Rule::var_decl => create_var_decl(pair),
         Rule::func_decl => create_func_decl(pair),
-        Rule::not => {
-            let mut pairs = pair.into_inner();
-            let inner = pairs.next().unwrap();
-            Node::Not {
-                body: Box::new(create_ast(inner)),
-            }
-        }
+        // Rule::not => {
+        //     let mut pairs = pair.into_inner();
+        //     let inner = pairs.next().unwrap();
+        //     Node::Not {
+        //         body: Box::new(create_ast(inner)),
+        //     }
+        // }
         Rule::literal => create_literal(pair),
         Rule::size => create_literal(pair),
         Rule::primary => {
@@ -451,21 +449,45 @@ fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
     }
 }
 
+/*
+
+      expression: `!a`
+        primary: `!a`
+          unary_op: `!a`
+            negate: `!`
+            primary: `a`
+              access: `a`
+                IDENTIFIER: `a`
+*/
+
 fn create_expression(pair: Pair<Rule>) -> Node {
     PRATT_PARSER
         .map_primary(|primary| {
-            let mut inner_pairs = primary.into_inner();
+            let mut inner_pairs = primary.clone().into_inner();
             let inner = inner_pairs.next().unwrap();
             match inner.as_rule() {
-                Rule::unary_plus => Node::UnaryOp {
-                    operator: UnaryOperator::Plus,
-                    operand: Box::new(create_ast(inner_pairs.next().unwrap())),
-                },
-                Rule::unary_minus => Node::UnaryOp {
-                    operator: UnaryOperator::Minus,
-                    operand: Box::new(create_ast(inner_pairs.next().unwrap())),
-                },
-                _ => create_ast(inner), // todo verify should we pass inner or primary
+                Rule::unary_op => {
+                    let mut unary_pairs = inner.into_inner();
+                    let unary_op_pair = unary_pairs.next().unwrap();
+                    let unary_operand_pair = unary_pairs.next().unwrap();
+                    match unary_op_pair.as_rule() {
+                        Rule::unary_plus => Node::UnaryOp {
+                            operator: UnaryOperator::Plus,
+                            operand: Box::new(create_ast(unary_operand_pair)),
+                        },
+                        Rule::unary_minus => Node::UnaryOp {
+                            operator: UnaryOperator::Minus,
+                            operand: Box::new(create_ast(unary_operand_pair)),
+                        },
+                        Rule::negate => Node::UnaryOp {
+                            operator: UnaryOperator::Negate,
+                            operand: Box::new(create_ast(unary_operand_pair)),
+                        },
+                        _ => panic!("unsupported unary operator {:?}", unary_op_pair),
+                    }
+                }
+
+                _ => create_ast(primary), // todo verify should we pass inner or primary
             }
         })
         .map_infix(|lhs, op, rhs| {
@@ -1163,8 +1185,9 @@ mod tests {
                 statements: Vec::from([
                     Node::Assignment {
                         var: Box::new(access_var("a")),
-                        value: Box::new(Node::Not {
-                            body: Box::new(access_var("a"))
+                        value: Box::new(Node::UnaryOp {
+                            operator: UnaryOperator::Negate,
+                            operand: Box::new(access_var("a"))
                         })
                     },
                     Node::EOI
@@ -1743,12 +1766,231 @@ mod tests {
     }
 
     #[test]
-    fn test_mod() {
+    fn test_mod_eq() {
         let source_code = r#"
-            if (i % 2 == 0) {
-                return i;
-            }
+            i % 2 == 0;
         "#;
-        println!("{:?}", parse(source_code));
+        assert_eq!(
+            Node::Program {
+                statements: [
+                    Node::BinaryOp {
+                        left: Box::new(Node::BinaryOp {
+                            left: Box::new(Access {
+                                nodes: [Identifier("i".to_string())].to_vec()
+                            }),
+                            operator: Operator::Mod,
+                            right: Box::new(Node::Literal(Literal::Integer(2)))
+                        }),
+                        operator: Operator::Equals,
+                        right: Box::new(Node::Literal(Literal::Integer(0)))
+                    },
+                    Node::EOI
+                ]
+                .to_vec()
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_unary_minus_mod_equals() {
+        let source_code = r#"
+        -i % 2 == 0;
+    "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::BinaryOp {
+                        left: Box::new(Node::BinaryOp {
+                            left: Box::new(Node::UnaryOp {
+                                operator: UnaryOperator::Minus,
+                                operand: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("i".to_string())],
+                                }),
+                            }),
+                            operator: Operator::Mod,
+                            right: Box::new(Node::Literal(Literal::Integer(2))),
+                        }),
+                        operator: Operator::Equals,
+                        right: Box::new(Node::Literal(Literal::Integer(0))),
+                    },
+                    Node::EOI,
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_add_mod_eq() {
+        let source_code = r#"
+        i + 1 % 2 == 0;
+    "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::BinaryOp {
+                        left: Box::new(Node::BinaryOp {
+                            left: Box::new(Node::Access {
+                                nodes: vec![Node::Identifier("i".to_string())],
+                            }),
+                            operator: Operator::Add,
+                            right: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::Literal(Literal::Integer(1))),
+                                operator: Operator::Mod,
+                                right: Box::new(Node::Literal(Literal::Integer(2))),
+                            }),
+                        }),
+                        operator: Operator::Equals,
+                        right: Box::new(Node::Literal(Literal::Integer(0))),
+                    },
+                    Node::EOI,
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_power_multiplication_mod_eq() {
+        let source_code = r#"
+            i ^ 3 * 2 % 5 == 1;
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::BinaryOp {
+                        left: Box::new(Node::BinaryOp {
+                            left: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::BinaryOp {
+                                    left: Box::new(Access {
+                                        nodes: vec![Identifier("i".to_string())]
+                                    }),
+                                    operator: Operator::Power,
+                                    right: Box::new(Node::Literal(Literal::Integer(3))),
+                                }),
+                                operator: Operator::Multiply,
+                                right: Box::new(Node::Literal(Literal::Integer(2))),
+                            }),
+                            operator: Operator::Mod,
+                            right: Box::new(Node::Literal(Literal::Integer(5))),
+                        }),
+                        operator: Operator::Equals,
+                        right: Box::new(Node::Literal(Literal::Integer(1))),
+                    },
+                    Node::EOI,
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_complex_combination_with_not_and_or() {
+        let source_code = r#"
+            !(i % 2 == 0) || (i + 3 > 5);
+             "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::BinaryOp {
+                        left: Box::new(Node::UnaryOp {
+                            operator: UnaryOperator::Negate,
+                            operand: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::BinaryOp {
+                                    left: Box::new(Access {
+                                        nodes: vec![Identifier("i".to_string())]
+                                    }),
+                                    operator: Operator::Mod,
+                                    right: Box::new(Node::Literal(Literal::Integer(2))),
+                                }),
+                                operator: Operator::Equals,
+                                right: Box::new(Node::Literal(Literal::Integer(0))),
+                            }),
+                        }),
+                        operator: Operator::Or,
+                        right: Box::new(Node::BinaryOp {
+                            left: Box::new(Node::BinaryOp {
+                                left: Box::new(Access {
+                                    nodes: vec![Identifier("i".to_string())]
+                                }),
+                                operator: Operator::Add,
+                                right: Box::new(Node::Literal(Literal::Integer(3))),
+                            }),
+                            operator: Operator::GreaterThan,
+                            right: Box::new(Node::Literal(Literal::Integer(5))),
+                        }),
+                    },
+                    Node::EOI,
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    // #[test] todo --i not supported and it's not unary operator
+    // fn test_nested_unary_operations_with_arithmetic() {
+    //     let source_code = r#"
+    //     --i + 2;
+    // "#;
+    //     assert_eq!(
+    //         Node::Program {
+    //             statements: vec![
+    //                 Node::BinaryOp {
+    //                     left: Box::new(Node::UnaryOp {
+    //                         operator: UnaryOperator::Negate,
+    //                         operand: Box::new(Node::UnaryOp {
+    //                             operator: UnaryOperator::Negate,
+    //                             operand: Box::new(Access {
+    //                                 nodes: vec![Identifier("i".to_string())]
+    //                             }),
+    //                         }),
+    //                     }),
+    //                     operator: Operator::Add,
+    //                     right: Box::new(Node::Literal(Literal::Integer(2))),
+    //                 },
+    //                 Node::EOI,
+    //             ]
+    //         },
+    //         parse(source_code)
+    //     );
+    // }
+
+    #[test]
+    fn test_add_subtract_multiply_divide() {
+        let source_code = r#"
+        (i + 1) * (j - 2) / 3;
+    "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::BinaryOp {
+                        left: Box::new(Node::BinaryOp {
+                            left: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("i".to_string())],
+                                }),
+                                operator: Operator::Add,
+                                right: Box::new(Node::Literal(Literal::Integer(1))),
+                            }),
+                            operator: Operator::Multiply,
+                            right: Box::new(Node::BinaryOp {
+                                left: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("j".to_string())],
+                                }),
+                                operator: Operator::Subtract,
+                                right: Box::new(Node::Literal(Literal::Integer(2))),
+                            }),
+                        }),
+                        operator: Operator::Divide,
+                        right: Box::new(Node::Literal(Literal::Integer(3))),
+                    },
+                    Node::EOI,
+                ]
+            },
+            parse(source_code)
+        );
     }
 }
