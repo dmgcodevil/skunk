@@ -413,10 +413,14 @@ pub fn evaluate_node(
             }
             last
         }
-        Node::StructDeclaration { name, declarations } => {
+        Node::StructDeclaration {
+            name,
+            fields,
+            functions,
+        } => {
             let sd = StructDefinition {
                 name: name.to_string(),
-                fields: declarations.clone(),
+                fields: fields.clone(),
             };
 
             global_environment

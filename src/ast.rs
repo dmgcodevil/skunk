@@ -12,7 +12,8 @@ pub enum Node {
     // Statements
     StructDeclaration {
         name: String,
-        declarations: Vec<(String, Type)>,
+        fields: Vec<(String, Type)>,
+        functions: Vec<Node>,
     },
     VariableDeclaration {
         var_type: Type,
@@ -425,14 +426,20 @@ fn create_type(pair: Pair<Rule>) -> Type {
 fn create_struct_decl(pair: Pair<Rule>) -> Node {
     let mut inner_pairs = pair.into_inner();
     let name = inner_pairs.next().unwrap().as_str().to_string();
-    let mut declarations: Vec<(String, Type)> = Vec::new();
+    let mut fields: Vec<(String, Type)> = Vec::new();
+    let mut functions = Vec::new();
     while let Some(p) = inner_pairs.next() {
         match p.as_rule() {
-            Rule::struct_field_decl => declarations.push(create_struct_field_dec(p)),
+            Rule::struct_field_decl => fields.push(create_struct_field_dec(p)),
+            Rule::func_decl => functions.push(create_func_decl(p)),
             _ => panic!("unsupported rule {}", p),
         }
     }
-    Node::StructDeclaration { name, declarations }
+    Node::StructDeclaration {
+        name,
+        fields,
+        functions,
+    }
 }
 
 fn create_struct_field_dec(pair: Pair<Rule>) -> (String, Type) {
@@ -1046,11 +1053,12 @@ mod tests {
                 statements: Vec::from([
                     Node::StructDeclaration {
                         name: "Foo".to_string(),
-                        declarations: Vec::from([
+                        fields: Vec::from([
                             ("i".to_string(), Type::Int),
                             ("s".to_string(), Type::String),
                             ("b".to_string(), Type::Boolean),
-                        ])
+                        ]),
+                        functions: [].to_vec()
                     },
                     Node::EOI
                 ])
@@ -1058,6 +1066,47 @@ mod tests {
             parse(source_code)
         )
     }
+
+    #[test]
+    fn test_struct_decl_with_functions() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+            y: int;
+
+            function distance(): int {
+                return x - y;
+            }
+        }
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::StructDeclaration {
+                        name: "Point".to_string(),
+                        fields: Vec::from([
+                            ("x".to_string(), Type::Int),
+                            ("y".to_string(), Type::Int),
+                        ]),
+                        functions: [Node::FunctionDeclaration {
+                            name: "distance".to_string(),
+                            parameters: [].to_vec(),
+                            return_type: Type::Int,
+                            body: Vec::from([Node::Return(Box::new(Node::BinaryOp {
+                                left: Box::new(access_var("x")),
+                                operator: Operator::Subtract,
+                                right: Box::new(access_var("y"))
+                            }))]),
+                        }]
+                        .to_vec()
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
     #[test]
     fn test_print() {
         let source_code = r#"
