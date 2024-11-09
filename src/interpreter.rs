@@ -6,10 +6,11 @@ use ast::Literal;
 use ast::Node;
 use ast::Operator;
 use ast::Type;
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::fmt;
 use std::io::BufRead;
 use std::rc::Rc;
+use std::*;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -727,7 +728,7 @@ pub fn evaluate_node(
     }
 }
 
-use crate::interpreter::Value::{Executed, Return, StructInstance, Undefined, Void};
+use crate::interpreter::Value::{Return, StructInstance, Undefined, Void};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 use std::cmp;
@@ -951,7 +952,6 @@ mod tests {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::collections::HashMap;
 
         #[test]
         fn test_for_loop_simple_increment() {
