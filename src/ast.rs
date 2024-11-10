@@ -9,6 +9,9 @@ pub enum Node {
     Program {
         statements: Vec<Node>,
     },
+    Block {
+        statements: Vec<Node>, // A block contains a list of statements
+    },
     // Statements
     StructDeclaration {
         name: String,
@@ -152,6 +155,13 @@ pub fn extract_struct_field(field: &Node) -> (String, Type) {
     }
 }
 
+
+fn create_block(pair: Pair<Rule>) -> Node {
+    assert_eq!(pair.as_rule(), Rule::block);
+    let statements = pair.into_inner().map(create_ast).collect();
+    Node::Block { statements }
+}
+
 fn create_primary(pair: Pair<Rule>) -> Node {
     assert_eq!(pair.as_rule(), Rule::primary);
     let mut primary_inner_pairs = pair.into_inner();
@@ -206,6 +216,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
             let inner = pairs.next().unwrap();
             create_ast(inner)
         }
+        Rule::block => create_block(pair),
         Rule::expression => create_expression(pair),
         Rule::assignment => create_assignment(pair),
         Rule::struct_decl => create_struct_decl(pair),
@@ -2165,4 +2176,47 @@ mod tests {
             parse(source_code)
         );
     }
+
+    #[test]
+    fn test_nested_block() {
+        let source_code = r#"
+    function f() {
+        i: int = 1;
+        {
+            i: int = 2;
+        }
+    }
+    "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::FunctionDeclaration {
+                        name: "f".to_string(),
+                        parameters: vec![],
+                        return_type: Type::Void,
+                        body: vec![
+                            Node::VariableDeclaration {
+                                var_type: Type::Int,
+                                name: "i".to_string(),
+                                value: Some(Box::new(Node::Literal(Literal::Integer(1)))),
+                            },
+                            Node::Block {
+                                statements: vec![
+                                    Node::VariableDeclaration {
+                                        var_type: Type::Int,
+                                        name: "i".to_string(),
+                                        value: Some(Box::new(Node::Literal(Literal::Integer(2)))),
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    Node::EOI
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
 }
