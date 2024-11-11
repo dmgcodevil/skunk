@@ -41,6 +41,25 @@ pub enum Value {
     Undefined,
 }
 
+enum Scope<'a> {
+    StructInstanceScope {
+        instance: &'a Value,
+        parent: Option<Box<Scope<'a>>>, // Parent for hierarchical resolution
+    },
+    FunctionScope {
+        env: &'a Environment,
+        parent: Option<Box<Scope<'a>>>,
+    },
+}
+
+fn resolve_from_scope<'a>(
+    scope: &'a Scope<'a>,
+    access_node: &Node,
+) -> Rc<RefCell<Value>> {
+    // todo
+    panic!("not implemented");
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -1334,5 +1353,22 @@ mod tests {
         let res = evaluate(&program);
         let res_ref = res.borrow();
         assert_eq!(Value::Integer(1212), *res_ref.deref()); // even_sum = 12, odd_sum = 6
+    }
+
+    // #[test]
+    fn test_nested_block() {
+        let source_code = r#"
+            fumction f():int {
+                i: int = 1;
+                {
+                    i:int = 2;
+                    print(i);
+                }
+                return i;
+            }
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        println!("{:#?}", res);
     }
 }
