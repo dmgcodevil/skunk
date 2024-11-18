@@ -151,8 +151,60 @@ struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
 }
 
-// todo return &Rc<RefCell<Value>>
-fn get_element_from_array(value: &Value, coordinates: &Vec<i64>) -> Rc<RefCell<Value>> {
+trait ValueModifier {
+    fn set(&mut self, value: Rc<RefCell<Value>>);
+    fn get(&self) -> Rc<RefCell<Value>>;
+}
+
+struct StructInstanceModifier {
+    instance: Rc<RefCell<Value>>,
+    field: String,
+}
+impl ValueModifier for StructInstanceModifier {
+    fn set(&mut self, value: Rc<RefCell<Value>>) {
+        if let Value::StructInstance {
+            name,
+            ref mut fields,
+        } = self.instance.borrow_mut().deref_mut()
+        {
+            fields.insert(self.field.clone(), value);
+        } else {
+            panic!("expected a struct instance");
+        }
+    }
+
+    fn get(&self) -> Rc<RefCell<Value>> {
+        if let Value::StructInstance { name, ref fields } = self.instance.borrow().deref() {
+            fields.get(&self.field).expect("Field not found").clone()
+        } else {
+            panic!("expected a struct instance");
+        }
+    }
+}
+
+struct ArrayModifier {
+    array: Rc<RefCell<Value>>,
+    coordinates: Vec<i64>,
+}
+
+impl ValueModifier for ArrayModifier {
+    fn set(&mut self, value: Rc<RefCell<Value>>) {
+        set_array_element(
+            self.array.borrow_mut().deref_mut(),
+            value,
+            &self.coordinates,
+        )
+    }
+    fn get(&self) -> Rc<RefCell<Value>> {
+        if let Value::Array { .. } = self.array.borrow().deref() {
+            get_array_element(self.array.borrow().deref(), &self.coordinates)
+        } else {
+            panic!("expected a array");
+        }
+    }
+}
+
+fn get_array_element(value: &Value, coordinates: &Vec<i64>) -> Rc<RefCell<Value>> {
     if let Value::Array {
         ref arr,
         ref dimensions,
@@ -322,7 +374,7 @@ fn get_or_set_array_element(
         set_array_element(array_value, Rc::clone(&new_value), &coordinates);
         new_value
     } else {
-        Rc::clone(&get_element_from_array(array_value.deref(), &coordinates))
+        Rc::clone(&get_array_element(array_value.deref(), &coordinates))
     }
 }
 
@@ -380,7 +432,19 @@ fn set_or_get_value(
                     frame
                 });
                 mem::drop(global_environment_ref);
-                res
+
+                if i == access_nodes.len() - 1 {
+                    res
+                } else {
+                    set_or_get_value(
+                        stack,
+                        global_environment,
+                        res,
+                        i + 1,
+                        access_nodes,
+                        new_value_opt,
+                    )
+                }
             }
             _ => panic!("unexpected member access {:?}", member),
         };
@@ -407,10 +471,8 @@ fn set_or_get_value(
                 );
                 mem::drop(current_value_ref);
             } else {
-                let next_value = Rc::clone(&get_element_from_array(
-                    current_value_ref.deref(),
-                    &_coordinates,
-                ));
+                let next_value =
+                    Rc::clone(&get_array_element(current_value_ref.deref(), &_coordinates));
                 mem::drop(current_value_ref);
                 res = set_or_get_value(
                     stack,
@@ -1496,5 +1558,40 @@ mod tests {
         println!("{:#?}", program);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(3), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_set_field_from_function() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+            y: int;
+
+            function set_x(x:int) {
+                self.x = x;
+            }
+
+            function get_x(){
+                return self.x;
+            }
+        }
+
+        struct Line {
+            start: Point;
+            end: Point;
+
+            function get_start():Point {
+                return self.start;
+            }
+        }
+
+        line: Line = Line {start: Point { x: 0, y: 0 }, end: Point { x: 5, y: 5 }};
+        line.get_start().set_x(1);
+        line.get_start().get_x();
+        "#;
+
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 }
