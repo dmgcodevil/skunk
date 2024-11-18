@@ -95,10 +95,16 @@ struct StructDefinition {
     functions: HashMap<String, FunctionDefinition>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct Parameter {
+    name: String,
+    sk_type: Type,
+}
+
 #[derive(Clone, Debug)]
 struct FunctionDefinition {
     name: String,
-    parameters: Vec<(String, Type)>,
+    parameters: Vec<Parameter>,
     return_type: Type,
     body: Vec<Node>,
 }
@@ -132,10 +138,10 @@ impl GlobalEnvironment {
     fn get_function(&self, name: &str) -> Option<&FunctionDefinition> {
         self.functions.get(name)
     }
-    fn get_struct_from_value(&self, v: &Value) -> &StructDefinition {
+    fn to_struct_def(&self, v: &Value) -> &StructDefinition {
         match v {
             StructInstance { name, .. } => self.structs.get(name).unwrap(),
-            _ => panic!("expected struct instance "),
+            _ => panic!("expected struct instance. given: {:?}", v),
         }
     }
 }
@@ -145,6 +151,7 @@ struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
 }
 
+// todo return &Rc<RefCell<Value>>
 fn get_element_from_array(value: &Value, coordinates: &Vec<i64>) -> Rc<RefCell<Value>> {
     if let Value::Array {
         ref arr,
@@ -154,7 +161,7 @@ fn get_element_from_array(value: &Value, coordinates: &Vec<i64>) -> Rc<RefCell<V
         let pos = to_1d_pos(coordinates, dimensions);
         Rc::clone(&arr[pos])
     } else {
-        panic!("not an array")
+        panic!("expected array value. given: {:?}", value)
     }
 }
 
@@ -166,6 +173,8 @@ fn set_array_element(value: &mut Value, new_value: Rc<RefCell<Value>>, coordinat
     {
         let pos = to_1d_pos(coordinates, dimensions);
         arr[pos] = new_value;
+    } else {
+        panic!("expected array value. given: {:?}", value)
     }
 }
 
@@ -202,11 +211,12 @@ impl Environment {
     }
 
     fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
-        // todo asserts
+        // todo assert that variable doesn't already exists
         self.variables.insert(name.to_string(), value);
     }
+
     fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
-        // todo asserts
+        // todo assert that var exists
         self.variables.insert(name.to_string(), value);
     }
 
@@ -214,7 +224,7 @@ impl Environment {
         if let Some(var) = self.variables.get(name) {
             var
         } else {
-            panic!("variable {} not declared", name);
+            panic!("variable '{}' not declared", name);
         }
     }
 }
@@ -246,13 +256,13 @@ impl CallStack {
     fn current_frame(&self) -> &CallFrame {
         self.frames
             .last()
-            .expect("Call stack underflow: No active frames")
+            .expect("call stack underflow: no active frames")
     }
 
     fn current_frame_mut(&mut self) -> &mut CallFrame {
         self.frames
             .last_mut()
-            .expect("Call stack underflow: No active frames")
+            .expect("call stack underflow: no active frames")
     }
 }
 
@@ -264,21 +274,6 @@ pub fn evaluate(node: &Node) -> Rc<RefCell<Value>> {
         locals: Environment::new(),
     });
     evaluate_node(node, &stack, &ge)
-}
-
-// todo revisit !!!
-fn get_value_by_name(
-    stack: &Rc<RefCell<CallStack>>,
-    global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    current_value: &Value,
-    name: &str,
-) -> Rc<RefCell<Value>> {
-    let frame = stack.borrow().current_frame();
-    match current_value {
-        Value::Undefined => Rc::new(RefCell::new(Value::Undefined)),
-        Value::StructInstance { name, fields } => Rc::clone(fields.get(name).unwrap()),
-        _ => panic!("expected current_value={:?}", current_value),
-    }
 }
 
 fn assert_value_is_struct(v: &Value) {
@@ -297,12 +292,45 @@ fn get_struct_fields_mut(v: &mut Value) -> &mut HashMap<String, Rc<RefCell<Value
 
 fn get_struct_field_value(field: String, v: &Value) -> &Rc<RefCell<Value>> {
     if let StructInstance { name, fields } = v {
-        fields.get(&field).unwrap()
+        fields
+            .get(&field)
+            .expect(format!("field '{}' not declared", field).as_str())
     } else {
         panic!("expected struct instance, found {:?}", v);
     }
 }
 
+fn get_or_set_struct_field(
+    struct_value: &mut Value,
+    field: String,
+    new_value_opt: Option<Rc<RefCell<Value>>>,
+) -> Rc<RefCell<Value>> {
+    if let Some(new_value) = new_value_opt {
+        get_struct_fields_mut(struct_value).insert(field.to_string(), new_value.clone());
+        Rc::new(RefCell::new(Value::Void))
+    } else {
+        Rc::clone(get_struct_field_value(field.to_string(), struct_value))
+    }
+}
+
+fn get_or_set_array_element(
+    array_value: &mut Value,
+    coordinates: Vec<i64>,
+    new_value_opt: Option<Rc<RefCell<Value>>>,
+) -> Rc<RefCell<Value>> {
+    if let Some(new_value) = new_value_opt {
+        set_array_element(array_value, Rc::clone(&new_value), &coordinates);
+        new_value
+    } else {
+        Rc::clone(&get_element_from_array(array_value.deref(), &coordinates))
+    }
+}
+
+// todo split into separate functions
+// we can use something similar to visitor pattern
+// where we iterate through access_nodes
+// and apply functions to specific node types
+//
 fn set_or_get_value(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
@@ -317,16 +345,11 @@ fn set_or_get_value(
         let res = match member_ref {
             Node::Identifier(name) => {
                 if i == access_nodes.len() - 1 {
-                    if let Some(new_value) = new_value_opt {
-                        get_struct_fields_mut(current_value.borrow_mut().deref_mut())
-                            .insert(name.to_string(), new_value.clone());
-                        Rc::new(RefCell::new(Value::Undefined))
-                    } else {
-                        Rc::clone(get_struct_field_value(
-                            name.to_string(),
-                            current_value.borrow().deref(),
-                        ))
-                    }
+                    get_or_set_struct_field(
+                        current_value.borrow_mut().deref_mut(),
+                        name.clone(),
+                        new_value_opt,
+                    )
                 } else {
                     set_or_get_value(
                         stack,
@@ -344,7 +367,7 @@ fn set_or_get_value(
             Node::FunctionCall { name, .. } => {
                 let global_environment_ref = global_environment.borrow();
                 let struct_def =
-                    global_environment_ref.get_struct_from_value(current_value.borrow().deref());
+                    global_environment_ref.to_struct_def(current_value.borrow().deref());
                 let fun_def = struct_def.functions.get(name).unwrap();
                 let res = evaluate_function(stack, fun_def, member_ref, global_environment, || {
                     let mut frame = CallFrame {
@@ -377,18 +400,11 @@ fn set_or_get_value(
         if let Value::Array { .. } = current_value_ref.deref() {
             let mut res = Rc::new(RefCell::new(Value::Undefined));
             if i == access_nodes.len() - 1 {
-                if let Some(new_value) = new_value_opt {
-                    set_array_element(
-                        current_value_ref.deref_mut(),
-                        Rc::clone(&new_value),
-                        &_coordinates,
-                    );
-                } else {
-                    res = Rc::clone(&get_element_from_array(
-                        current_value_ref.deref(),
-                        &_coordinates,
-                    ));
-                };
+                res = get_or_set_array_element(
+                    current_value_ref.deref_mut(),
+                    _coordinates,
+                    new_value_opt,
+                );
                 mem::drop(current_value_ref);
             } else {
                 let next_value = Rc::clone(&get_element_from_array(
@@ -451,7 +467,7 @@ fn set_or_get_value(
 pub fn init(node: &Node, global_environment: &Rc<RefCell<GlobalEnvironment>>) {
     // todo:
     // 1. parse modules, structs and functions
-    // 2. resolve imports, etc.
+    // 2. resolve includes, imports, etc.
 }
 
 fn evaluate_function<F>(
@@ -469,12 +485,12 @@ where
             .into_iter()
             .map(|arg| evaluate_node(arg, stack, global_environment))
             .collect();
-        let parameters: Vec<(&(String, Type), Rc<RefCell<Value>>)> =
+        let arguments: Vec<(&Parameter, Rc<RefCell<Value>>)> =
             fun.parameters.iter().zip(args_values.into_iter()).collect();
         let mut frame = frame_creator();
-        for p in parameters {
-            let first = p.0.clone().0;
-            let second = p.1;
+        for arg in arguments {
+            let first = arg.0.name.clone();
+            let second = arg.1;
             frame.locals.variables.insert(first, Rc::clone(&second));
         }
         stack.borrow_mut().push(frame);
@@ -490,7 +506,6 @@ where
             }
         }
         stack.borrow_mut().pop();
-
         result
     } else {
         panic!("expected Node::FunctionCall")
@@ -507,7 +522,13 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
     {
         FunctionDefinition {
             name: name.to_string(),
-            parameters: parameters.clone(),
+            parameters: parameters
+                .iter()
+                .map(|p| Parameter {
+                    name: p.0.clone(),
+                    sk_type: p.1.clone(),
+                })
+                .collect(),
             return_type: return_type.clone(),
             body: body.clone(), // todo avoid clone
         }
@@ -561,15 +582,10 @@ pub fn evaluate_node(
             return_type,
             body,
         } => {
-            global_environment.borrow_mut().functions.insert(
-                name.clone(),
-                FunctionDefinition {
-                    name: name.to_string(),
-                    parameters: parameters.clone(),
-                    return_type: return_type.clone(),
-                    body: body.clone(),
-                },
-            );
+            global_environment
+                .borrow_mut()
+                .functions
+                .insert(name.clone(), create_function_definition(node));
             Rc::new(RefCell::new(Value::Function {
                 name: name.to_string(),
                 parameters: parameters.clone(),
