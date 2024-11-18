@@ -1,4 +1,4 @@
-use crate::ast::Node::{Identifier, MemberAccess, StructInitialization};
+use crate::ast::Node::{Identifier, MemberAccess, StructInitialization, EMPTY};
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -8,6 +8,9 @@ use pest::Parser;
 pub enum Node {
     Program {
         statements: Vec<Node>,
+    },
+    Module {
+        name: String,
     },
     Block {
         statements: Vec<Node>, // A block contains a list of statements
@@ -155,7 +158,6 @@ pub fn extract_struct_field(field: &Node) -> (String, Type) {
     }
 }
 
-
 fn create_block(pair: Pair<Rule>) -> Node {
     assert_eq!(pair.as_rule(), Rule::block);
     let statements = pair.into_inner().map(create_ast).collect();
@@ -211,6 +213,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
             }
             Node::Program { statements }
         }
+        Rule::module => create_module(pair),
         Rule::statement => {
             let mut pairs = pair.into_inner();
             let inner = pairs.next().unwrap();
@@ -275,6 +278,17 @@ lazy_static::lazy_static! {
             .op(Op::infix(or, Left))
             .op(Op::infix(and, Left))
 };
+}
+
+fn create_module(pair: Pair<Rule>) -> Node {
+    let mut inner_pairs = pair.into_inner();
+    if let Identifier(name) = create_identifier(inner_pairs.next().unwrap()) {
+        Node::Module {
+            name: name.to_string(),
+        }
+    } else {
+        unreachable!()
+    }
 }
 
 fn create_literal(pair: Pair<Rule>) -> Node {
@@ -1566,7 +1580,7 @@ mod tests {
             return -1;
         }
         test();
-    "#;
+        "#;
         assert_eq!(
             Node::Program {
                 statements: vec![
@@ -1783,7 +1797,7 @@ mod tests {
     fn test_array_1d_assignment() {
         let source_code = r#"
         arr[0] = 1;
-    "#;
+        "#;
         assert_eq!(
             Node::Program {
                 statements: Vec::from([
@@ -1809,7 +1823,7 @@ mod tests {
     fn test_array_member_assignment() {
         let source_code = r#"
         arr[0].a = 1;
-    "#;
+        "#;
         assert_eq!(
             Node::Program {
                 statements: Vec::from([
@@ -2023,7 +2037,7 @@ mod tests {
     fn test_complex_combination_with_not_and_or() {
         let source_code = r#"
             !(i % 2 == 0) || (i + 3 > 5);
-             "#;
+        "#;
         assert_eq!(
             Node::Program {
                 statements: vec![
@@ -2180,13 +2194,13 @@ mod tests {
     #[test]
     fn test_nested_block() {
         let source_code = r#"
-    function f() {
-        i: int = 1;
-        {
-            i: int = 2;
+        function f() {
+            i: int = 1;
+            {
+                i: int = 2;
+            }
         }
-    }
-    "#;
+        "#;
 
         assert_eq!(
             Node::Program {
@@ -2202,13 +2216,11 @@ mod tests {
                                 value: Some(Box::new(Node::Literal(Literal::Integer(1)))),
                             },
                             Node::Block {
-                                statements: vec![
-                                    Node::VariableDeclaration {
-                                        var_type: Type::Int,
-                                        name: "i".to_string(),
-                                        value: Some(Box::new(Node::Literal(Literal::Integer(2)))),
-                                    }
-                                ],
+                                statements: vec![Node::VariableDeclaration {
+                                    var_type: Type::Int,
+                                    name: "i".to_string(),
+                                    value: Some(Box::new(Node::Literal(Literal::Integer(2)))),
+                                }],
                             },
                         ],
                     },
@@ -2219,4 +2231,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_module() {
+        let source_code = r#"
+            module A;
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::Module {
+                        name: "A".to_string()
+                    },
+                    Node::EOI
+                ]
+            },
+            parse(source_code)
+        );
+    }
 }
