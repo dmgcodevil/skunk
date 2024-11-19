@@ -9,8 +9,8 @@ use ast::Type;
 use std::cell::RefCell;
 use std::fmt;
 use std::io::BufRead;
+use std::mem;
 use std::rc::Rc;
-use std::*;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -76,7 +76,7 @@ impl fmt::Display for Value {
             }
             Value::StructInstance {
                 name: struct_name,
-                fields,
+                fields: _,
             } => {
                 write!(f, "struct {} {{}}", struct_name)
             }
@@ -174,7 +174,11 @@ impl ValueModifier for StructInstanceModifier {
     }
 
     fn get(&self) -> Rc<RefCell<Value>> {
-        if let Value::StructInstance { name, ref fields } = self.instance.borrow().deref() {
+        if let Value::StructInstance {
+            name: _,
+            ref fields,
+        } = self.instance.borrow().deref()
+        {
             fields.get(&self.field).expect("Field not found").clone()
         } else {
             panic!("expected a struct instance");
@@ -196,11 +200,48 @@ impl ValueModifier for ArrayModifier {
         )
     }
     fn get(&self) -> Rc<RefCell<Value>> {
-        if let Value::Array { .. } = self.array.borrow().deref() {
-            get_array_element(self.array.borrow().deref(), &self.coordinates)
-        } else {
-            panic!("expected a array");
-        }
+        get_array_element(self.array.borrow().deref(), &self.coordinates)
+    }
+}
+
+struct ReadValueModifier {
+    value: Rc<RefCell<Value>>,
+}
+
+impl ValueModifier for ReadValueModifier {
+    fn set(&mut self, _value: Rc<RefCell<Value>>) {
+        panic!("attempted to set a read value");
+    }
+
+    fn get(&self) -> Rc<RefCell<Value>> {
+        Rc::clone(&self.value)
+    }
+}
+
+struct StackVariableModifier {
+    stack: Rc<RefCell<CallStack>>,
+    name: String,
+}
+
+impl ValueModifier for StackVariableModifier {
+    fn set(&mut self, value: Rc<RefCell<Value>>) {
+        let mut stack = self.stack.borrow_mut();
+        stack
+            .deref_mut()
+            .current_frame_mut()
+            .locals
+            .assign_variable(&self.name.clone(), Rc::clone(&value));
+    }
+
+    fn get(&self) -> Rc<RefCell<Value>> {
+        let stack = self.stack.borrow();
+        Rc::clone(
+            &stack
+                .deref()
+                .current_frame()
+                .locals
+                .get_variable_value(&self.name.clone()),
+        )
     }
 }
 
@@ -334,88 +375,19 @@ fn assert_value_is_struct(v: &Value) {
     }
 }
 
-fn get_struct_fields_mut(v: &mut Value) -> &mut HashMap<String, Rc<RefCell<Value>>> {
-    if let StructInstance { name, fields } = v {
-        fields
-    } else {
-        panic!("expected struct instance, found {:?}", v);
-    }
-}
-
-fn get_struct_field_value(field: String, v: &Value) -> &Rc<RefCell<Value>> {
-    if let StructInstance { name, fields } = v {
-        fields
-            .get(&field)
-            .expect(format!("field '{}' not declared", field).as_str())
-    } else {
-        panic!("expected struct instance, found {:?}", v);
-    }
-}
-
-fn get_or_set_struct_field(
-    struct_value: &mut Value,
-    field: String,
-    new_value_opt: Option<Rc<RefCell<Value>>>,
-) -> Rc<RefCell<Value>> {
-    if let Some(new_value) = new_value_opt {
-        get_struct_fields_mut(struct_value).insert(field.to_string(), new_value.clone());
-        Rc::new(RefCell::new(Value::Void))
-    } else {
-        Rc::clone(get_struct_field_value(field.to_string(), struct_value))
-    }
-}
-
-fn get_or_set_array_element(
-    array_value: &mut Value,
-    coordinates: Vec<i64>,
-    new_value_opt: Option<Rc<RefCell<Value>>>,
-) -> Rc<RefCell<Value>> {
-    if let Some(new_value) = new_value_opt {
-        set_array_element(array_value, Rc::clone(&new_value), &coordinates);
-        new_value
-    } else {
-        Rc::clone(&get_array_element(array_value.deref(), &coordinates))
-    }
-}
-
-// todo split into separate functions
-// we can use something similar to visitor pattern
-// where we iterate through access_nodes
-// and apply functions to specific node types
-//
-fn set_or_get_value(
+fn resolve_member_access(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     current_value: Rc<RefCell<Value>>,
-    i: usize,
-    access_nodes: &Vec<Node>,
-    new_value_opt: Option<Rc<RefCell<Value>>>,
-) -> Rc<RefCell<Value>> {
-    let access_node = &access_nodes[i];
-    if let Node::MemberAccess { member } = access_node {
+    node: &Node,
+) -> Box<dyn ValueModifier> {
+    if let Node::MemberAccess { member } = node {
         let member_ref = member.as_ref();
-        let res = match member_ref {
-            Node::Identifier(name) => {
-                if i == access_nodes.len() - 1 {
-                    get_or_set_struct_field(
-                        current_value.borrow_mut().deref_mut(),
-                        name.clone(),
-                        new_value_opt,
-                    )
-                } else {
-                    set_or_get_value(
-                        stack,
-                        global_environment,
-                        Rc::clone(get_struct_field_value(
-                            name.to_string(),
-                            current_value.borrow().deref(),
-                        )),
-                        i + 1,
-                        access_nodes,
-                        new_value_opt,
-                    )
-                }
-            }
+        match member_ref {
+            Node::Identifier(name) => Box::new(StructInstanceModifier {
+                instance: current_value,
+                field: name.clone(),
+            }),
             Node::FunctionCall { name, .. } => {
                 let global_environment_ref = global_environment.borrow();
                 let struct_def =
@@ -432,25 +404,22 @@ fn set_or_get_value(
                     frame
                 });
                 mem::drop(global_environment_ref);
-
-                if i == access_nodes.len() - 1 {
-                    res
-                } else {
-                    set_or_get_value(
-                        stack,
-                        global_environment,
-                        res,
-                        i + 1,
-                        access_nodes,
-                        new_value_opt,
-                    )
-                }
+                Box::new(ReadValueModifier { value: res })
             }
-            _ => panic!("unexpected member access {:?}", member),
-        };
+            _ => panic!("expected member access, found {:?}", member_ref),
+        }
+    } else {
+        panic!("expected member access, found {:?}", node);
+    }
+}
 
-        return res;
-    } else if let Node::ArrayAccess { coordinates } = access_node {
+fn resolve_array_access(
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+    current_value: Rc<RefCell<Value>>,
+    node: &Node,
+) -> Box<dyn ValueModifier> {
+    if let Node::ArrayAccess { coordinates } = node {
         let _coordinates: Vec<i64> = coordinates
             .iter()
             .map(
@@ -460,76 +429,56 @@ fn set_or_get_value(
                 },
             )
             .collect();
-        let mut current_value_ref = current_value.borrow_mut();
-        if let Value::Array { .. } = current_value_ref.deref() {
-            let mut res = Rc::new(RefCell::new(Value::Undefined));
-            if i == access_nodes.len() - 1 {
-                res = get_or_set_array_element(
-                    current_value_ref.deref_mut(),
-                    _coordinates,
-                    new_value_opt,
-                );
-                mem::drop(current_value_ref);
-            } else {
-                let next_value =
-                    Rc::clone(&get_array_element(current_value_ref.deref(), &_coordinates));
-                mem::drop(current_value_ref);
-                res = set_or_get_value(
-                    stack,
-                    global_environment,
-                    next_value,
-                    i + 1,
-                    access_nodes,
-                    new_value_opt,
-                );
-            }
-
-            return res;
-        } else {
-            panic!(
-                "expected array value, found {:?}",
-                current_value.borrow().deref()
-            );
-        }
-    } else if let Node::Identifier(name) = access_node {
-        if i == access_nodes.len() - 1 {
-            return if let Some(new_value) = new_value_opt {
-                stack
-                    .borrow_mut()
-                    .current_frame_mut()
-                    .locals
-                    .assign_variable(name, Rc::clone(&new_value));
-                Rc::new(RefCell::new(Undefined)) // todo return new value ?
-            } else {
-                Rc::clone(
-                    &stack
-                        .borrow()
-                        .current_frame()
-                        .locals
-                        .get_variable_value(name),
-                )
-            };
-        } else {
-            let stack_ref = stack.borrow();
-            let next_val = Rc::clone(&stack_ref.current_frame().locals.get_variable_value(name));
-            mem::drop(stack_ref);
-            return set_or_get_value(
-                stack,
-                global_environment,
-                next_val,
-                i + 1,
-                access_nodes,
-                new_value_opt,
-            );
-        }
+        Box::new(ArrayModifier {
+            array: current_value,
+            coordinates: _coordinates,
+        })
+    } else {
+        panic!("expected array access, found {:?}", node)
     }
-    panic!("unreachable code")
 }
 
-pub fn init(node: &Node, global_environment: &Rc<RefCell<GlobalEnvironment>>) {
-    // todo:
-    // 1. parse modules, structs and functions
-    // 2. resolve includes, imports, etc.
+fn resolve_variable_access(stack: &Rc<RefCell<CallStack>>, node: &Node) -> Box<dyn ValueModifier> {
+    if let Node::Identifier(name) = node {
+        Box::new(StackVariableModifier {
+            stack: Rc::clone(stack),
+            name: name.clone(),
+        })
+    } else {
+        panic!("expected identifier, found {:?}", node)
+    }
+}
+
+fn resolve_access(
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+    current_value: Rc<RefCell<Value>>,
+    level: usize,
+    access_nodes: &Vec<Node>,
+) -> Box<dyn ValueModifier> {
+    let access_node = &access_nodes[level];
+    let modifier = match access_node {
+        Node::MemberAccess { .. } => {
+            resolve_member_access(stack, global_environment, current_value, access_node)
+        }
+        Node::ArrayAccess { .. } => {
+            resolve_array_access(stack, global_environment, current_value, access_node)
+        }
+        Node::Identifier(..) => resolve_variable_access(stack, access_node),
+        _ => panic!("unexpected access node: {:?}", access_node),
+    };
+
+    if level == access_nodes.len() - 1 {
+        modifier
+    } else {
+        resolve_access(
+            stack,
+            global_environment,
+            modifier.get(),
+            level + 1,
+            access_nodes,
+        )
+    }
 }
 
 fn evaluate_function<F>(
@@ -542,7 +491,7 @@ fn evaluate_function<F>(
 where
     F: Fn() -> CallFrame,
 {
-    if let Node::FunctionCall { name, arguments } = call_node {
+    if let Node::FunctionCall { name: _, arguments } = call_node {
         let args_values: Vec<_> = arguments
             .into_iter()
             .map(|arg| evaluate_node(arg, stack, global_environment))
@@ -604,7 +553,6 @@ pub fn evaluate_node(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> Rc<RefCell<Value>> {
-    println!("evaluate_node={:?}", node);
     match node {
         Node::Program { statements } => {
             let mut last = Rc::new(RefCell::new(Void));
@@ -642,7 +590,7 @@ pub fn evaluate_node(
             name,
             parameters,
             return_type,
-            body,
+            body: _,
         } => {
             global_environment
                 .borrow_mut()
@@ -686,40 +634,39 @@ pub fn evaluate_node(
             };
             Rc::new(RefCell::new(value))
         }
-        Node::Access { nodes } => set_or_get_value(
+        Node::Access { nodes } => resolve_access(
             stack,
             global_environment,
             Rc::new(RefCell::new(Undefined)),
             0,
             nodes,
-            None,
         )
+        .get()
         .clone(),
         Node::Assignment { var, value } => match var.as_ref() {
-            Node::Access { nodes } => set_or_get_value(
-                stack,
-                global_environment,
-                Rc::new(RefCell::new(Undefined)),
-                0,
-                nodes,
-                Some(Rc::clone(&evaluate_node(
-                    value.as_ref(),
+            Node::Access { nodes } => {
+                let mut modifier = resolve_access(
                     stack,
                     global_environment,
-                ))),
-            )
-            .clone(),
-            _ => panic!("expected access to assignment node "),
+                    Rc::new(RefCell::new(Undefined)),
+                    0,
+                    nodes,
+                );
+                let new_value =
+                    Rc::clone(&evaluate_node(value.as_ref(), stack, global_environment));
+                modifier.set(new_value);
+                modifier.get()
+            }
+            _ => panic!("expected access to assignment node"),
         },
-        Node::Access { nodes } => set_or_get_value(
+        Node::Access { nodes } => resolve_access(
             stack,
             global_environment,
             Rc::new(RefCell::new(Undefined)),
             0,
             nodes,
-            None,
         )
-        .clone(),
+        .get(),
         Node::FunctionCall { name, .. } => {
             let global_environment_ref = global_environment.borrow();
             let fun = global_environment_ref.get_function(name).unwrap().clone();
@@ -733,11 +680,11 @@ pub fn evaluate_node(
         }
         Node::StaticFunctionCall {
             _type,
-            name,
+            name: _,
             arguments,
         } => match _type {
             Type::Array {
-                elem_type,
+                elem_type: _,
                 dimensions,
             } => {
                 let mut size: usize = 1;
@@ -745,7 +692,7 @@ pub fn evaluate_node(
                     size = size * (*d) as usize;
                 }
                 let mut arr = Vec::with_capacity(size);
-                for i in 0..size {
+                for _ in 0..size {
                     arr.push(evaluate_node(&arguments[0], stack, global_environment));
                 }
                 Rc::new(RefCell::new(Value::Array {
@@ -914,79 +861,8 @@ pub fn evaluate_node(
 }
 
 use crate::interpreter::Value::{Return, StructInstance, Undefined, Void};
-use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, Result};
-use std::cmp;
 use std::fmt::Octal;
 use std::ops::{Deref, DerefMut};
-
-pub fn repl() -> Result<()> {
-    let mut stack = CallStack::new();
-    let mut ge = GlobalEnvironment::new();
-    stack.push(CallFrame {
-        name: "main".to_string(),
-        locals: Environment::new(),
-    });
-
-    let mut rl = DefaultEditor::new()?;
-    println!("Welcome to Skunk REPL!");
-    println!("Type your code and press Enter to execute. Use Shift+Enter to insert a new line.");
-    println!("Press Ctrl-C to exit.");
-
-    loop {
-        let mut input = String::new();
-        let mut prompt = ">>> ".to_string(); // Primary prompt
-        let mut indent_level = 0;
-        loop {
-            // Read a line of input with the prompt
-            match rl.readline(&prompt) {
-                Ok(line) => {
-                    if line.trim().is_empty() {
-                        // empty line indicates the end of input
-                        if !input.trim().is_empty() {
-                            // Add the input to history
-                            rl.add_history_entry(input.trim_end());
-                            // process the input
-                            // println!("{}", &input);
-
-                            let program = ast::parse(&input);
-                            println!("{:?}", evaluate(&program));
-                        }
-                        // Reset the prompt and break to start new input
-                        prompt = ">>> ".to_string();
-                        break;
-                    } else {
-                        // append the line to the input buffer
-                        input.push_str(&line);
-                        input.push('\n');
-
-                        for ch in line.chars() {
-                            match ch {
-                                '{' => indent_level += 1,
-                                '}' => indent_level = cmp::max(0, indent_level - 1),
-                                _ => {}
-                            }
-                        }
-
-                        prompt = format!("{}... ", "  ".repeat(indent_level));
-                    }
-                }
-                Err(ReadlineError::Interrupted) => {
-                    println!("^C");
-                    break;
-                }
-                Err(ReadlineError::Eof) => {
-                    println!("^D");
-                    break;
-                }
-                Err(err) => {
-                    println!("Error: {:?}", err);
-                    break;
-                }
-            }
-        }
-    }
-}
 
 mod tests {
     use super::*;
