@@ -456,29 +456,30 @@ fn resolve_access(
     level: usize,
     access_nodes: &Vec<Node>,
 ) -> Box<dyn ValueModifier> {
-    let access_node = &access_nodes[level];
-    let modifier = match access_node {
-        Node::MemberAccess { .. } => {
-            resolve_member_access(stack, global_environment, current_value, access_node)
-        }
-        Node::ArrayAccess { .. } => {
-            resolve_array_access(stack, global_environment, current_value, access_node)
-        }
-        Node::Identifier(..) => resolve_variable_access(stack, access_node),
-        _ => panic!("unexpected access node: {:?}", access_node),
-    };
+    let mut current_modifier: Box<dyn ValueModifier> = Box::new(ReadValueModifier {
+        value: Rc::clone(&current_value),
+    });
 
-    if level == access_nodes.len() - 1 {
-        modifier
-    } else {
-        resolve_access(
-            stack,
-            global_environment,
-            modifier.get(),
-            level + 1,
-            access_nodes,
-        )
+    for access_node in access_nodes {
+        current_modifier = match access_node {
+            Node::MemberAccess { .. } => resolve_member_access(
+                stack,
+                global_environment,
+                current_modifier.get(),
+                access_node,
+            ),
+            Node::ArrayAccess { .. } => resolve_array_access(
+                stack,
+                global_environment,
+                current_modifier.get(),
+                access_node,
+            ),
+            Node::Identifier(..) => resolve_variable_access(stack, access_node),
+            _ => panic!("unexpected access node: {:?}", access_node),
+        };
     }
+
+    current_modifier
 }
 
 fn evaluate_function<F>(
@@ -1408,6 +1409,56 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         println!("{:#?}", res);
+    }
+
+    #[test]
+    fn test_resolve_access_struct_field() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+            y: int;
+        }
+
+        p: Point = Point { x: 10, y: 20 };
+        p.x;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(10), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_resolve_access_nested_struct() {
+        let source_code = r#"
+        struct Inner {
+            value: int;
+        }
+
+        struct Outer {
+            inner: Inner;
+        }
+
+        o: Outer = Outer { inner: Inner { value: 42 } };
+        o.inner.value;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(42), *res.borrow().deref());
+    }
+
+    // #[test] array initialization is not supported
+    fn test_resolve_access_mixed() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+        }
+
+        arr: Point[2] = [Point { x: 10 }, Point { x: 20 }];
+        arr[1].x;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(20), *res.borrow().deref());
     }
 
     #[test]
