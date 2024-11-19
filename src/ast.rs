@@ -1,4 +1,4 @@
-use crate::ast::Node::{Identifier, MemberAccess, StructInitialization, EMPTY};
+use crate::ast::Node::{ArrayInit, Identifier, MemberAccess, StructInitialization, EMPTY};
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -35,6 +35,9 @@ pub enum Node {
     Assignment {
         var: Box<Node>,
         value: Box<Node>,
+    },
+    ArrayInit {
+        elements: Vec<Node>,
     },
     If {
         condition: Box<Node>,          // The condition of the `if` or `else if`
@@ -233,6 +236,7 @@ fn create_ast(pair: Pair<Rule>) -> Node {
         Rule::func_call => create_function_call(pair),
         Rule::static_func_call => create_static_func_call(pair),
         Rule::struct_init => create_struct_init(pair),
+        Rule::inline_array_init => create_inline_array_init(pair),
         Rule::sk_return => {
             let mut pairs = pair.into_inner();
             Node::Return(Box::new(create_ast(pairs.next().unwrap())))
@@ -311,6 +315,12 @@ fn create_array_access(pair: Pair<Rule>) -> Node {
         coordinates.push(create_ast(dim_expr));
     }
     Node::ArrayAccess { coordinates }
+}
+
+fn create_inline_array_init(pair: Pair<Rule>) -> Node {
+    let mut inner_pairs = pair.into_inner();
+    let elements = inner_pairs.map(|p| create_ast(p)).collect();
+    ArrayInit { elements }
 }
 
 fn create_member_access(pair: Pair<Rule>) -> Node {
@@ -1738,6 +1748,59 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test]
+    fn test_array_init_inline() {
+        let source_code = r#"
+        arr: int[2] = [1, 2];
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    name: "arr".to_string(),
+                    var_type: Type::Array {
+                        elem_type: Box::new(Type::Int),
+                        dimensions: vec![2],
+                    },
+                    value: Some(Box::new(Node::ArrayInit {
+                        elements: vec![
+                            Node::Literal(Literal::Integer(1)),
+                            Node::Literal(Literal::Integer(2)),
+                        ],
+                    })),
+                },
+                Node::EOI,
+            ],
+        };
+
+        let program = parse(source_code);
+        assert_eq!(expected_ast, program);
+
+        println!("{:?}", program);
+    }
+
+    #[test]
+    fn test_2d_array_init_inline() {
+        let source_code = r#"
+        arr: int[2][2] = [
+            [1, 2],
+            [3, 4]
+        ];
+        "#;
+        println!("{:?}", parse(source_code));
+    }
+
+    #[test]
+    fn test_3d_array_init_inline() {
+        let source_code = r#"
+        arr: int[2][2][1] = [
+            [[1], [2]],
+            [[3], [4]]
+        ];
+        "#;
+        println!("{:?}", parse(source_code));
     }
 
     #[test]

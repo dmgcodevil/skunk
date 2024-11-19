@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, LinkedList};
 
 use crate::ast;
 use ast::Literal;
@@ -620,6 +620,48 @@ pub fn evaluate_node(
                 .locals
                 .declare_variable(name, value);
             Rc::new(RefCell::new(Value::Variable(name.to_string())))
+        }
+        Node::ArrayInit { elements } => {
+            let mut dimensions: Vec<i64> = vec![];
+            dimensions.push(elements.len() as i64);
+
+            let mut node_stack: LinkedList<&Node> = LinkedList::new();
+            if !elements.is_empty() {
+                node_stack.push_back(&elements[0]);
+            }
+            while !node_stack.is_empty() {
+                let n = node_stack.pop_back().unwrap();
+                match n {
+                    Node::ArrayInit { elements } => {
+                        if !elements.is_empty() {
+                            dimensions.push(elements.len() as i64);
+                            node_stack.push_back(&elements[0])
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            node_stack.clear();
+            for e in elements {
+                node_stack.push_back(e)
+            }
+            let mut values: Vec<Rc<RefCell<Value>>> = vec![];
+            while !node_stack.is_empty() {
+                let n = node_stack.pop_front().unwrap();
+                match n {
+                    Node::ArrayInit { elements } => {
+                        for e in elements {
+                            node_stack.push_back(e)
+                        }
+                    }
+                    _ => values.push(Rc::clone(&evaluate_node(n, stack, global_environment))),
+                }
+            }
+
+            Rc::new(RefCell::new(Value::Array {
+                arr: values,
+                dimensions,
+            }))
         }
         Node::StructInitialization { name, fields } => {
             let mut field_values: HashMap<String, Rc<RefCell<Value>>> = HashMap::new();
@@ -1446,7 +1488,7 @@ mod tests {
         assert_eq!(Value::Integer(42), *res.borrow().deref());
     }
 
-    // #[test] array initialization is not supported
+    #[test]
     fn test_resolve_access_mixed() {
         let source_code = r#"
         struct Point {
@@ -1459,6 +1501,62 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(20), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_2d_array_init_inline() {
+        let source_code = r#"
+            arr: int[2][2] = [[1,2], [2,4]];
+            arr;
+            arr[1][1] = 5;
+            arr[1][1];
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(5), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_3d_array_init_inline_modify_flatten() {
+        let source_code = r#"
+            arr: int[3][2][1]= [[[1],[2]], [[3],[4]], [[5],[6]]];
+            for(i:int = 0; i < 3; i = i + 1) {
+                for(j:int = 0; j < 2; j = j + 1) {
+                    for(k:int = 0; k < 1; k = k + 1) {
+                        arr[i][j][k] = arr[i][j][k] + 10;
+                    }
+                }
+            }
+            n:int = 0;
+            res: int[6] = int[6]::new(0);
+            for(i:int = 0; i < 3; i = i + 1) {
+                for(j:int = 0; j < 2; j = j + 1) {
+                    for(k:int = 0; k < 1; k = k + 1) {
+                        res[n] = arr[i][j][k];
+                        n = n + 1;
+                    }
+                }
+            }
+            res;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        let res_ref = res.borrow();
+        match res_ref.deref() {
+            Value::Array { arr, .. } => {
+                let mut n = 1;
+                for e in arr.iter() {
+                    let e_ref = e.borrow();
+                    if let Value::Integer(i) = e_ref.deref() {
+                        assert_eq!(n + 10, *i);
+                        n += 1;
+                    } else {
+                        panic!("expected integer");
+                    }
+                }
+            }
+            _ => panic!("expected array"),
+        }
     }
 
     #[test]
