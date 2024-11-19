@@ -149,6 +149,7 @@ impl GlobalEnvironment {
 #[derive(Debug, PartialEq, Clone)]
 struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
+    overridable: bool,
 }
 
 trait ValueModifier {
@@ -300,6 +301,13 @@ impl Environment {
     fn new() -> Self {
         Environment {
             variables: HashMap::new(),
+            overridable: false,
+        }
+    }
+    fn overridable() -> Self {
+        Environment {
+            variables: HashMap::new(),
+            overridable: true,
         }
     }
 
@@ -720,6 +728,27 @@ pub fn evaluate_node(
                 name: name.to_string(),
                 locals: Environment::new(),
             })
+        }
+        Node::Block { statements } => {
+            let mut frame = CallFrame {
+                name: "".to_string(),
+                locals: Environment::overridable(),
+            };
+            let mut stack_ref = stack.borrow_mut();
+            for (n, v) in &stack_ref.deref().current_frame().locals.variables {
+                frame.locals.variables.insert(n.to_string(), v.clone());
+            }
+            stack_ref.frames.push(frame);
+            mem::drop(stack_ref);
+            for statement in statements {
+                evaluate_node(statement, stack, global_environment);
+            }
+            stack_ref = stack.borrow_mut();
+            stack_ref.frames.pop();
+            mem::drop(stack_ref);
+            Rc::new(RefCell::new(Undefined))
+            // todo return actual value produced by the block:
+            // i: int = { 1 }
         }
         Node::StaticFunctionCall {
             _type,
@@ -1436,10 +1465,10 @@ mod tests {
         assert_eq!(Value::Integer(1212), *res_ref.deref()); // even_sum = 12, odd_sum = 6
     }
 
-    // #[test]
+    #[test]
     fn test_nested_block() {
         let source_code = r#"
-            fumction f():int {
+            function f():int {
                 i: int = 1;
                 {
                     i:int = 2;
@@ -1447,10 +1476,11 @@ mod tests {
                 }
                 return i;
             }
+            f();
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        println!("{:#?}", res);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 
     #[test]
