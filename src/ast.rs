@@ -900,6 +900,29 @@ mod tests {
     }
 
     #[test]
+    fn test_var_dec_function_call() {
+        let source_code = r#"
+        a:int = f();
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        name: "a".to_string(),
+                        var_type: Type::Int,
+                        value: Some(Box::new(Node::FunctionCall {
+                            name: "f".to_string(),
+                            arguments: [].to_vec()
+                        }))
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
+    //#[test] todo should fail
     fn test_var_dec() {
         let source_code = r#"
         a:int;

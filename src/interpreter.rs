@@ -740,15 +740,17 @@ pub fn evaluate_node(
             }
             stack_ref.frames.push(frame);
             mem::drop(stack_ref);
+            let mut res = Rc::new(RefCell::new(Undefined));
             for statement in statements {
-                evaluate_node(statement, stack, global_environment);
+                res = evaluate_node(statement, stack, global_environment);
+                if let Value::Return(v) = res.borrow_mut().deref() {
+                    break;
+                }
             }
             stack_ref = stack.borrow_mut();
             stack_ref.frames.pop();
             mem::drop(stack_ref);
-            Rc::new(RefCell::new(Undefined))
-            // todo return actual value produced by the block:
-            // i: int = { 1 }
+            Rc::clone(&res)
         }
         Node::StaticFunctionCall {
             _type,
@@ -1466,24 +1468,6 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_block() {
-        let source_code = r#"
-            function f():int {
-                i: int = 1;
-                {
-                    i:int = 2;
-                    print(i);
-                }
-                return i;
-            }
-            f();
-        "#;
-        let program = ast::parse(source_code);
-        let res = evaluate(&program);
-        assert_eq!(Value::Integer(1), *res.borrow().deref());
-    }
-
-    #[test]
     fn test_resolve_access_struct_field() {
         let source_code = r#"
         struct Point {
@@ -1645,6 +1629,25 @@ mod tests {
         line.get_start().get_x();
         "#;
 
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
+    }
+
+    // nested blocks tests
+    #[test]
+    fn test_nested_block_shadowing() {
+        let source_code = r#"
+            function f(): int {
+                i: int = 1;
+                {
+                    i:int = 2;
+                    print(i);
+                }
+                return i;
+            }
+            f();
+        "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(1), *res.borrow().deref());

@@ -43,10 +43,10 @@ optional_return_type = _{ return_type? }
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
 statement         = { module | var_decl ~ ";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block}
-assignment        = { access ~ "=" ~ expression }
+assignment        = { access ~ "=" ~ (expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 module            = { "module" ~ IDENTIFIER ~ ";"}
-var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ("=" ~ expression)? }
+var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ("=" ~ expression|func_call) }
 func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
 param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
@@ -96,7 +96,7 @@ sk_return        = { "return" ~ expression ~ ";" }
 
 unary_op        = { (unary_plus | unary_minus | negate) ~ primary }
 expression      = { primary ~ (operation ~ primary)* }
-primary         = { unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | IDENTIFIER }
+primary         = { unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
 
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
