@@ -136,6 +136,9 @@ pub enum Type {
         elem_type: Box<Type>,
         dimensions: Vec<i64>,
     },
+    Slice {
+        elem_type: Box<Type>
+    },
     Custom(String), // Custom types like structs
 }
 
@@ -432,12 +435,18 @@ fn create_base_type_from_str(s: &str) -> Type {
 fn create_type(pair: Pair<Rule>) -> Type {
     match pair.as_rule() {
         Rule::base_type => create_base_type_from_str(pair.as_str()),
+        Rule::slice_type => {
+            let mut inner_pairs = pair.into_inner();
+            Type::Slice {
+                elem_type: Box::new(create_type(inner_pairs.next().unwrap())),
+            }
+        }
         Rule::array_type => {
             let mut inner_pairs = pair.into_inner();
             let elem_type = create_type(
                 inner_pairs
                     .next()
-                    .filter(|x| matches!(x.as_rule(), Rule::base_type))
+                    .filter(|x| matches!(x.as_rule(), Rule::base_type)) // only arrays of primitives ?
                     .unwrap_or_else(|| panic!("array type is missing")),
             );
             let mut dimensions: Vec<i64> = Vec::new();
@@ -1848,6 +1857,15 @@ mod tests {
             },
             parse(source_code)
         );
+    }
+
+    #[test]
+    fn test_slice_type() {
+        let source_code = r#"
+            slice: int[] = [1, 2, 3];
+        "#;
+
+        println!("{:?}", parse(source_code));
     }
 
     #[test]

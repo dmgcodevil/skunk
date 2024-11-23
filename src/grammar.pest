@@ -35,7 +35,9 @@ size = { INTEGER }
 base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
 array_dim       = { "[" ~ expression ~ "]" }
 array_type      = { base_type ~ array_dim+ } // todo in array type dims cannot be expressions, they should be literals: integers
-_type           = { array_type | base_type | "void" }
+slice_type      = { base_type ~ ("[" ~ "]")+ }
+_type           = { array_type | slice_type | base_type | "void" }
+
 return_type     = { ":" ~ _type }
 optional_return_type = _{ return_type? }
 
