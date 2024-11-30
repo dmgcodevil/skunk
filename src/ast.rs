@@ -3,6 +3,7 @@ use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::Parser;
+use std::fmt;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Node {
@@ -13,7 +14,8 @@ pub enum Node {
         name: String,
     },
     Block {
-        statements: Vec<Node>, // A block contains a list of statements
+        statements: Vec<Node>,
+        // metadata: Metadata,
     },
     // Statements
     StructDeclaration {
@@ -25,6 +27,7 @@ pub enum Node {
         var_type: Type,
         name: String,
         value: Option<Box<Node>>,
+        metadata: Metadata,
     },
     FunctionDeclaration {
         name: String,
@@ -35,6 +38,7 @@ pub enum Node {
     Assignment {
         var: Box<Node>,
         value: Box<Node>,
+        metadata: Metadata,
     },
     ArrayInit {
         elements: Vec<Node>,
@@ -134,137 +138,40 @@ pub enum Type {
     Boolean,
     Array {
         elem_type: Box<Type>,
-        dimensions: Vec<i64>,
+        dimensions: Vec<Node>,
     },
     Slice {
-        elem_type: Box<Type>
+        elem_type: Box<Type>,
     },
     Custom(String), // Custom types like structs
 }
 
-pub fn type_to_string(t: &Type) -> String {
-    match t {
-        Type::Void => "void".to_string(),
-        Type::Int => "int".to_string(),
-        Type::String => "string".to_string(),
-        Type::Boolean => "boolean".to_string(),
-        Type::Custom(v) => v.to_string(),
-        _ => panic!("unsupported type {:?}", t),
-    }
+#[derive(Debug, PartialEq, Clone)]
+struct Span {
+    start: usize,  // start col
+    end: usize,    // end col
+    line: usize,   // line number
+    input: String, // input being parsed
 }
 
-pub fn extract_struct_field(field: &Node) -> (String, Type) {
-    match field {
-        Node::VariableDeclaration {
-            name,
-            var_type,
-            value,
-        } => ((*name).clone(), (*var_type).clone()),
-        _ => panic!("expected VariableDeclaration node but: {:?}", field),
-    }
+#[derive(Debug, PartialEq, Clone)]
+pub struct Metadata {
+    span: Span,
 }
 
-fn create_block(pair: Pair<Rule>) -> Node {
-    assert_eq!(pair.as_rule(), Rule::block);
-    let statements = pair.into_inner().map(create_ast).collect();
-    Node::Block { statements }
+impl Metadata {
+    pub const EMPTY: Metadata = Metadata {
+        span: Span {
+            start: 0,
+            end: 0,
+            line: 0,
+            input: String::new(),
+        },
+    };
 }
 
-fn create_primary(pair: Pair<Rule>) -> Node {
-    assert_eq!(pair.as_rule(), Rule::primary);
-    let mut primary_inner_pairs = pair.into_inner();
-    assert_eq!(
-        primary_inner_pairs.len(),
-        1,
-        "primary should have exactly one child"
-    );
-    let primary_child = primary_inner_pairs.next().unwrap();
-    match primary_child.as_rule() {
-        Rule::unary_op => {
-            let mut unary_pairs = primary_child.into_inner();
-            assert_eq!(
-                unary_pairs.len(),
-                2,
-                "unary pair should have exactly two children"
-            );
-            let unary_op_pair = unary_pairs.next().unwrap();
-            let unary_operand_pair = unary_pairs.next().unwrap();
-            match unary_op_pair.as_rule() {
-                Rule::unary_plus => Node::UnaryOp {
-                    operator: UnaryOperator::Plus,
-                    operand: Box::new(create_ast(unary_operand_pair)),
-                },
-                Rule::unary_minus => Node::UnaryOp {
-                    operator: UnaryOperator::Minus,
-                    operand: Box::new(create_ast(unary_operand_pair)),
-                },
-                Rule::negate => Node::UnaryOp {
-                    operator: UnaryOperator::Negate,
-                    operand: Box::new(create_ast(unary_operand_pair)),
-                },
-                _ => panic!("unsupported unary operator {:?}", unary_op_pair),
-            }
-        }
-        _ => create_ast(primary_child),
-    }
-}
-
-fn create_ast(pair: Pair<Rule>) -> Node {
-    let r = pair.as_rule();
-    match r {
-        Rule::program => {
-            let mut statements: Vec<Node> = Vec::new();
-            for inner_pair in pair.into_inner() {
-                statements.push(create_ast(inner_pair));
-            }
-            Node::Program { statements }
-        }
-        Rule::module => create_module(pair),
-        Rule::statement => {
-            let mut pairs = pair.into_inner();
-            let inner = pairs.next().unwrap();
-            create_ast(inner)
-        }
-        Rule::block => create_block(pair),
-        Rule::expression => create_expression(pair),
-        Rule::assignment => create_assignment(pair),
-        Rule::struct_decl => create_struct_decl(pair),
-        Rule::var_decl => create_var_decl(pair),
-        Rule::func_decl => create_func_decl(pair),
-        Rule::literal => create_literal(pair),
-        Rule::size => create_literal(pair),
-        Rule::primary => create_primary(pair),
-        Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
-        Rule::access => create_access(pair),
-        Rule::func_call => create_function_call(pair),
-        Rule::static_func_call => create_static_func_call(pair),
-        Rule::struct_init => create_struct_init(pair),
-        Rule::inline_array_init => create_inline_array_init(pair),
-        Rule::sk_return => {
-            let mut pairs = pair.into_inner();
-            Node::Return(Box::new(create_ast(pairs.next().unwrap())))
-        }
-        Rule::io => {
-            let p = pair.into_inner().next().unwrap();
-            match p.as_rule() {
-                Rule::print => Node::Print(Box::new(create_ast(p.into_inner().next().unwrap()))),
-                Rule::input => Node::Input,
-                _ => panic!("unsupported IO rule"),
-            }
-        }
-        Rule::control_flow => {
-            let p = pair.into_inner().next().unwrap();
-            match p.as_rule() {
-                Rule::if_expr => create_if_expr(p),
-                Rule::for_expr => create_for_classic(p),
-                _ => panic!("unsupported control flow"),
-            }
-        }
-        Rule::EOI => Node::EOI,
-        _ => {
-            panic!("Unexpected Node: {:?}", pair);
-        }
-    }
+struct PestImpl {
+    metadata_creator: fn(&Pair<Rule>) -> Metadata,
 }
 
 lazy_static::lazy_static! {
@@ -287,138 +194,599 @@ lazy_static::lazy_static! {
 };
 }
 
-fn create_module(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    if let Identifier(name) = create_identifier(inner_pairs.next().unwrap()) {
-        Node::Module {
-            name: name.to_string(),
-        }
-    } else {
-        unreachable!()
-    }
-}
-
-fn create_literal(pair: Pair<Rule>) -> Node {
-    let literal = pair.into_inner().next().unwrap();
-    match literal.as_rule() {
-        Rule::STRING_LITERAL => Node::Literal(Literal::StringLiteral(literal.as_str().to_string())),
-        Rule::INTEGER => Node::Literal(Literal::Integer(literal.as_str().parse::<i64>().unwrap())),
-        Rule::BOOLEAN_LITERAL => {
-            Node::Literal(Literal::Boolean(literal.as_str().parse::<bool>().unwrap()))
-        }
-        _ => panic!("unsupported rule {:?}", literal),
-    }
-}
-
-fn create_array_access(pair: Pair<Rule>) -> Node {
-    assert_eq!(Rule::array_access, pair.as_rule());
-    let mut pairs = pair.into_inner();
-    let mut coordinates: Vec<Node> = Vec::new();
-    while let Some(dim_expr) = pairs.next() {
-        coordinates.push(create_ast(dim_expr));
-    }
-    Node::ArrayAccess { coordinates }
-}
-
-fn create_inline_array_init(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let elements = inner_pairs.map(|p| create_ast(p)).collect();
-    ArrayInit { elements }
-}
-
-fn create_member_access(pair: Pair<Rule>) -> Node {
-    assert_eq!(Rule::member_access, pair.as_rule());
-    let mut pairs = pair.into_inner();
-    if let Some(inner) = pairs.next() {
-        MemberAccess {
-            member: Box::new(match inner.as_rule() {
-                Rule::func_call => create_function_call(inner),
-                Rule::IDENTIFIER => Identifier(inner.as_str().to_string()),
-                _ => panic!("unsupported member access rule: {:?}", inner),
-            }),
-        }
-    } else {
-        panic!("member access tree is empty")
-    }
-}
-
-fn create_chained_access(pair: Pair<Rule>) -> Vec<Node> {
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut inner_pairs = pair.into_inner();
-    while let Some(inner_pair) = inner_pairs.next() {
-        match inner_pair.as_rule() {
-            Rule::IDENTIFIER => nodes.push(create_identifier(inner_pair)),
-            Rule::member_access => nodes.push(create_member_access(inner_pair)),
-            Rule::array_access => nodes.push(create_array_access(inner_pair)),
-            _ => panic!("unsupported chained access node: {:?}", inner_pair),
+impl PestImpl {
+    fn new() -> Self {
+        PestImpl {
+            metadata_creator: |p| Self::create_metadata(p),
         }
     }
-    nodes
-}
 
-fn create_access(pair: Pair<Rule>) -> Node {
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut inner_pairs = pair.into_inner();
-    while let Some(inner_pair) = inner_pairs.next() {
-        match inner_pair.as_rule() {
-            Rule::chained_access => nodes.extend(create_chained_access(inner_pair)),
-            Rule::IDENTIFIER => nodes.push(create_identifier(inner_pair)),
-            _ => panic!("unsupported rule {:?}", inner_pair),
+    pub fn parse(&self, code: &str) -> Result<Node, String> {
+        match SkunkParser::parse(Rule::program, code) {
+            Ok(pairs) => {
+                Self::pretty_print(pairs.clone().next().unwrap(), 0);
+                Ok(self.create_ast(pairs.clone().next().unwrap()))
+            }
+            Err(e) => Err(format!("parser failed: {}", e)),
         }
     }
-    Node::Access { nodes }
-}
 
-fn create_function_call(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let name = inner_pairs.next().unwrap().as_str().to_string();
-    let mut arguments = Vec::new();
-    while let Some(arg_pair) = inner_pairs.next() {
-        arguments.push(create_ast(arg_pair));
-    }
-    Node::FunctionCall { name, arguments }
-}
-
-fn create_static_func_call(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let _type = create_type(inner_pairs.next().unwrap());
-    let name = inner_pairs.next().unwrap().as_str().to_string();
-    let mut arguments = Vec::new();
-    while let Some(arg_pair) = inner_pairs.next() {
-        arguments.push(create_ast(arg_pair));
-    }
-
-    Node::StaticFunctionCall {
-        _type,
-        name,
-        arguments,
-    }
-}
-
-fn create_struct_init(pair: Pair<Rule>) -> Node {
-    println!("{:?}", pair);
-    let mut inner_pairs = pair.into_inner();
-    let name_pair = inner_pairs.next().unwrap();
-    let name = create_identifier(name_pair);
-    let mut fields: Vec<(String, Node)> = Vec::new();
-    if let Some(mut init_field_list) = inner_pairs.next().map(|p| p.into_inner()) {
-        while let Some(p) = init_field_list.next() {
-            match p.as_rule() {
-                Rule::init_field => {
-                    let mut init_field_pairs = p.into_inner();
-                    let field_name = init_field_pairs.next().unwrap().as_str().to_string();
-                    let body = create_ast(init_field_pairs.next().unwrap());
-                    fields.push((field_name, body));
+    fn create_ast(&self, pair: Pair<Rule>) -> Node {
+        let r = pair.as_rule();
+        match r {
+            Rule::program => {
+                let mut statements: Vec<Node> = Vec::new();
+                for inner_pair in pair.into_inner() {
+                    statements.push(self.create_ast(inner_pair));
                 }
-                _ => panic!("unsupported rule {}", p),
+                Node::Program { statements }
+            }
+            Rule::module => self.create_module(pair),
+            Rule::statement => {
+                let mut pairs = pair.into_inner();
+                let inner = pairs.next().unwrap();
+                self.create_ast(inner)
+            }
+            Rule::block => self.create_block(pair),
+            Rule::expression => self.create_expression(pair),
+            Rule::assignment => self.create_assignment(pair),
+            Rule::struct_decl => self.create_struct_decl(pair),
+            Rule::var_decl => self.create_var_decl(pair),
+            Rule::func_decl => self.create_func_decl(pair),
+            Rule::literal => self.create_literal(pair),
+            Rule::size => self.create_literal(pair),
+            Rule::primary => self.create_primary(pair),
+            Rule::IDENTIFIER => Node::Identifier(pair.as_str().to_string()),
+            Rule::access => self.create_access(pair),
+            Rule::func_call => self.create_function_call(pair),
+            Rule::static_func_call => self.create_static_func_call(pair),
+            Rule::struct_init => self.create_struct_init(pair),
+            Rule::inline_array_init => self.create_inline_array_init(pair),
+            Rule::sk_return => {
+                let mut pairs = pair.into_inner();
+                Node::Return(Box::new(self.create_ast(pairs.next().unwrap())))
+            }
+            Rule::io => {
+                let p = pair.into_inner().next().unwrap();
+                match p.as_rule() {
+                    Rule::print => {
+                        Node::Print(Box::new(self.create_ast(p.into_inner().next().unwrap())))
+                    }
+                    Rule::input => Node::Input,
+                    _ => panic!("unsupported IO rule"),
+                }
+            }
+            Rule::control_flow => {
+                let p = pair.into_inner().next().unwrap();
+                match p.as_rule() {
+                    Rule::if_expr => self.create_if_expr(p),
+                    Rule::for_expr => self.create_for_classic(p),
+                    _ => panic!("unsupported control flow"),
+                }
+            }
+            Rule::EOI => Node::EOI,
+            _ => {
+                panic!("Unexpected Node: {:?}", pair);
             }
         }
     }
 
-    if let Identifier(s) = name {
-        StructInitialization { name: s, fields } // todo
-    } else {
-        unreachable!()
+    fn create_block(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::block);
+        let span = pair.as_span();
+        let statements = pair.into_inner().map(|p| self.create_ast(p)).collect();
+        Node::Block {
+            statements,
+            //    metadata: Metadata{ span: Span { start: span.start(), end: span.end() }}
+        }
+    }
+
+    fn create_primary(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::primary);
+        let mut primary_inner_pairs = pair.into_inner();
+        assert_eq!(
+            primary_inner_pairs.len(),
+            1,
+            "primary should have exactly one child"
+        );
+        let primary_child = primary_inner_pairs.next().unwrap();
+        match primary_child.as_rule() {
+            Rule::unary_op => {
+                let mut unary_pairs = primary_child.into_inner();
+                assert_eq!(
+                    unary_pairs.len(),
+                    2,
+                    "unary pair should have exactly two children"
+                );
+                let unary_op_pair = unary_pairs.next().unwrap();
+                let unary_operand_pair = unary_pairs.next().unwrap();
+                match unary_op_pair.as_rule() {
+                    Rule::unary_plus => Node::UnaryOp {
+                        operator: UnaryOperator::Plus,
+                        operand: Box::new(self.create_ast(unary_operand_pair)),
+                    },
+                    Rule::unary_minus => Node::UnaryOp {
+                        operator: UnaryOperator::Minus,
+                        operand: Box::new(self.create_ast(unary_operand_pair)),
+                    },
+                    Rule::negate => Node::UnaryOp {
+                        operator: UnaryOperator::Negate,
+                        operand: Box::new(self.create_ast(unary_operand_pair)),
+                    },
+                    _ => panic!("unsupported unary operator {:?}", unary_op_pair),
+                }
+            }
+            _ => self.create_ast(primary_child),
+        }
+    }
+
+    fn create_module(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        if let Identifier(name) = self.create_identifier(inner_pairs.next().unwrap()) {
+            Node::Module {
+                name: name.to_string(),
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn create_literal(&self, pair: Pair<Rule>) -> Node {
+        let literal = pair.into_inner().next().unwrap();
+        match literal.as_rule() {
+            Rule::STRING_LITERAL => {
+                Node::Literal(Literal::StringLiteral(literal.as_str().to_string()))
+            }
+            Rule::INTEGER => {
+                Node::Literal(Literal::Integer(literal.as_str().parse::<i64>().unwrap()))
+            }
+            Rule::BOOLEAN_LITERAL => {
+                Node::Literal(Literal::Boolean(literal.as_str().parse::<bool>().unwrap()))
+            }
+            _ => panic!("unsupported rule {:?}", literal),
+        }
+    }
+
+    fn create_array_access(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(Rule::array_access, pair.as_rule());
+        let mut pairs = pair.into_inner();
+        let mut coordinates: Vec<Node> = Vec::new();
+        while let Some(dim_expr) = pairs.next() {
+            coordinates.push(self.create_ast(dim_expr));
+        }
+        Node::ArrayAccess { coordinates }
+    }
+
+    fn create_inline_array_init(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        let elements = inner_pairs.map(|p| self.create_ast(p)).collect();
+        ArrayInit { elements }
+    }
+
+    fn create_member_access(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(Rule::member_access, pair.as_rule());
+        let mut pairs = pair.into_inner();
+        if let Some(inner) = pairs.next() {
+            MemberAccess {
+                member: Box::new(match inner.as_rule() {
+                    Rule::func_call => self.create_function_call(inner),
+                    Rule::IDENTIFIER => Identifier(inner.as_str().to_string()),
+                    _ => panic!("unsupported member access rule: {:?}", inner),
+                }),
+            }
+        } else {
+            panic!("member access tree is empty")
+        }
+    }
+
+    fn create_chained_access(&self, pair: Pair<Rule>) -> Vec<Node> {
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut inner_pairs = pair.into_inner();
+        while let Some(inner_pair) = inner_pairs.next() {
+            match inner_pair.as_rule() {
+                Rule::IDENTIFIER => nodes.push(self.create_identifier(inner_pair)),
+                Rule::member_access => nodes.push(self.create_member_access(inner_pair)),
+                Rule::array_access => nodes.push(self.create_array_access(inner_pair)),
+                _ => panic!("unsupported chained access node: {:?}", inner_pair),
+            }
+        }
+        nodes
+    }
+
+    fn create_access(&self, pair: Pair<Rule>) -> Node {
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut inner_pairs = pair.into_inner();
+        while let Some(inner_pair) = inner_pairs.next() {
+            match inner_pair.as_rule() {
+                Rule::chained_access => nodes.extend(self.create_chained_access(inner_pair)),
+                Rule::IDENTIFIER => nodes.push(self.create_identifier(inner_pair)),
+                _ => panic!("unsupported rule {:?}", inner_pair),
+            }
+        }
+        Node::Access { nodes }
+    }
+
+    fn create_function_call(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let mut arguments = Vec::new();
+        while let Some(arg_pair) = inner_pairs.next() {
+            arguments.push(self.create_ast(arg_pair));
+        }
+        Node::FunctionCall { name, arguments }
+    }
+
+    fn create_static_func_call(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        let _type = self.create_type(inner_pairs.next().unwrap());
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let mut arguments = Vec::new();
+        while let Some(arg_pair) = inner_pairs.next() {
+            arguments.push(self.create_ast(arg_pair));
+        }
+
+        Node::StaticFunctionCall {
+            _type,
+            name,
+            arguments,
+        }
+    }
+
+    fn create_struct_init(&self, pair: Pair<Rule>) -> Node {
+        println!("{:?}", pair);
+        let mut inner_pairs = pair.into_inner();
+        let name_pair = inner_pairs.next().unwrap();
+        let name = self.create_identifier(name_pair);
+        let mut fields: Vec<(String, Node)> = Vec::new();
+        if let Some(mut init_field_list) = inner_pairs.next().map(|p| p.into_inner()) {
+            while let Some(p) = init_field_list.next() {
+                match p.as_rule() {
+                    Rule::init_field => {
+                        let mut init_field_pairs = p.into_inner();
+                        let field_name = init_field_pairs.next().unwrap().as_str().to_string();
+                        let body = self.create_ast(init_field_pairs.next().unwrap());
+                        fields.push((field_name, body));
+                    }
+                    _ => panic!("unsupported rule {}", p),
+                }
+            }
+        }
+
+        if let Identifier(s) = name {
+            StructInitialization { name: s, fields } // todo
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn create_assignment(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(Rule::assignment, pair.as_rule());
+        let metadata = (self.metadata_creator)(&pair);
+        let mut inner_pairs = pair.into_inner();
+        let var = Box::new(self.create_access(inner_pairs.next().unwrap()));
+        let value = Box::new(self.create_ast(inner_pairs.next().unwrap()));
+        Node::Assignment {
+            var,
+            value,
+            metadata,
+        }
+    }
+
+    fn create_metadata(p: &Pair<Rule>) -> Metadata {
+        let span = p.as_span();
+        let line_pos = span.start_pos().line_col();
+        let line_num = line_pos.0;
+        let input = span.as_str().to_string();
+        println!("{:?}", span);
+        Metadata {
+            span: Span {
+                start: span.start(),
+                end: span.end(),
+                line: line_num,
+                input,
+            },
+        }
+    }
+
+    fn create_identifier(&self, pair: Pair<Rule>) -> Node {
+        match pair.as_rule() {
+            Rule::IDENTIFIER => Identifier(pair.as_str().to_string()),
+            _ => panic!("not identifier rule {}", pair),
+        }
+    }
+
+    fn create_func_decl(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        let name = self.create_identifier(inner_pairs.next().unwrap());
+        let parameters = self.create_param_list(inner_pairs.next().unwrap());
+        let return_type = match inner_pairs.peek() {
+            Some(p) => {
+                if p.as_rule() == Rule::return_type {
+                    self.create_type(inner_pairs.next().unwrap().into_inner().next().unwrap())
+                } else {
+                    Type::Void
+                }
+            }
+            _ => Type::Void,
+        };
+        let mut body: Vec<Node> = Vec::new();
+        while let Some(statement) = inner_pairs.next() {
+            body.push(self.create_ast(statement))
+        }
+        if let Identifier(s) = name {
+            // todo
+            Node::FunctionDeclaration {
+                name: s,
+                parameters,
+                return_type,
+                body,
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn create_type(&self, pair: Pair<Rule>) -> Type {
+        match pair.as_rule() {
+            Rule::base_type => create_base_type_from_str(pair.as_str()),
+            Rule::slice_type => {
+                let mut inner_pairs = pair.into_inner();
+                Type::Slice {
+                    elem_type: Box::new(self.create_type(inner_pairs.next().unwrap())),
+                }
+            }
+            Rule::array_type => {
+                let mut inner_pairs = pair.into_inner();
+                let elem_type = self.create_type(
+                    inner_pairs
+                        .next()
+                        .filter(|x| matches!(x.as_rule(), Rule::base_type)) // only arrays of primitives ?
+                        .unwrap_or_else(|| panic!("array type is missing")),
+                );
+                let mut dimensions: Vec<Node> = Vec::new();
+                while let Some(dim_pair) = inner_pairs.next() {
+                    let dim = self.create_ast(dim_pair.into_inner().next().unwrap());
+                    dimensions.push(dim);
+                    // match dim {
+                    //     Node::Literal(Literal::Integer(v)) => dimensions.push(v),
+                    //     //todo support Access nodes, e.g. identifier
+                    //     _ => panic!("incorrect array size literal: {:?}", dim),
+                    // }
+                }
+                Type::Array {
+                    elem_type: Box::new(elem_type),
+                    dimensions,
+                }
+            }
+            Rule::_type => self.create_type(pair.into_inner().next().unwrap()),
+            _ => panic!("unexpected pair {:?}", pair),
+        }
+    }
+
+    fn pretty_print(pair: Pair<Rule>, depth: usize) {
+        println!(
+            "{:indent$}{:?}: `{}`",
+            "",
+            pair.as_rule(),
+            pair.as_str(),
+            indent = depth * 2
+        );
+        for inner_pair in pair.into_inner() {
+            Self::pretty_print(inner_pair, depth + 1);
+        }
+    }
+
+    fn create_if_expr(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        let condition = self.create_ast(inner_pairs.next().unwrap());
+        let mut body = vec![];
+        while let Some(p) = inner_pairs.peek() {
+            if p.as_rule() == Rule::statement {
+                inner_pairs.next();
+                body.push(self.create_ast(p));
+            } else {
+                break;
+            }
+        }
+
+        // Parse optional `else if` blocks
+        let mut else_if_blocks = Vec::new();
+        while let Some(else_if_pair) = inner_pairs.peek() {
+            if else_if_pair.as_rule() == Rule::else_if_expr {
+                inner_pairs.next(); // Consume the peeked pair
+                let mut elif_pairs = else_if_pair.into_inner(); // condition + body
+                let else_if_condition = self.create_ast(elif_pairs.next().unwrap());
+                let else_if_body = self.create_body(&mut elif_pairs);
+                else_if_blocks.push(Node::If {
+                    condition: Box::new(else_if_condition),
+                    body: else_if_body,
+                    else_if_blocks: Vec::new(),
+                    else_block: None,
+                });
+            } else {
+                break;
+            }
+        }
+
+        // Parse optional `else` block
+        let else_block = if let Some(else_pair) = inner_pairs.next() {
+            Some(self.create_body(&mut else_pair.into_inner()))
+        } else {
+            None
+        };
+
+        Node::If {
+            condition: Box::new(condition),
+            body,
+            else_if_blocks,
+            else_block,
+        }
+    }
+
+    fn create_body(&self, pairs: &mut pest::iterators::Pairs<Rule>) -> Vec<Node> {
+        pairs.by_ref().map(|p| self.create_ast(p)).collect()
+    }
+
+    fn create_for_classic(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        assert_eq!(Rule::for_classic, inner_pairs.peek().unwrap().as_rule());
+        let mut for_decl = inner_pairs.next().unwrap().into_inner();
+        let init_pair = for_decl.next().unwrap();
+        let init: Option<Node> = if !init_pair.as_str().is_empty() {
+            let init_kind = init_pair.into_inner().next().unwrap();
+            match init_kind.as_rule() {
+                Rule::assignment => Some(self.create_assignment(init_kind)),
+                Rule::var_decl => Some(self.create_var_decl(init_kind)),
+                _ => panic!("unsupported 'for' init rule {:?}", init_kind),
+            }
+        } else {
+            None
+        };
+
+        let condition_pair = for_decl.next().unwrap();
+        let condition: Option<Node> = if !condition_pair.as_str().is_empty() {
+            // todo add cond rule. create_ast is too generic
+            Some(self.create_ast(condition_pair.into_inner().next().unwrap()))
+        } else {
+            None
+        };
+        let update_pair = for_decl.next().unwrap();
+        let update: Option<Node> = if !update_pair.as_str().is_empty() {
+            Some(self.create_assignment(update_pair.into_inner().next().unwrap()))
+        } else {
+            None
+        };
+
+        let body = self.create_body(&mut inner_pairs);
+        Node::For {
+            init: init.map(Box::new),
+            condition: condition.map(Box::new),
+            update: update.map(Box::new),
+            body,
+        }
+    }
+
+    fn create_struct_decl(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let mut fields: Vec<(String, Type)> = Vec::new();
+        let mut functions = Vec::new();
+        while let Some(p) = inner_pairs.next() {
+            match p.as_rule() {
+                Rule::struct_field_decl => fields.push(self.create_struct_field_dec(p)),
+                Rule::func_decl => functions.push(self.create_func_decl(p)),
+                _ => panic!("unsupported rule {}", p),
+            }
+        }
+        Node::StructDeclaration {
+            name,
+            fields,
+            functions,
+        }
+    }
+
+    fn create_struct_field_dec(&self, pair: Pair<Rule>) -> (String, Type) {
+        let mut inner_pairs = pair.into_inner();
+        let field_name = inner_pairs.next().unwrap().as_str().to_string();
+        let field_type = self.create_type(inner_pairs.next().unwrap());
+        (field_name, field_type)
+    }
+
+    fn create_var_decl(&self, pair: Pair<Rule>) -> Node {
+        let metadata = (self.metadata_creator)(&pair);
+        let mut inner_pairs = pair.into_inner();
+        let var_name = inner_pairs.next().unwrap().as_str().to_string();
+        let var_type = self.create_type(inner_pairs.next().unwrap());
+
+        let body = if let Some(body_pair) = inner_pairs.next() {
+            Some(Box::new(self.create_ast(body_pair)))
+        } else {
+            None
+        };
+
+        Node::VariableDeclaration {
+            var_type,
+            name: var_name,
+            value: body,
+            metadata,
+        }
+    }
+
+    fn create_param_list(&self, pair: Pair<Rule>) -> Vec<(String, Type)> {
+        match pair.as_rule() {
+            Rule::empty_params => Vec::new(),
+            Rule::param_list => {
+                let mut result: Vec<(String, Type)> = Vec::new();
+                let pairs: Vec<Pair<Rule>> = pair.into_inner().collect();
+                assert_eq!(pairs.len() % 2, 0);
+                pairs.chunks(2).for_each(|chunk| {
+                    result.push((
+                        chunk[0].as_str().to_string(),
+                        self.create_type(chunk[1].clone()),
+                    ));
+                });
+                result
+            }
+            _ => panic!("unexpected  rule {}", pair),
+        }
+    }
+
+    fn create_expression(&self, pair: Pair<Rule>) -> Node {
+        PRATT_PARSER
+            .map_primary(|primary| self.create_primary(primary))
+            .map_infix(|lhs, op, rhs| {
+                let operator = match op.as_rule() {
+                    Rule::add => Operator::Add,
+                    Rule::subtract => Operator::Subtract,
+                    Rule::multiply => Operator::Multiply,
+                    Rule::divide => Operator::Divide,
+                    Rule::modulus => Operator::Mod,
+                    Rule::power => Operator::Power,
+                    Rule::and => Operator::And,
+                    Rule::or => Operator::Or,
+                    Rule::eq => Operator::Equals,
+                    Rule::not_eq => Operator::NotEquals,
+                    Rule::lt => Operator::LessThan,
+                    Rule::lte => Operator::LessThanOrEqual,
+                    Rule::gt => Operator::GreaterThan,
+                    Rule::gte => Operator::GreaterThanOrEqual,
+                    _ => panic!("unsupported operator {:?}", op),
+                };
+
+                Node::BinaryOp {
+                    left: Box::new(lhs),
+                    operator,
+                    right: Box::new(rhs),
+                }
+            })
+            .parse(pair.into_inner())
+    }
+}
+
+pub fn parse(input: &str) -> Node {
+    PestImpl::new().parse(input).unwrap()
+}
+
+pub fn type_to_string(t: &Type) -> String {
+    match t {
+        Type::Void => "void".to_string(),
+        Type::Int => "int".to_string(),
+        Type::String => "string".to_string(),
+        Type::Boolean => "boolean".to_string(),
+        Type::Custom(v) => v.to_string(),
+        _ => panic!("unsupported type {:?}", t),
+    }
+}
+
+pub fn extract_struct_field(field: &Node) -> (String, Type) {
+    match field {
+        Node::VariableDeclaration {
+            name,
+            var_type,
+            value,
+            metadata,
+        } => ((*name).clone(), (*var_type).clone()),
+        _ => panic!("expected VariableDeclaration node but: {:?}", field),
     }
 }
 
@@ -432,299 +800,24 @@ fn create_base_type_from_str(s: &str) -> Type {
     }
 }
 
-fn create_type(pair: Pair<Rule>) -> Type {
-    match pair.as_rule() {
-        Rule::base_type => create_base_type_from_str(pair.as_str()),
-        Rule::slice_type => {
-            let mut inner_pairs = pair.into_inner();
-            Type::Slice {
-                elem_type: Box::new(create_type(inner_pairs.next().unwrap())),
-            }
-        }
-        Rule::array_type => {
-            let mut inner_pairs = pair.into_inner();
-            let elem_type = create_type(
-                inner_pairs
-                    .next()
-                    .filter(|x| matches!(x.as_rule(), Rule::base_type)) // only arrays of primitives ?
-                    .unwrap_or_else(|| panic!("array type is missing")),
-            );
-            let mut dimensions: Vec<i64> = Vec::new();
-            while let Some(dim_pair) = inner_pairs.next() {
-                let dim = create_ast(dim_pair.into_inner().next().unwrap());
-                match dim {
-                    Node::Literal(Literal::Integer(v)) => dimensions.push(v),
-                    _ => panic!("incorrect array size literal: {:?}", dim),
-                }
-            }
-            Type::Array {
-                elem_type: Box::new(elem_type),
-                dimensions,
-            }
-        }
-        Rule::_type => create_type(pair.into_inner().next().unwrap()),
-        _ => panic!("unexpected pair {:?}", pair),
-    }
-}
-
-fn create_struct_decl(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let name = inner_pairs.next().unwrap().as_str().to_string();
-    let mut fields: Vec<(String, Type)> = Vec::new();
-    let mut functions = Vec::new();
-    while let Some(p) = inner_pairs.next() {
-        match p.as_rule() {
-            Rule::struct_field_decl => fields.push(create_struct_field_dec(p)),
-            Rule::func_decl => functions.push(create_func_decl(p)),
-            _ => panic!("unsupported rule {}", p),
-        }
-    }
-    Node::StructDeclaration {
-        name,
-        fields,
-        functions,
-    }
-}
-
-fn create_struct_field_dec(pair: Pair<Rule>) -> (String, Type) {
-    let mut inner_pairs = pair.into_inner();
-    let field_name = inner_pairs.next().unwrap().as_str().to_string();
-    let field_type = create_type(inner_pairs.next().unwrap());
-    (field_name, field_type)
-}
-
-fn create_var_decl(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let var_name = inner_pairs.next().unwrap().as_str().to_string();
-    let var_type = create_type(inner_pairs.next().unwrap());
-
-    let body = if let Some(body_pair) = inner_pairs.next() {
-        Some(Box::new(create_ast(body_pair)))
-    } else {
-        None
-    };
-
-    Node::VariableDeclaration {
-        var_type,
-        name: var_name,
-        value: body,
-    }
-}
-
-/// returns params as a vector of (String, Type) pairs
-fn create_param_list(pair: Pair<Rule>) -> Vec<(String, Type)> {
-    match pair.as_rule() {
-        Rule::empty_params => Vec::new(),
-        Rule::param_list => {
-            let mut result: Vec<(String, Type)> = Vec::new();
-            let pairs: Vec<Pair<Rule>> = pair.into_inner().collect();
-            assert_eq!(pairs.len() % 2, 0);
-            pairs.chunks(2).for_each(|chunk| {
-                result.push((chunk[0].as_str().to_string(), create_type(chunk[1].clone())));
-            });
-            result
-        }
-        _ => panic!("unexpected  rule {}", pair),
-    }
-}
-
-fn create_expression(pair: Pair<Rule>) -> Node {
-    PRATT_PARSER
-        .map_primary(|primary| create_primary(primary))
-        .map_infix(|lhs, op, rhs| {
-            let operator = match op.as_rule() {
-                // Rule::assign => Operator::Assign,
-                Rule::add => Operator::Add,
-                Rule::subtract => Operator::Subtract,
-                Rule::multiply => Operator::Multiply,
-                Rule::divide => Operator::Divide,
-                Rule::modulus => Operator::Mod,
-                Rule::power => Operator::Power,
-                Rule::and => Operator::And,
-                Rule::or => Operator::Or,
-                Rule::eq => Operator::Equals,
-                Rule::not_eq => Operator::NotEquals,
-                // Rule::not => Operator::Not,
-                Rule::lt => Operator::LessThan,
-                Rule::lte => Operator::LessThanOrEqual,
-                Rule::gt => Operator::GreaterThan,
-                Rule::gte => Operator::GreaterThanOrEqual,
-                _ => panic!("unsupported operator {:?}", op),
-            };
-
-            Node::BinaryOp {
-                left: Box::new(lhs),
-                operator,
-                right: Box::new(rhs),
-            }
-        })
-        .parse(pair.into_inner())
-}
-
-fn create_identifier(pair: Pair<Rule>) -> Node {
-    match pair.as_rule() {
-        Rule::IDENTIFIER => Identifier(pair.as_str().to_string()),
-        _ => panic!("not identifier rule {}", pair),
-    }
-}
-
-/// creates Node::FunctionDeclaration from the pair
-fn create_func_decl(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let name = create_identifier(inner_pairs.next().unwrap());
-    let parameters = create_param_list(inner_pairs.next().unwrap());
-    let return_type = match inner_pairs.peek() {
-        Some(p) => {
-            if p.as_rule() == Rule::return_type {
-                create_type(inner_pairs.next().unwrap().into_inner().next().unwrap())
-            } else {
-                Type::Void
-            }
-        }
-        _ => Type::Void,
-    };
-    let mut body: Vec<Node> = Vec::new();
-    while let Some(statement) = inner_pairs.next() {
-        body.push(create_ast(statement))
-    }
-    if let Identifier(s) = name {
-        // todo
-        Node::FunctionDeclaration {
-            name: s,
-            parameters,
-            return_type,
-            body,
-        }
-    } else {
-        unreachable!()
-    }
-}
-
-/// Recursive function to pretty print the parse tree
-fn pretty_print(pair: Pair<Rule>, depth: usize) {
-    println!(
-        "{:indent$}{:?}: `{}`",
-        "",
-        pair.as_rule(),
-        pair.as_str(),
-        indent = depth * 2
-    );
-    for inner_pair in pair.into_inner() {
-        pretty_print(inner_pair, depth + 1);
-    }
-}
-
-fn create_if_expr(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    let condition = create_ast(inner_pairs.next().unwrap());
-    let body = create_body(inner_pairs.next().unwrap().into_inner());
-
-    // Parse optional `else if` blocks
-    let mut else_if_blocks = Vec::new();
-    while let Some(else_if_pair) = inner_pairs.clone().peek() {
-        if else_if_pair.as_rule() == Rule::else_if_expr {
-            inner_pairs.next(); // Consume the peeked pair
-            let mut elif_pairs = else_if_pair.into_inner(); // condition + body
-            let else_if_condition = create_ast(elif_pairs.next().unwrap());
-            let else_if_body = create_body(elif_pairs.next().unwrap().into_inner());
-            else_if_blocks.push(Node::If {
-                condition: Box::new(else_if_condition),
-                body: else_if_body,
-                else_if_blocks: Vec::new(),
-                else_block: None,
-            });
-        } else {
-            break;
-        }
-    }
-
-    // Parse optional `else` block
-    let else_block = if let Some(else_pair) = inner_pairs.next() {
-        Some(create_body(else_pair.into_inner()))
-    } else {
-        None
-    };
-
-    Node::If {
-        condition: Box::new(condition),
-        body,
-        else_if_blocks,
-        else_block,
-    }
-}
-
-fn create_body(pairs: pest::iterators::Pairs<Rule>) -> Vec<Node> {
-    pairs.map(create_ast).collect()
-}
-
-fn create_assignment(pair: Pair<Rule>) -> Node {
-    assert_eq!(Rule::assignment, pair.as_rule());
-    let mut inner_pairs = pair.into_inner();
-    let var = Box::new(create_access(inner_pairs.next().unwrap()));
-    let value = Box::new(create_ast(inner_pairs.next().unwrap()));
-    Node::Assignment { var, value }
-}
-
-fn create_for_classic(pair: Pair<Rule>) -> Node {
-    let mut inner_pairs = pair.into_inner();
-    assert_eq!(Rule::for_classic, inner_pairs.peek().unwrap().as_rule());
-    let mut for_decl = inner_pairs.next().unwrap().into_inner();
-    let init_pair = for_decl.next().unwrap();
-    let init: Option<Node> = if !init_pair.as_str().is_empty() {
-        let init_kind = init_pair.into_inner().next().unwrap();
-        match init_kind.as_rule() {
-            Rule::assignment => Some(create_assignment(init_kind)),
-            Rule::var_decl => Some(create_var_decl(init_kind)),
-            _ => panic!("unsupported 'for' init rule {:?}", init_kind),
-        }
-    } else {
-        None
-    };
-
-    let condition_pair = for_decl.next().unwrap();
-    let condition: Option<Node> = if !condition_pair.as_str().is_empty() {
-        // todo add cond rule. create_ast is too generic
-        Some(create_ast(condition_pair.into_inner().next().unwrap()))
-    } else {
-        None
-    };
-    let update_pair = for_decl.next().unwrap();
-    let update: Option<Node> = if !update_pair.as_str().is_empty() {
-        Some(create_assignment(update_pair.into_inner().next().unwrap()))
-    } else {
-        None
-    };
-
-    let body = create_body(inner_pairs);
-    Node::For {
-        init: init.map(Box::new),
-        condition: condition.map(Box::new),
-        update: update.map(Box::new),
-        body,
-    }
-}
-
-pub fn parse(code: &str) -> Node {
-    match SkunkParser::parse(Rule::program, code) {
-        Ok(pairs) => {
-            pretty_print(pairs.clone().next().unwrap(), 0);
-            create_ast(pairs.clone().next().unwrap())
-        }
-        Err(e) => {
-            panic!("Error while parsing: {}", e);
-        }
-    }
-}
-
 mod tests {
     use super::*;
     use crate::ast::Node::Access;
+
+    fn parse(code: &str) -> Node {
+        PestImpl {
+            metadata_creator: |_| Metadata::EMPTY,
+        }
+        .parse(code)
+        .unwrap()
+    }
 
     fn int_var_decl(name: &str, value: i64) -> Node {
         Node::VariableDeclaration {
             name: name.to_string(),
             var_type: Type::Int,
             value: Some(Box::new(Node::Literal(Literal::Integer(value)))),
+            metadata: Metadata::EMPTY,
         }
     }
 
@@ -732,6 +825,7 @@ mod tests {
         Node::Assignment {
             var: Box::new(access_var(name)),
             value: Box::new(Node::Literal(Literal::Integer(value))),
+            metadata: Metadata::EMPTY,
         }
     }
 
@@ -751,6 +845,7 @@ mod tests {
                 operator: Operator::Add,
                 right: Box::new(Node::Literal(Literal::Integer(1))),
             }),
+            metadata: Metadata::EMPTY,
         }
     }
 
@@ -899,7 +994,8 @@ mod tests {
                     Node::VariableDeclaration {
                         name: "a".to_string(),
                         var_type: Type::Int,
-                        value: Some(Box::new(Node::Literal(Literal::Integer(0))))
+                        value: Some(Box::new(Node::Literal(Literal::Integer(0)))),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -922,7 +1018,8 @@ mod tests {
                         value: Some(Box::new(Node::FunctionCall {
                             name: "f".to_string(),
                             arguments: [].to_vec()
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -942,7 +1039,8 @@ mod tests {
                     Node::VariableDeclaration {
                         name: "a".to_string(),
                         var_type: Type::Int,
-                        value: None
+                        value: None,
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -969,7 +1067,8 @@ mod tests {
                         var: Box::new(Node::Access {
                             nodes: [Node::Identifier("i".to_string())].to_vec()
                         }),
-                        value: Box::new(add)
+                        value: Box::new(add),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -993,7 +1092,8 @@ mod tests {
                             left: Box::new(Node::Literal(Literal::Integer(2))),
                             operator: Operator::Add,
                             right: Box::new(Node::Literal(Literal::Integer(3)))
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1020,7 +1120,8 @@ mod tests {
                                 operator: Operator::Divide,
                                 right: Box::new(Node::Literal(Literal::Integer(4))),
                             })
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1047,7 +1148,8 @@ mod tests {
                             }),
                             operator: Operator::Divide,
                             right: Box::new(Node::Literal(Literal::Integer(4)))
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1096,7 +1198,8 @@ mod tests {
                                     Node::Literal(Literal::Integer(1)),
                                     Node::Literal(Literal::Integer(2))
                                 ])
-                            }))
+                            })),
+                            metadata: Metadata::EMPTY
                         }]),
                     },
                     Node::EOI
@@ -1219,6 +1322,7 @@ mod tests {
             var_type: Type::Boolean,
             name: "c".to_string(),
             value: Some(Box::new(and)),
+            metadata: Metadata::EMPTY,
         };
 
         assert_eq!(
@@ -1242,6 +1346,7 @@ mod tests {
             var_type: Type::Boolean,
             name: "c".to_string(),
             value: Some(Box::new(and)),
+            metadata: Metadata::EMPTY,
         };
 
         assert_eq!(
@@ -1271,6 +1376,7 @@ mod tests {
             var_type: Type::Boolean,
             name: "d".to_string(),
             value: Some(Box::new(or)),
+            metadata: Metadata::EMPTY,
         };
 
         assert_eq!(
@@ -1294,7 +1400,8 @@ mod tests {
                         value: Box::new(Node::UnaryOp {
                             operator: UnaryOperator::Negate,
                             operand: Box::new(access_var("a"))
-                        })
+                        }),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1353,6 +1460,66 @@ mod tests {
             parse(source_code)
         );
     }
+
+    #[test]
+    fn test_if_multiline() {
+        let source_code = r#"
+        if(a) {
+           print(1);
+           print(2);
+           print(3);
+        } else if(b) {
+           print(1);
+           print(2);
+           print(3);
+        } else {
+           print(1);
+           print(2);
+           print(3);
+        }
+    "#;
+
+        let var_a = access_var("a");
+        let var_b = access_var("b");
+
+        let if_body = vec![
+            Node::Print(Box::new(Node::Literal(Literal::Integer(1)))),
+            Node::Print(Box::new(Node::Literal(Literal::Integer(2)))),
+            Node::Print(Box::new(Node::Literal(Literal::Integer(3)))),
+        ];
+
+        let else_if_body = vec![
+            Node::Print(Box::new(Node::Literal(Literal::Integer(1)))),
+            Node::Print(Box::new(Node::Literal(Literal::Integer(2)))),
+            Node::Print(Box::new(Node::Literal(Literal::Integer(3)))),
+        ];
+
+        let else_body = vec![
+            Node::Print(Box::new(Node::Literal(Literal::Integer(1)))),
+            Node::Print(Box::new(Node::Literal(Literal::Integer(2)))),
+            Node::Print(Box::new(Node::Literal(Literal::Integer(3)))),
+        ];
+
+        let if_statement = Node::If {
+            condition: Box::new(var_a),
+            body: if_body,
+            else_if_blocks: vec![Node::If {
+                condition: Box::new(var_b),
+                body: else_if_body,
+                else_if_blocks: Vec::new(),
+                else_block: None,
+            }],
+            else_block: Some(else_body),
+        };
+
+        assert_eq!(
+            Node::Program {
+                statements: vec![if_statement, Node::EOI]
+            },
+            parse(source_code)
+        );
+    }
+
     #[test]
     fn test_if_elif() {
         let source_code = r#"
@@ -1637,6 +1804,7 @@ mod tests {
                                         nodes: vec![Node::Identifier("i".to_string())],
                                     }),
                                     value: Box::new(Node::Literal(Literal::Integer(0))),
+                                    metadata: Metadata::EMPTY
                                 })),
                                 condition: Some(Box::new(Node::BinaryOp {
                                     left: Box::new(Node::Access {
@@ -1656,6 +1824,7 @@ mod tests {
                                         operator: Operator::Add,
                                         right: Box::new(Node::Literal(Literal::Integer(1))),
                                     }),
+                                    metadata: Metadata::EMPTY
                                 })),
                                 body: vec![Node::If {
                                     condition: Box::new(Node::BinaryOp {
@@ -1708,11 +1877,13 @@ mod tests {
                         value: Some(Box::new(Node::StructInitialization {
                             name: "Foo".to_string(),
                             fields: Vec::from([])
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::Assignment {
                         var: Box::new(field_access("f", "a")),
-                        value: Box::new(Node::Literal(Literal::Integer(1)))
+                        value: Box::new(Node::Literal(Literal::Integer(1))),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1741,7 +1912,8 @@ mod tests {
                                 ("x".to_string(), Node::Literal(Literal::Integer(0))),
                                 ("y".to_string(), Node::Literal(Literal::Integer(1)))
                             ])
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1763,17 +1935,18 @@ mod tests {
                     Node::VariableDeclaration {
                         var_type: Type::Array {
                             elem_type: Box::new(Type::Int),
-                            dimensions: Vec::from([1])
+                            dimensions: Vec::from([Node::Literal(Literal::Integer(1))])
                         },
                         name: "arr".to_string(),
                         value: Some(Box::new(Node::StaticFunctionCall {
                             _type: Type::Array {
                                 elem_type: Box::new(Type::Int),
-                                dimensions: Vec::from([1])
+                                dimensions: Vec::from([Node::Literal(Literal::Integer(1))])
                             },
                             name: "new".to_string(),
                             arguments: Vec::from([Node::Literal(Literal::Integer(1))])
-                        }))
+                        })),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ])
@@ -1794,7 +1967,7 @@ mod tests {
                     name: "arr".to_string(),
                     var_type: Type::Array {
                         elem_type: Box::new(Type::Int),
-                        dimensions: vec![2],
+                        dimensions: vec![Node::Literal(Literal::Integer(2))],
                     },
                     value: Some(Box::new(Node::ArrayInit {
                         elements: vec![
@@ -1802,6 +1975,7 @@ mod tests {
                             Node::Literal(Literal::Integer(2)),
                         ],
                     })),
+                    metadata: Metadata::EMPTY,
                 },
                 Node::EOI,
             ],
@@ -1915,6 +2089,7 @@ mod tests {
                             ]
                         }),
                         value: Box::new(Node::Literal(Literal::Integer(1))),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI,
                 ])
@@ -1944,6 +2119,7 @@ mod tests {
                             ]
                         }),
                         value: Box::new(Node::Literal(Literal::Integer(1))),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI,
                 ])
@@ -1979,6 +2155,7 @@ mod tests {
                             ]
                         }),
                         value: Box::new(Node::Literal(Literal::Integer(1))),
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI,
                 ])
@@ -2318,12 +2495,14 @@ mod tests {
                                 var_type: Type::Int,
                                 name: "i".to_string(),
                                 value: Some(Box::new(Node::Literal(Literal::Integer(1)))),
+                                metadata: Metadata::EMPTY
                             },
                             Node::Block {
                                 statements: vec![Node::VariableDeclaration {
                                     var_type: Type::Int,
                                     name: "i".to_string(),
                                     value: Some(Box::new(Node::Literal(Literal::Integer(2)))),
+                                    metadata: Metadata::EMPTY
                                 }],
                             },
                         ],

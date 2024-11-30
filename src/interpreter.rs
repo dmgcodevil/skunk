@@ -694,7 +694,7 @@ pub fn evaluate_node(
         )
         .get()
         .clone(),
-        Node::Assignment { var, value } => match var.as_ref() {
+        Node::Assignment { var, value, .. } => match var.as_ref() {
             Node::Access { nodes } => {
                 let mut modifier = resolve_access(
                     stack,
@@ -762,8 +762,17 @@ pub fn evaluate_node(
                 dimensions,
             } => {
                 let mut size: usize = 1;
-                for d in dimensions {
-                    size = size * (*d) as usize;
+                let mut int_dimensions: Vec<i64> = vec![];
+                for dim_node in dimensions {
+                    let dim_val = evaluate_node(dim_node, stack, global_environment);
+                    let dim_val_ref = dim_val.borrow();
+                    match dim_val_ref.deref() {
+                        Value::Integer(i) => {
+                            int_dimensions.push(*i);
+                            size = size * (*i) as usize;
+                        }
+                        _ => panic!("expected integer in array size"),
+                    };
                 }
                 let mut arr = Vec::with_capacity(size);
                 for _ in 0..size {
@@ -771,7 +780,7 @@ pub fn evaluate_node(
                 }
                 Rc::new(RefCell::new(Value::Array {
                     arr,
-                    dimensions: dimensions.clone(),
+                    dimensions: int_dimensions.clone(),
                 }))
             }
             _ => panic!("unsupported static function call type"),
@@ -899,6 +908,22 @@ pub fn evaluate_node(
                     Operator::And => Rc::new(RefCell::new(Value::Boolean(*a && *b))),
                     Operator::Or => Rc::new(RefCell::new(Value::Boolean(*a || *b))),
                     _ => panic!("Unsupported operator"),
+                },
+                (Value::String(s), Value::Integer(i)) => match operator {
+                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s, i)))),
+                    _ => panic!("Unsupported operator for string concatenation"),
+                },
+                (Value::Integer(i), Value::String(s)) => match operator {
+                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", i, s)))),
+                    _ => panic!("Unsupported operator for string concatenation"),
+                },
+                (Value::Boolean(i), Value::String(s)) => match operator {
+                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", i, s)))),
+                    _ => panic!("Unsupported operator for string concatenation"),
+                },
+                (Value::String(s), Value::Boolean(i)) => match operator {
+                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s, i)))),
+                    _ => panic!("Unsupported operator for string concatenation"),
                 },
                 _ => panic!(
                     "Unsupported binary operation={:?}, left={:?}, right={:?}",
@@ -1651,5 +1676,34 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(1), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_list() {
+        let source_code = r#"
+            struct List {
+                size:int;
+                capacity:int;
+
+                function has_space():boolean {
+                    return self.size > self.capacity;
+                }
+
+                function grow() {
+                    if(self.size > self.capacity) {
+                        print("increase capacity");
+                        self.capacity = 4; //self.capacity * 2;
+                    }
+                }
+
+            }
+            list = List{size: 3, capacity: 2};
+            //list.has_space();
+            list.grow();
+            print("capacity=" + list.capacity);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        println!("{:#?}", res.borrow().deref());
     }
 }
