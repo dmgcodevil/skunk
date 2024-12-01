@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 #[derive(Debug, PartialEq, Clone)]
-struct Var {
+struct Symbol {
     name: String,
     sk_type: Type,
     metadata: Metadata, // we can say where var is defined
@@ -11,7 +11,7 @@ struct Var {
 
 #[derive(Debug, PartialEq, Clone)]
 struct VarTable {
-    vars: HashMap<String, Var>,
+    vars: HashMap<String, Symbol>,
 }
 
 impl VarTable {
@@ -21,7 +21,7 @@ impl VarTable {
         }
     }
 
-    fn add(&mut self, var: Var) {
+    fn add(&mut self, var: Symbol) {
         self.vars.insert(var.name.clone(), var);
     }
 }
@@ -50,20 +50,37 @@ impl VarTables {
     }
 }
 
-fn validate_add(left: &Type, right: &Type) -> Result<(), String> {
+#[derive(Debug, PartialEq, Clone)]
+struct FunctionSymbol {
+    name: String,
+    parameters: Vec<Symbol>,
+    return_type: Type,
+    // metadata: Metadata, todo
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct StructSymbol {
+    name: String,
+    fields: Vec<Symbol>,
+    functions: HashMap<String, FunctionSymbol>,
+    // metadata: Metadata, todo
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct GlobalScope {
+    structs: HashMap<String, StructSymbol>,
+    functions: HashMap<String, FunctionSymbol>,
+    variables: HashMap<String, Symbol>,
+}
+
+fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     match (left, right) {
-        (Type::Int, Type::Int) => Ok(()), //ok
+        (Type::Int, Type::Int) => Ok(Type::Int),
+        (Type::String, Type::String) => Ok(Type::String),
         _ => Err(format!(
             "unexpected types for +: {:?} and {:?}",
             left, right
         )),
-    }
-}
-fn resolve_add_type(left: &Type, right: &Type) -> Type {
-    match (left, right) {
-        (Type::Int, Type::Int) => Type::Int,
-        (Type::String, Type::String) => Type::String,
-        _ => unreachable!(),
     }
 }
 
@@ -87,7 +104,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
         } => {
             let mut var_table = VarTable::new();
             for parameter in parameters {
-                var_table.add(Var {
+                var_table.add(Symbol {
                     name: parameter.0.clone(),
                     sk_type: parameter.1.clone(),
                     metadata: Metadata::EMPTY, // todo
@@ -128,7 +145,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
             value,
             metadata,
         } => {
-            var_tables.get_mut().add(Var {
+            var_tables.get_mut().add(Symbol {
                 name: name.clone(),
                 sk_type: var_type.clone(),
                 metadata: metadata.clone(),
@@ -150,6 +167,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
                 Ok(var_type.clone())
             }
         }
+        Node::FunctionCall { name, arguments } => Ok(Type::Void),
         Node::BinaryOp {
             left,
             operator,
@@ -158,10 +176,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
             let left_type = resolve_type(var_tables, left.deref())?;
             let right_type = resolve_type(var_tables, right.deref())?;
             match operator {
-                Operator::Add => {
-                    validate_add(&left_type, &right_type);
-                    Ok(resolve_add_type(&left_type, &right_type))
-                }
+                Operator::Add => resolve_add(&left_type, &right_type),
                 _ => unreachable!("todo"),
             }
         }
@@ -176,7 +191,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
             .map(|v| v.sk_type.clone())
             .ok_or(format!("unknown variable '{}'", name)),
         Node::Access { nodes } => {
-            // Ok(Type::Void)
+            // todo member access, array, etc.
             let mut res = Ok(Type::Void);
             for node in nodes {
                 res = resolve_type(var_tables, node);
