@@ -1,3 +1,4 @@
+use crate::ast::Type::Custom;
 use crate::ast::{Literal, Metadata, Node, Operator, Type};
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -50,6 +51,17 @@ impl VarTables {
     }
 }
 
+fn create_symbols(declarations: &Vec<(String, Type)>) -> Vec<Symbol> {
+    declarations
+        .iter()
+        .map(|d| Symbol {
+            name: d.0.clone(),
+            sk_type: d.1.clone(),
+            metadata: Metadata::EMPTY,
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Clone)]
 struct FunctionSymbol {
     name: String,
@@ -58,10 +70,28 @@ struct FunctionSymbol {
     // metadata: Metadata, todo
 }
 
+impl FunctionSymbol {
+    fn from_node(node: &Node) -> Self {
+        match node {
+            Node::FunctionDeclaration {
+                name,
+                parameters,
+                return_type,
+                ..
+            } => FunctionSymbol {
+                name: name.clone(),
+                parameters: create_symbols(parameters),
+                return_type: return_type.clone(),
+            },
+            _ => panic!("expected function declaration"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 struct StructSymbol {
     name: String,
-    fields: Vec<Symbol>,
+    fields: HashMap<String, Symbol>,
     functions: HashMap<String, FunctionSymbol>,
     // metadata: Metadata, todo
 }
@@ -71,6 +101,78 @@ struct GlobalScope {
     structs: HashMap<String, StructSymbol>,
     functions: HashMap<String, FunctionSymbol>,
     variables: HashMap<String, Symbol>,
+}
+
+impl GlobalScope {
+    fn new() -> Self {
+        GlobalScope {
+            structs: HashMap::new(),
+            functions: HashMap::new(),
+            variables: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, node: &Node) {
+        match node {
+            Node::StructDeclaration {
+                name,
+                fields,
+                functions,
+            } => {
+                self.structs.insert(
+                    name.clone(),
+                    StructSymbol {
+                        name: name.clone(),
+                        fields: fields
+                            .iter()
+                            .map(|field| {
+                                (
+                                    field.0.to_string(),
+                                    Symbol {
+                                        name: field.0.to_string(),
+                                        sk_type: field.1.clone(),
+                                        metadata: Metadata::EMPTY,
+                                    },
+                                )
+                            })
+                            .collect::<HashMap<_, _>>(),
+                        functions: functions
+                            .iter()
+                            .map(|n| {
+                                let fun_symbol = FunctionSymbol::from_node(n);
+                                (fun_symbol.name.clone(), fun_symbol)
+                            })
+                            .collect::<HashMap<_, _>>(),
+                    },
+                );
+            }
+            Node::FunctionDeclaration {
+                name,
+                parameters,
+                return_type,
+                ..
+            } => {
+                self.functions
+                    .insert(name.clone(), FunctionSymbol::from_node(node));
+            }
+            Node::VariableDeclaration {
+                var_type,
+                name,
+                value,
+                metadata,
+            } => {
+                self.variables.insert(
+                    name.clone(),
+                    Symbol {
+                        name: name.clone(),
+                        sk_type: var_type.clone(),
+                        metadata: metadata.clone(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
@@ -84,11 +186,134 @@ fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     }
 }
 
-fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String> {
+fn resolve_access(
+    global_scope: &GlobalScope,
+    var_tables: &mut VarTables,
+    curr: Type,
+    i: usize,
+    access_nodes: &Vec<Node>,
+) -> Result<Type, String> {
+    if i == access_nodes.len() {
+        return Ok(curr);
+    }
+    match access_nodes.get(i).unwrap() {
+        Node::ArrayAccess { .. } => {
+            if let Type::Array { elem_type, .. } = curr {
+                return resolve_access(
+                    global_scope,
+                    var_tables,
+                    elem_type.deref().clone(),
+                    i + 1,
+                    access_nodes,
+                );
+            } else {
+                return Err(format!("array access to not array variable"));
+            }
+        }
+        Node::MemberAccess { member } => match curr {
+            Type::Custom(struct_name) => {
+                if !global_scope.structs.contains_key(&struct_name) {
+                    return Err("struct doesn't exist".to_string());
+                }
+                let struct_symbol = global_scope.structs.get(&struct_name).unwrap();
+                match member.deref() {
+                    Node::Identifier(field_name) => {
+                        if !struct_symbol.fields.contains_key(field_name) {
+                            return Err(format!(
+                                "struct '{}' doesn't have field '{}'",
+                                struct_name, field_name
+                            ));
+                        }
+                        return resolve_access(
+                            global_scope,
+                            var_tables,
+                            struct_symbol
+                                .fields
+                                .get(field_name)
+                                .unwrap()
+                                .sk_type
+                                .clone(),
+                            i + 1,
+                            access_nodes,
+                        );
+                    }
+                    Node::FunctionCall { name, .. } => {
+                        if !struct_symbol.functions.contains_key(name) {
+                            return Err(format!(
+                                "struct '{}' doesn't have function '{}'",
+                                struct_name, name
+                            ));
+                        }
+                        let return_type = resolve_function_call(
+                            global_scope,
+                            var_tables,
+                            struct_symbol.functions.get(name).unwrap(),
+                            member.deref(),
+                        )?;
+                        return resolve_access(
+                            global_scope,
+                            var_tables,
+                            return_type,
+                            i + 1,
+                            access_nodes,
+                        );
+                    }
+                    _ => panic!("expected member access node"),
+                }
+            }
+            _ => return Err(format!("access to member access to not instance structs")),
+        },
+        _ => unreachable!("unexpected access node"),
+    }
+}
+
+fn resolve_function_call(
+    global_scope: &GlobalScope,
+    var_tables: &mut VarTables,
+    function_symbol: &FunctionSymbol,
+    node: &Node,
+) -> Result<Type, String> {
+    if let Node::FunctionCall { name, arguments } = node {
+        if arguments.len() != function_symbol.parameters.len() {
+            return Err(format!(
+                "incorrect number of args to '{}' function. \
+                    expected={}, actual={}",
+                name,
+                function_symbol.parameters.len(),
+                arguments.len()
+            ));
+        }
+        let mut argument_types = Vec::new();
+        for arg in arguments {
+            argument_types.push(resolve_type(global_scope, var_tables, arg)?);
+        }
+        for i in 0..argument_types.len() {
+            if argument_types[i] != function_symbol.parameters[i].sk_type {
+                return Err(format!(
+                    "arguments to '{}' function are incorrect. parameter='{}', \
+                        expected type='{:?}', actual type='{:?}'",
+                    name,
+                    function_symbol.parameters[i].name,
+                    function_symbol.parameters[i].sk_type,
+                    argument_types[i]
+                ));
+            }
+        }
+        Ok(function_symbol.return_type.clone())
+    } else {
+        panic!("incorrect node")
+    }
+}
+
+fn resolve_type(
+    global_scope: &GlobalScope,
+    var_tables: &mut VarTables,
+    node: &Node,
+) -> Result<Type, String> {
     match node {
         Node::Program { statements } => {
             for statement in statements {
-                let res = resolve_type(var_tables, statement);
+                let res = resolve_type(global_scope, var_tables, statement);
                 match &res {
                     Err(e) => return Err(e.to_string()),
                     _ => (),
@@ -96,6 +321,14 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
             }
             Ok(Type::Void)
         }
+        Node::StructInitialization { name, .. } => {
+            if !global_scope.structs.contains_key(name) {
+                Err("struct doesn't exist".to_string())
+            } else {
+                Ok(Custom(name.clone()))
+            }
+        }
+        Node::StructDeclaration { name, .. } => Ok(Custom(name.clone())),
         Node::FunctionDeclaration {
             name,
             parameters,
@@ -114,7 +347,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
             let mut actual_return_type = Type::Void;
             let mut res = Ok(Type::Void);
             for n in body {
-                res = resolve_type(var_tables, n);
+                res = resolve_type(global_scope, var_tables, n);
                 match &res {
                     Err(e) => break,
                     Ok(t) => match n {
@@ -151,7 +384,7 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
                 metadata: metadata.clone(),
             });
             if let Some(body) = value {
-                let value_type = resolve_type(var_tables, &body.deref())?;
+                let value_type = resolve_type(global_scope, var_tables, &body.deref())?;
                 if *var_type != value_type {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
@@ -167,17 +400,35 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
                 Ok(var_type.clone())
             }
         }
-        Node::FunctionCall { name, arguments } => Ok(Type::Void),
+        Node::FunctionCall { name, arguments } => resolve_function_call(
+            global_scope,
+            var_tables,
+            global_scope.functions.get(name).unwrap(),
+            node,
+        ),
         Node::BinaryOp {
             left,
             operator,
             right,
         } => {
-            let left_type = resolve_type(var_tables, left.deref())?;
-            let right_type = resolve_type(var_tables, right.deref())?;
+            let left_type = resolve_type(global_scope, var_tables, left.deref())?;
+            let right_type = resolve_type(global_scope, var_tables, right.deref())?;
             match operator {
                 Operator::Add => resolve_add(&left_type, &right_type),
                 _ => unreachable!("todo"),
+            }
+        }
+        Node::Assignment { var, value, .. } => {
+            let var_type = resolve_type(global_scope, var_tables, var.deref())?;
+            let value_type = resolve_type(global_scope, var_tables, value.deref())?;
+            if var_type != value_type {
+                // todo include var name, metadata
+                Err(format!(
+                    "assignment type mismatch. expected: {:?}, actual: {:?}",
+                    var_type, value_type
+                ))
+            } else {
+                Ok(var_type.clone())
             }
         }
         Node::Literal(Literal::Integer(_)) => Ok(Type::Int),
@@ -189,24 +440,44 @@ fn resolve_type(var_tables: &mut VarTables, node: &Node) -> Result<Type, String>
             .vars
             .get(name)
             .map(|v| v.sk_type.clone())
+            .or(global_scope.variables.get(name).map(|v| v.sk_type.clone()))
             .ok_or(format!("unknown variable '{}'", name)),
         Node::Access { nodes } => {
-            // todo member access, array, etc.
-            let mut res = Ok(Type::Void);
-            for node in nodes {
-                res = resolve_type(var_tables, node);
-            }
-            res
+            let start = resolve_type(global_scope, var_tables, nodes.get(0).unwrap())?;
+            resolve_access(global_scope, var_tables, start, 1, nodes)
         }
-        Node::Return(body) => resolve_type(var_tables, body),
-        _ => Ok(Type::Void),
+        Node::StaticFunctionCall { _type, .. } => Ok(_type.clone()),
+        Node::Return(body) => resolve_type(global_scope, var_tables, body),
+        Node::Block { statements } => {
+            let var_table = var_tables.get().clone();
+            var_tables.add(var_table);
+
+            for statement in statements {
+                let res = resolve_type(global_scope, var_tables, statement);
+                if let Err(_) = res {
+                    return res;
+                }
+            }
+            Ok(Type::Void) // do we need to check Return node ?
+        }
+        Node::Print(_) => Ok(Type::Void),
+        _ => unreachable!("{}", format!("{:?}", node)),
     }
 }
 
 pub fn check(node: &Node) -> Result<(), String> {
     let mut var_tables = VarTables::new();
     var_tables.add(VarTable::new());
-    match resolve_type(&mut var_tables, node) {
+    let mut global_scope = GlobalScope::new();
+    match node {
+        Node::Program { statements } => {
+            for statement in statements {
+                global_scope.add(statement);
+            }
+        }
+        _ => panic!("expected program node"),
+    }
+    match resolve_type(&mut global_scope, &mut var_tables, node) {
         Err(e) => Err(e.to_string()),
         Ok(_) => Ok(()),
     }
@@ -217,12 +488,102 @@ mod tests {
     use crate::ast;
 
     #[test]
-    fn test_var_decl() {
+    fn test_check() {
         let source_code = r#"
-        function bar(i:int):int {
-            return j;
+        struct Point {
+            x:int;
+            y:int;
+
+            function set_x(x:int) {
+                self.x = x;
+            }
+
+            function get_x():int {
+               return self.x;
+            }
+
+            function set_y(y:int) {
+                self.y = y;
+            }
+
+            function get_y():int {
+                return self.y;
+            }
         }
+
+        global_var: int = 1;
+
+        function foo(i:int):int {
+            return i;
+        }
+
+        foo(1);
+        p:Point = Point { x: 0, y: 0 };
+        p.set_x(1);
+
         "#;
         let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_function_call_wrong_args() {
+        let source_code = r#"
+    function foo(a: int): int {
+        return a;
+    }
+    foo("string"); // This should fail
+    "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_struct_field_not_exist() {
+        let source_code = r#"
+    struct Point {
+        x: int;
+        y: int;
+    }
+    p: Point = Point { x: 0, y: 0 };
+    a = p.z; // 'z' field does not exist
+    "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_function_return_type_mismatch() {
+        let source_code = r#"
+    function foo(): int {
+        return "string"; // Should fail since return type is expected to be int
+    }
+    "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_array_access_wrong_type() {
+        let source_code = r#"
+    arr: int[5] = int[5]::new(1);
+    s: string = arr[0]; // Should fail: assigning int to string
+    "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_variable_scope_nested_block() {
+        let source_code = r#"
+    a: int = 5;
+    {
+        a: string = "nested";
+        print(a); // Should refer to 'string' type
+    }
+    print(a); // Should refer to 'int' type
+    "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
     }
 }
