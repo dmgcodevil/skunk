@@ -389,7 +389,7 @@ fn resolve_member_access(
     current_value: Rc<RefCell<Value>>,
     node: &Node,
 ) -> Box<dyn ValueModifier> {
-    if let Node::MemberAccess { member } = node {
+    if let Node::MemberAccess { member, .. } = node {
         let member_ref = member.as_ref();
         match member_ref {
             Node::Identifier(name) => Box::new(StructInstanceModifier {
@@ -500,7 +500,10 @@ fn evaluate_function<F>(
 where
     F: Fn() -> CallFrame,
 {
-    if let Node::FunctionCall { name: _, arguments } = call_node {
+    if let Node::FunctionCall {
+        name: _, arguments, ..
+    } = call_node
+    {
         let args_values: Vec<_> = arguments
             .into_iter()
             .map(|arg| evaluate_node(arg, stack, global_environment))

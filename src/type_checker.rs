@@ -210,18 +210,24 @@ fn resolve_access(
                 return Err(format!("array access to not array variable"));
             }
         }
-        Node::MemberAccess { member } => match curr {
+
+        Node::MemberAccess { member, metadata } => match curr {
             Type::Custom(struct_name) => {
                 if !global_scope.structs.contains_key(&struct_name) {
-                    return Err("struct doesn't exist".to_string());
+                    return Err("error: struct doesn't exist".to_string());
                 }
                 let struct_symbol = global_scope.structs.get(&struct_name).unwrap();
                 match member.deref() {
                     Node::Identifier(field_name) => {
                         if !struct_symbol.fields.contains_key(field_name) {
+                            // error[E0609]: no field `z` on type `Point`
+                            // --> src/main.rs:10:22
+                            // |
+                            // 10 |     println!("{}", p.z);
+                            // |                      ^ unknown field
                             return Err(format!(
-                                "struct '{}' doesn't have field '{}'",
-                                struct_name, field_name
+                                "error {}:{}: no field `{}` on type `{}`",
+                                metadata.span.line, metadata.span.start, field_name, struct_name
                             ));
                         }
                         return resolve_access(
@@ -237,11 +243,18 @@ fn resolve_access(
                             access_nodes,
                         );
                     }
-                    Node::FunctionCall { name, .. } => {
+                    Node::FunctionCall {
+                        name,
+                        arguments,
+                        metadata,
+                    } => {
                         if !struct_symbol.functions.contains_key(name) {
                             return Err(format!(
-                                "struct '{}' doesn't have function '{}'",
-                                struct_name, name
+                                "error {}:{}:no method named `{}` found for struct `{}` in the current scope",
+                                metadata.span.line,
+                                metadata.span.start,
+                                name,
+                                struct_name,
                             ));
                         }
                         let return_type = resolve_function_call(
@@ -250,6 +263,16 @@ fn resolve_access(
                             struct_symbol.functions.get(name).unwrap(),
                             member.deref(),
                         )?;
+                        // global_scope: &GlobalScope,
+                        // var_tables: &mut VarTables,
+                        // node: &Node,
+                        let args_types_res: Result<Vec<Type>, String> = arguments
+                            .iter()
+                            .map(|arg| resolve_type(global_scope, var_tables, arg))
+                            .collect();
+                        let args_types = args_types_res?;
+                        println!("args_types = {:?}", args_types);
+
                         return resolve_access(
                             global_scope,
                             var_tables,
@@ -273,7 +296,12 @@ fn resolve_function_call(
     function_symbol: &FunctionSymbol,
     node: &Node,
 ) -> Result<Type, String> {
-    if let Node::FunctionCall { name, arguments } = node {
+    if let Node::FunctionCall {
+        name,
+        arguments,
+        metadata,
+    } = node
+    {
         if arguments.len() != function_symbol.parameters.len() {
             return Err(format!(
                 "incorrect number of args to '{}' function. \
@@ -290,8 +318,10 @@ fn resolve_function_call(
         for i in 0..argument_types.len() {
             if argument_types[i] != function_symbol.parameters[i].sk_type {
                 return Err(format!(
-                    "arguments to '{}' function are incorrect. parameter='{}', \
+                    "error {}:{}:arguments to '{}' function are incorrect. parameter='{}', \
                         expected type='{:?}', actual type='{:?}'",
+                    metadata.span.line,
+                    metadata.span.start,
                     name,
                     function_symbol.parameters[i].name,
                     function_symbol.parameters[i].sk_type,
@@ -400,7 +430,9 @@ fn resolve_type(
                 Ok(var_type.clone())
             }
         }
-        Node::FunctionCall { name, arguments } => resolve_function_call(
+        Node::FunctionCall {
+            name, arguments, ..
+        } => resolve_function_call(
             global_scope,
             var_tables,
             global_scope.functions.get(name).unwrap(),
@@ -460,7 +492,7 @@ fn resolve_type(
             }
             Ok(Type::Void) // do we need to check Return node ?
         }
-        Node::Print(_) => Ok(Type::Void),
+        Node::Print(n) => resolve_type(global_scope, var_tables, n.deref()),
         _ => unreachable!("{}", format!("{:?}", node)),
     }
 }

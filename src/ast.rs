@@ -74,12 +74,14 @@ pub enum Node {
     FunctionCall {
         name: String,         // The function name
         arguments: Vec<Node>, // The arguments are a list of expression nodes
+        metadata: Metadata,
     },
     ArrayAccess {
         coordinates: Vec<Node>,
     },
     MemberAccess {
         member: Box<Node>, // field, function
+        metadata: Metadata,
     },
     Access {
         nodes: Vec<Node>,
@@ -147,16 +149,16 @@ pub enum Type {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-struct Span {
-    start: usize,  // start col
-    end: usize,    // end col
-    line: usize,   // line number
-    input: String, // input being parsed
+pub struct Span {
+    pub start: usize,  // start col
+    pub end: usize,    // end col
+    pub line: usize,   // line number
+    pub input: String, // input being parsed
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Metadata {
-    span: Span,
+    pub span: Span,
 }
 
 impl Metadata {
@@ -365,6 +367,7 @@ impl PestImpl {
 
     fn create_member_access(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(Rule::member_access, pair.as_rule());
+        let metadata = (self.metadata_creator)(&pair);
         let mut pairs = pair.into_inner();
         if let Some(inner) = pairs.next() {
             MemberAccess {
@@ -373,6 +376,7 @@ impl PestImpl {
                     Rule::IDENTIFIER => Identifier(inner.as_str().to_string()),
                     _ => panic!("unsupported member access rule: {:?}", inner),
                 }),
+                metadata,
             }
         } else {
             panic!("member access tree is empty")
@@ -407,13 +411,18 @@ impl PestImpl {
     }
 
     fn create_function_call(&self, pair: Pair<Rule>) -> Node {
+        let metadata = (self.metadata_creator)(&pair);
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut arguments = Vec::new();
         while let Some(arg_pair) = inner_pairs.next() {
             arguments.push(self.create_ast(arg_pair));
         }
-        Node::FunctionCall { name, arguments }
+        Node::FunctionCall {
+            name,
+            arguments,
+            metadata,
+        }
     }
 
     fn create_static_func_call(&self, pair: Pair<Rule>) -> Node {
@@ -476,11 +485,12 @@ impl PestImpl {
         let span = p.as_span();
         let line_pos = span.start_pos().line_col();
         let line_num = line_pos.0;
+        let col = line_pos.1;
         let input = span.as_str().to_string();
         println!("{:?}", span);
         Metadata {
             span: Span {
-                start: span.start(),
+                start: col,
                 end: span.end(),
                 line: line_num,
                 input,
@@ -864,6 +874,7 @@ mod tests {
                 Identifier(name.to_string()),
                 MemberAccess {
                     member: Box::new(Identifier(field_name.to_string())),
+                    metadata: Metadata::EMPTY,
                 },
             ]
             .to_vec(),
@@ -1017,7 +1028,8 @@ mod tests {
                         var_type: Type::Int,
                         value: Some(Box::new(Node::FunctionCall {
                             name: "f".to_string(),
-                            arguments: [].to_vec()
+                            arguments: [].to_vec(),
+                            metadata: Metadata::EMPTY
                         })),
                         metadata: Metadata::EMPTY
                     },
@@ -1197,7 +1209,8 @@ mod tests {
                                 arguments: Vec::from([
                                     Node::Literal(Literal::Integer(1)),
                                     Node::Literal(Literal::Integer(2))
-                                ])
+                                ]),
+                                metadata: Metadata::EMPTY
                             })),
                             metadata: Metadata::EMPTY
                         }]),
@@ -1853,7 +1866,8 @@ mod tests {
                     },
                     Node::FunctionCall {
                         name: "test".to_string(),
-                        arguments: vec![]
+                        arguments: vec![],
+                        metadata: Metadata::EMPTY
                     },
                     Node::EOI
                 ]
@@ -2114,7 +2128,8 @@ mod tests {
                                     coordinates: vec![Node::Literal(Literal::Integer(0))],
                                 },
                                 MemberAccess {
-                                    member: Box::new(Node::Identifier("a".to_string()))
+                                    member: Box::new(Node::Identifier("a".to_string())),
+                                    metadata: Metadata::EMPTY
                                 },
                             ]
                         }),
@@ -2144,13 +2159,15 @@ mod tests {
                                     coordinates: vec![Node::Literal(Literal::Integer(0))],
                                 },
                                 Node::MemberAccess {
-                                    member: Box::new(Node::Identifier("b".to_string()))
+                                    member: Box::new(Node::Identifier("b".to_string())),
+                                    metadata: Metadata::EMPTY
                                 },
                                 Node::ArrayAccess {
                                     coordinates: vec![Node::Literal(Literal::Integer(1))],
                                 },
                                 Node::MemberAccess {
-                                    member: Box::new(Node::Identifier("c".to_string()))
+                                    member: Box::new(Node::Identifier("c".to_string())),
+                                    metadata: Metadata::EMPTY
                                 },
                             ]
                         }),
@@ -2179,8 +2196,10 @@ mod tests {
                             Node::MemberAccess {
                                 member: Box::new(Node::FunctionCall {
                                     name: "f".to_string(),
-                                    arguments: [].to_vec()
-                                })
+                                    arguments: [].to_vec(),
+                                    metadata: Metadata::EMPTY
+                                }),
+                                metadata: Metadata::EMPTY
                             }
                         ]
                         .to_vec()
