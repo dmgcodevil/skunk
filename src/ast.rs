@@ -94,6 +94,7 @@ pub enum Node {
         _type: Type,
         name: String,
         arguments: Vec<Node>,
+        metadata: Metadata,
     },
     EOI,
     EMPTY,
@@ -426,6 +427,7 @@ impl PestImpl {
     }
 
     fn create_static_func_call(&self, pair: Pair<Rule>) -> Node {
+        let metadata = (self.metadata_creator)(&pair);
         let mut inner_pairs = pair.into_inner();
         let _type = self.create_type(inner_pairs.next().unwrap());
         let name = inner_pairs.next().unwrap().as_str().to_string();
@@ -438,6 +440,7 @@ impl PestImpl {
             _type,
             name,
             arguments,
+            metadata,
         }
     }
 
@@ -1958,7 +1961,8 @@ mod tests {
                                 dimensions: Vec::from([Node::Literal(Literal::Integer(1))])
                             },
                             name: "new".to_string(),
-                            arguments: Vec::from([Node::Literal(Literal::Integer(1))])
+                            arguments: Vec::from([Node::Literal(Literal::Integer(1))]),
+                            metadata: Metadata::EMPTY
                         })),
                         metadata: Metadata::EMPTY
                     },

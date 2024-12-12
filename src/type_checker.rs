@@ -1,6 +1,7 @@
 use crate::ast::Type::Custom;
 use crate::ast::{Literal, Metadata, Node, Operator, Type};
 use std::collections::HashMap;
+use std::fmt::format;
 use std::ops::Deref;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -478,7 +479,38 @@ fn resolve_type(
             let start = resolve_type(global_scope, var_tables, nodes.get(0).unwrap())?;
             resolve_access(global_scope, var_tables, start, 1, nodes)
         }
-        Node::StaticFunctionCall { _type, .. } => Ok(_type.clone()),
+        Node::StaticFunctionCall {
+            _type,
+            name,
+            arguments,
+            metadata,
+        } => {
+            match _type {
+                Type::Void => {}
+                Type::Int => {}
+                Type::String => {}
+                Type::Boolean => {}
+                Type::Array { elem_type, .. } => {
+                    if arguments.len() != 1 {
+                        return Err(format!(
+                            "error {}:{}: array `new` method should have exactly one argument",
+                            metadata.span.line, metadata.span.start,
+                        ));
+                    }
+                    let arg_type =
+                        resolve_type(global_scope, var_tables, arguments.get(0).unwrap())?;
+                    if arg_type != *elem_type.deref() {
+                        return Err(format!("error {}:{}: array `new`. expected arg type is `{:?}` but given `{:?}`",
+                                           metadata.span.line,
+                                           metadata.span.start,
+                                           elem_type.deref(), arg_type ));
+                    }
+                }
+                Type::Slice { .. } => {}
+                Custom(_) => {}
+            }
+            Ok(_type.clone())
+        }
         Node::Return(body) => resolve_type(global_scope, var_tables, body),
         Node::Block { statements } => {
             let var_table = var_tables.get().clone();
@@ -601,6 +633,15 @@ mod tests {
     arr: int[5] = int[5]::new(1);
     s: string = arr[0]; // Should fail: assigning int to string
     "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_array_init_wrong_type() {
+        let source_code = r#"
+        arr: int[5] = int[5]::new("1");
+        "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
     }

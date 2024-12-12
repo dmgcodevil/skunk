@@ -759,6 +759,7 @@ pub fn evaluate_node(
             _type,
             name: _,
             arguments,
+            ..
         } => match _type {
             Type::Array {
                 elem_type: _,
