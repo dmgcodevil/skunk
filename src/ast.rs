@@ -147,6 +147,7 @@ pub enum Type {
         elem_type: Box<Type>,
     },
     Custom(String), // Custom types like structs
+    SkSelf,         // special type for member functions
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -725,8 +726,9 @@ impl PestImpl {
         }
     }
 
-    fn create_param_list(&self, pair: Pair<Rule>) -> Vec<(String, Type)> {
+    fn _create_param_list(&self, pair: Pair<Rule>) -> Vec<(String, Type)> {
         match pair.as_rule() {
+            Rule::_self => Vec::from([("self".to_string(), Type::SkSelf)]),
             Rule::empty_params => Vec::new(),
             Rule::param_list => {
                 let mut result: Vec<(String, Type)> = Vec::new();
@@ -739,6 +741,27 @@ impl PestImpl {
                     ));
                 });
                 result
+            }
+            _ => panic!("unexpected  rule {}", pair),
+        }
+    }
+
+    fn create_param_list(&self, pair: Pair<Rule>) -> Vec<(String, Type)> {
+        let mut res = Vec::<(String, Type)>::new();
+        match pair.as_rule() {
+            Rule::member_func_params => {
+                let inner_pairs = pair.into_inner();
+                for p in inner_pairs {
+                    res.extend(self._create_param_list(p));
+                }
+                res
+            }
+            Rule::static_func_params => {
+                let mut inner_pairs = pair.into_inner();
+                for p in inner_pairs {
+                    res.extend(self._create_param_list(p));
+                }
+                res
             }
             _ => panic!("unexpected  rule {}", pair),
         }
@@ -1937,6 +1960,65 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test]
+    fn test_struct_member_function_empty_params() {
+        let source_code = r#"
+            struct Point {
+                function f(self) {
+                }
+            }
+        "#;
+        println!("{:?}", parse(source_code))
+    }
+
+    #[test]
+    fn test_struct_member_function_with_params() {
+        let source_code = r#"
+            struct Point {
+                function f(self, i:int) {
+                }
+            }
+        "#;
+        println!("{:?}", parse(source_code))
+    }
+
+    #[test]
+    fn test_struct_static_function() {
+        let source_code = r#"
+            struct Point {
+                function f() {
+                }
+            }
+        "#;
+        println!("{:?}", parse(source_code))
+    }
+
+    #[test]
+    fn test_struct_static_function_with_params() {
+        let source_code = r#"
+            struct Point {
+                function f(i:int) {
+                }
+            }
+        "#;
+        println!("{:?}", parse(source_code))
+    }
+
+    #[test]
+    fn test_struct_static_function_call() {
+        let source_code = r#"
+            struct Point {
+                function new():Point {
+                    return Point{};
+                }
+            }
+
+           Point::new();
+        "#;
+
+        println!("{:?}", parse(source_code))
     }
 
     #[test]

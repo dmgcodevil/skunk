@@ -508,6 +508,7 @@ fn resolve_type(
                 }
                 Type::Slice { .. } => {}
                 Custom(_) => {}
+                Type::SkSelf => {}
             }
             Ok(_type.clone())
         }

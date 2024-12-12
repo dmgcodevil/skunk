@@ -401,6 +401,8 @@ fn resolve_member_access(
                 let struct_def =
                     global_environment_ref.to_struct_def(current_value.borrow().deref());
                 let fun_def = struct_def.functions.get(name).unwrap();
+                assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
+
                 let res = evaluate_function(stack, fun_def, member_ref, global_environment, || {
                     let mut frame = CallFrame {
                         name: format!("{}.{}", struct_def.name, name),
@@ -508,8 +510,12 @@ where
             .into_iter()
             .map(|arg| evaluate_node(arg, stack, global_environment))
             .collect();
-        let arguments: Vec<(&Parameter, Rc<RefCell<Value>>)> =
-            fun.parameters.iter().zip(args_values.into_iter()).collect();
+        let arguments: Vec<(&Parameter, Rc<RefCell<Value>>)> = fun
+            .parameters
+            .iter()
+            .filter(|p| p.sk_type != Type::SkSelf) // self is added to call stack implicitly
+            .zip(args_values.into_iter())
+            .collect();
         let mut frame = frame_creator();
         for arg in arguments {
             let first = arg.0.name.clone();
@@ -1609,11 +1615,11 @@ mod tests {
             x: int;
             y: int;
 
-            function set_x(x:int) {
+            function set_x(self, x:int) {
                 self.x = x;
             }
 
-            function get_x(){
+            function get_x(self){
                 return self.x;
             }
         }
@@ -1635,11 +1641,11 @@ mod tests {
             x: int;
             y: int;
 
-            function set_x(x:int) {
+            function set_x(self, x:int) {
                 self.x = x;
             }
 
-            function get_x(){
+            function get_x(self){
                 return self.x;
             }
         }
@@ -1648,7 +1654,7 @@ mod tests {
             start: Point;
             end: Point;
 
-            function get_start():Point {
+            function get_start(self):Point {
                 return self.start;
             }
         }
@@ -1689,11 +1695,11 @@ mod tests {
                 size:int;
                 capacity:int;
 
-                function has_space():boolean {
+                function has_space(self):boolean {
                     return self.size > self.capacity;
                 }
 
-                function grow() {
+                function grow(self) {
                     if(self.size > self.capacity) {
                         print("increase capacity");
                         self.capacity = 4; //self.capacity * 2;

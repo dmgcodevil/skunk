@@ -38,6 +38,11 @@ array_type      = { base_type ~ array_dim+ } // todo in array type dims cannot b
 slice_type      = { base_type ~ ("[" ~ "]")+ }
 _type           = { array_type | slice_type | base_type | "void" }
 
+_self               = { "self" }
+member_func_params  = { "(" ~ _self ~ ("," ~ param_list )? ~ ")" }
+static_func_params  = { "(" ~ param_list ~ ")" | empty_params }
+
+
 return_type     = { ":" ~ _type }
 optional_return_type = _{ return_type? }
 
@@ -49,7 +54,7 @@ assignment        = { access ~ "=" ~ (expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 module            = { "module" ~ IDENTIFIER ~ ";"}
 var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ("=" ~ expression|func_call) }
-func_decl         = { "function" ~ IDENTIFIER ~ ("(" ~ param_list ~ ")" | empty_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
+func_decl         = { "function" ~ IDENTIFIER ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
 param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
