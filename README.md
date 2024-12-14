@@ -1,3 +1,5 @@
+![Alt text](logo.jpg)
+
 # Skunk Programming Language
 
 **Skunk** is a statically typed, interpreted programming language designed for simplicity, learning, and extensibility. It provides a clean syntax for working with structured data, control flow, and functions while supporting extensible features like user-defined types and type inference.
