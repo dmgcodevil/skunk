@@ -147,7 +147,11 @@ pub enum Type {
         elem_type: Box<Type>,
     },
     Custom(String), // Custom types like structs
-    SkSelf,         // special type for member functions
+    Function {
+        parameters: Vec<Type>,
+        return_type: Box<Type>,
+    },
+    SkSelf, // special type for member functions
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -236,7 +240,9 @@ impl PestImpl {
             Rule::assignment => self.create_assignment(pair),
             Rule::struct_decl => self.create_struct_decl(pair),
             Rule::var_decl => self.create_var_decl(pair),
+            Rule::var_decl_stmt => self.create_var_decl(pair),
             Rule::func_decl => self.create_func_decl(pair),
+            Rule::lambda_expr => self.create_func_decl(pair),
             Rule::literal => self.create_literal(pair),
             Rule::size => self.create_literal(pair),
             Rule::primary => self.create_primary(pair),
@@ -511,7 +517,11 @@ impl PestImpl {
 
     fn create_func_decl(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
-        let name = self.create_identifier(inner_pairs.next().unwrap());
+
+        let name = match inner_pairs.peek().unwrap().as_rule() {
+            Rule::IDENTIFIER => self.create_identifier(inner_pairs.next().unwrap()),
+            _ => Node::Identifier("anonymous".to_string()),
+        };
         let parameters = self.create_param_list(inner_pairs.next().unwrap());
         let return_type = match inner_pairs.peek() {
             Some(p) => {
@@ -543,6 +553,31 @@ impl PestImpl {
     fn create_type(&self, pair: Pair<Rule>) -> Type {
         match pair.as_rule() {
             Rule::base_type => create_base_type_from_str(pair.as_str()),
+            Rule::function_type => {
+                let mut params: Vec<Type> = Vec::new();
+                let mut inner_pairs = pair.into_inner();
+                match inner_pairs.peek().unwrap().as_rule() {
+                    Rule::param_type_list => {
+                        let param_type_list = inner_pairs.next().unwrap();
+                        params.extend(
+                            param_type_list
+                                .into_inner()
+                                .map(|p| self.create_type(p))
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    _ => (),
+                }
+                if let Some(r) = inner_pairs.next() {
+                    assert_eq!(r.as_rule(), Rule::_type);
+                    Type::Function {
+                        parameters: params,
+                        return_type: Box::new(self.create_type(r)),
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
             Rule::slice_type => {
                 let mut inner_pairs = pair.into_inner();
                 Type::Slice {
@@ -2635,5 +2670,80 @@ mod tests {
             },
             parse(source_code)
         );
+    }
+
+    #[test]
+    fn test_assign_function_to_var() {
+        let source_code = r#"
+        sum: (int, int) -> int = function (a:int, b:int): int {
+            return a+b;
+        }
+    "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        name: "sum".to_string(),
+                        var_type: Type::Function {
+                            parameters: vec![Type::Int, Type::Int],
+                            return_type: Box::new(Type::Int),
+                        },
+                        value: Some(Box::new(Node::FunctionDeclaration {
+                            name: "anonymous".to_string(),
+                            parameters: vec![
+                                ("a".to_string(), Type::Int),
+                                ("b".to_string(), Type::Int),
+                            ],
+                            return_type: Type::Int,
+                            body: vec![Node::Return(Box::new(Node::BinaryOp {
+                                left: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("a".to_string())],
+                                }),
+                                operator: Operator::Add,
+                                right: Box::new(Node::Access {
+                                    nodes: vec![Node::Identifier("b".to_string())],
+                                }),
+                            }))]
+                        })),
+                        metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
+    #[test]
+    fn test_function_type_empty_params() {
+        let source_code = r#"
+        no_args: () -> int = function (): int {
+            return 42;
+        }
+    "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        name: "no_args".to_string(),
+                        var_type: Type::Function {
+                            parameters: vec![], // Empty parameter list
+                            return_type: Box::new(Type::Int),
+                        },
+                        value: Some(Box::new(Node::FunctionDeclaration {
+                            name: "anonymous".to_string(),
+                            parameters: vec![], // No parameters in the declaration
+                            return_type: Type::Int,
+                            body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(42))))]
+                        })),
+                        metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
     }
 }

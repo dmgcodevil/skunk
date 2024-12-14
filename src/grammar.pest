@@ -36,7 +36,8 @@ base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
 array_dim       = { "[" ~ expression ~ "]" }
 array_type      = { base_type ~ array_dim+ } // todo in array type dims cannot be expressions, they should be literals: integers
 slice_type      = { base_type ~ ("[" ~ "]")+ }
-_type           = { array_type | slice_type | base_type | "void" }
+function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
+_type           = { array_type | slice_type | base_type | function_type | "void" }
 
 _self               = { "self" }
 member_func_params  = { "(" ~ _self ~ ("," ~ param_list )? ~ ")" }
@@ -49,16 +50,20 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | var_decl ~ ";" | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block}
-assignment        = { access ~ "=" ~ (expression | func_call) }
+statement         = { module | var_decl_stmt | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block }
+assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 module            = { "module" ~ IDENTIFIER ~ ";"}
-var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ("=" ~ expression|func_call) }
+var_decl          = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ ( lambda_expr | expression | func_call ) }
+var_decl_stmt     = { IDENTIFIER ~ ":" ~ _type ~ "=" ~ ( lambda_expr | ((expression | func_call) ~ ";")) }
 func_decl         = { "function" ~ IDENTIFIER ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
 param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
+param_type_list   = { (_type ~ ("," ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
 struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }
+
+lambda_expr       = { "function" ~ static_func_params ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 
 // Struct Initialization
 struct_init        = { IDENTIFIER ~ "{" ~ init_field_list? ~ "}" }
