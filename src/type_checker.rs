@@ -401,7 +401,7 @@ fn resolve_type(
                     name, return_type, actual_return_type
                 ))
             } else {
-                Ok(actual_return_type)
+                Ok(actual_return_type) // if lambda return Type:Function
             }
         }
         Node::VariableDeclaration {
