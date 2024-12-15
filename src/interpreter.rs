@@ -34,6 +34,7 @@ pub enum Value {
         name: String,
         parameters: Vec<(String, Type)>,
         return_type: Type,
+        body: Vec<Node>,
     },
     Return(Rc<RefCell<Value>>),
     Executed, // indicates that a branch has been executed
@@ -60,6 +61,7 @@ impl fmt::Display for Value {
                 name,
                 parameters,
                 return_type,
+                body
             } => {
                 let params_str = parameters
                     .into_iter()
@@ -101,12 +103,13 @@ struct Parameter {
     sk_type: Type,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct FunctionDefinition {
     name: String,
     parameters: Vec<Parameter>,
     return_type: Type,
     body: Vec<Node>,
+    lambda: bool,
 }
 
 struct GlobalEnvironment {
@@ -547,6 +550,7 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
         parameters,
         return_type,
         body,
+        lambda
     } = n
     {
         FunctionDefinition {
@@ -560,6 +564,7 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
                 .collect(),
             return_type: return_type.clone(),
             body: body.clone(), // todo avoid clone
+            lambda: *lambda
         }
     } else {
         panic!("expected Node::FunctionDeclaration")
@@ -608,16 +613,20 @@ pub fn evaluate_node(
             name,
             parameters,
             return_type,
-            body: _,
+            body,
+            lambda
         } => {
-            global_environment
-                .borrow_mut()
-                .functions
-                .insert(name.clone(), create_function_definition(node));
+            if !lambda {
+                global_environment
+                    .borrow_mut()
+                    .functions
+                    .insert(name.clone(), create_function_definition(node));
+            }
             Rc::new(RefCell::new(Value::Function {
                 name: name.to_string(),
                 parameters: parameters.clone(),
                 return_type: return_type.clone(),
+                body: if *lambda { body.clone() } else { Vec::new() },
             }))
         }
         Node::Literal(Literal::Integer(x)) => Rc::new(RefCell::new(Value::Integer(*x))),
@@ -728,11 +737,36 @@ pub fn evaluate_node(
         )
         .get(),
         Node::FunctionCall { name, .. } => {
+            let stack_ref = stack.borrow(); // Borrow the RefCell
+            let current_frame = stack_ref.current_frame();
             let global_environment_ref = global_environment.borrow();
-            let fun = global_environment_ref.get_function(name).unwrap().clone();
+            let fun= current_frame.locals.variables.get(name).and_then(|v| {
+                let val_ref = v.borrow();
+                match val_ref.deref() {
+                    Value::Function { name, parameters, return_type, body }
+                    => {
+                        let fd = FunctionDefinition {
+                            name: name.to_string(),
+                            parameters: parameters
+                                .iter()
+                                .map(|p| Parameter {
+                                    name: p.0.clone(),
+                                    sk_type: p.1.clone(),
+                                })
+                                .collect(),
+                            return_type: return_type.clone(),
+                            body: body.clone(),
+                            lambda: true,
+                        }; // todo cache it in CallFrame env
+                        Some(fd)
+                    }
+                    _ => None
+                }
+            }).unwrap_or_else(|| global_environment_ref.get_function(name).unwrap().clone());
             // we need to clone FunctionDefinition since `evaluate_function` calls `evaluate_node` that
             // also can borrow global_environment
             mem::drop(global_environment_ref);
+            mem::drop(stack_ref);
             evaluate_function(stack, &fun, node, global_environment, || CallFrame {
                 name: name.to_string(),
                 locals: Environment::new(),
@@ -972,6 +1006,7 @@ pub fn evaluate_node(
 use crate::interpreter::Value::{Return, StructInstance, Undefined, Void};
 use std::fmt::Octal;
 use std::ops::{Deref, DerefMut};
+use crate::ast::Node::FunctionDeclaration;
 
 mod tests {
     use super::*;

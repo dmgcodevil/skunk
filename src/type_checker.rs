@@ -365,6 +365,7 @@ fn resolve_type(
             parameters,
             return_type,
             body,
+            lambda,
         } => {
             let mut var_table = VarTable::new();
             for parameter in parameters {

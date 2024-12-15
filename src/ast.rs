@@ -34,6 +34,7 @@ pub enum Node {
         parameters: Vec<(String, Type)>,
         return_type: Type,
         body: Vec<Node>, // The function body is a list of nodes (statements or expressions)
+        lambda: bool
     },
     Assignment {
         var: Box<Node>,
@@ -517,10 +518,13 @@ impl PestImpl {
 
     fn create_func_decl(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
-
+        let mut lambda: bool = false;
         let name = match inner_pairs.peek().unwrap().as_rule() {
             Rule::IDENTIFIER => self.create_identifier(inner_pairs.next().unwrap()),
-            _ => Node::Identifier("anonymous".to_string()),
+            _ => {
+                lambda = true;
+                Node::Identifier("anonymous".to_string())
+            }
         };
         let parameters = self.create_param_list(inner_pairs.next().unwrap());
         let return_type = match inner_pairs.peek() {
@@ -544,6 +548,7 @@ impl PestImpl {
                 parameters,
                 return_type,
                 body,
+                lambda,
             }
         } else {
             unreachable!()
@@ -1002,6 +1007,7 @@ mod tests {
                         parameters: Vec::new(),
                         return_type: Type::Void,
                         body: Vec::new(),
+                        lambda: false,
                     },
                     Node::EOI
                 ])
@@ -1023,6 +1029,7 @@ mod tests {
                         parameters: Vec::new(),
                         return_type: Type::Void,
                         body: Vec::new(),
+                        lambda: false,
                     },
                     Node::EOI
                 ])
@@ -1047,6 +1054,7 @@ mod tests {
                         ]),
                         return_type: Type::Int,
                         body: Vec::new(),
+                        lambda: false,
                     },
                     Node::EOI
                 ])
@@ -1257,6 +1265,7 @@ mod tests {
                             operator: Operator::Add,
                             right: Box::new(access_var("b"))
                         }))]),
+                        lambda: false,
                     },
                     Node::FunctionDeclaration {
                         name: "main".to_string(),
@@ -1275,6 +1284,7 @@ mod tests {
                             })),
                             metadata: Metadata::EMPTY
                         }]),
+                        lambda: false,
                     },
                     Node::EOI
                 ])
@@ -1341,6 +1351,7 @@ mod tests {
                                 operator: Operator::Subtract,
                                 right: Box::new(access_var("y"))
                             }))]),
+                            lambda: false,
                         }]
                         .to_vec()
                     },
@@ -1924,6 +1935,7 @@ mod tests {
                                 operand: Box::new(Node::Literal(Literal::Integer(1))),
                             })),
                         ],
+                        lambda: false,
                     },
                     Node::FunctionCall {
                         name: "test".to_string(),
@@ -2646,6 +2658,7 @@ mod tests {
                                 }],
                             },
                         ],
+                        lambda: false,
                     },
                     Node::EOI
                 ]
@@ -2704,7 +2717,8 @@ mod tests {
                                 right: Box::new(Node::Access {
                                     nodes: vec![Node::Identifier("b".to_string())],
                                 }),
-                            }))]
+                            }))],
+                            lambda: false,
                         })),
                         metadata: Metadata::EMPTY
                     },
@@ -2736,7 +2750,8 @@ mod tests {
                             name: "anonymous".to_string(),
                             parameters: vec![], // No parameters in the declaration
                             return_type: Type::Int,
-                            body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(42))))]
+                            body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(42))))],
+                            lambda: false,
                         })),
                         metadata: Metadata::EMPTY
                     },
