@@ -34,7 +34,7 @@ pub enum Node {
         parameters: Vec<(String, Type)>,
         return_type: Type,
         body: Vec<Node>, // The function body is a list of nodes (statements or expressions)
-        lambda: bool
+        lambda: bool,
     },
     Assignment {
         var: Box<Node>,
@@ -2718,7 +2718,7 @@ mod tests {
                                     nodes: vec![Node::Identifier("b".to_string())],
                                 }),
                             }))],
-                            lambda: false,
+                            lambda: true,
                         })),
                         metadata: Metadata::EMPTY
                     },
@@ -2751,7 +2751,7 @@ mod tests {
                             parameters: vec![], // No parameters in the declaration
                             return_type: Type::Int,
                             body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(42))))],
-                            lambda: false,
+                            lambda: true,
                         })),
                         metadata: Metadata::EMPTY
                     },
