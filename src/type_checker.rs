@@ -468,6 +468,20 @@ fn resolve_type(
                 Ok(var_type.clone())
             }
         }
+        Node::ArrayInit { elements } => {
+            assert!(elements.len() > 0, "array init cannot be empty");
+            let mut curr: Type = resolve_type(global_scope, var_tables, &elements[0])?;
+            for i in 1..elements.len() {
+                let t = resolve_type(global_scope, var_tables, &elements[i])?;
+                if t != curr {
+                    return Err("invalid arr value type".to_string());
+                }
+                curr = t;
+            }
+            Ok(Type::Slice {
+                elem_type: Box::new(curr),
+            })
+        }
         Node::Literal(Literal::Integer(_)) => Ok(Type::Int),
         Node::Literal(Literal::Boolean(_)) => Ok(Type::Boolean),
         Node::Literal(Literal::StringLiteral(_)) => Ok(Type::String),
@@ -647,6 +661,24 @@ mod tests {
     fn test_array_init_wrong_type() {
         let source_code = r#"
         arr: int[5] = int[5]::new("1");
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_inline_array_init() {
+        let source_code = r#"
+            arr:int[] = [1,2,3,4];
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_inline_array_init_invalid_type() {
+        let source_code = r#"
+            arr:int[] = [1,"2"];
         "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
