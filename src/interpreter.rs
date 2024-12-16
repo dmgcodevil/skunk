@@ -339,6 +339,18 @@ pub struct CallFrame {
     locals: Environment,
 }
 
+impl CallFrame {
+    fn to_overridable(&self, name: String) -> CallFrame {
+        CallFrame {
+            name,
+            locals: Environment {
+                variables: self.locals.variables.clone(),
+                overridable: true,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CallStack {
     frames: Vec<CallFrame>,
@@ -395,10 +407,25 @@ fn resolve_member_access(
     if let Node::MemberAccess { member, .. } = node {
         let member_ref = member.as_ref();
         match member_ref {
-            Node::Identifier(name) => Box::new(StructInstanceModifier {
-                instance: current_value,
-                field: name.clone(),
-            }),
+            Node::Identifier(name) => {
+                let current_value_ref = current_value.borrow();
+                match current_value_ref.deref() {
+                    StructInstance { .. } => {
+                        drop(current_value_ref);
+                        Box::new(StructInstanceModifier {
+                            instance: current_value,
+                            field: name.clone(),
+                        })
+                    }
+                    Value::Array { arr, .. } => match name.as_str() {
+                        "len" => Box::new(ReadValueModifier {
+                            value: Rc::new(RefCell::new(Value::Integer(arr.len() as i64))),
+                        }),
+                        _ => unreachable!("{}", format!("unsupported array member: `{}`", name)),
+                    },
+                    _ => unreachable!("unsupported member access"),
+                }
+            }
             Node::FunctionCall { name, .. } => {
                 let global_environment_ref = global_environment.borrow();
                 let struct_def =
@@ -774,7 +801,12 @@ pub fn evaluate_node(
                         &body,
                         node,
                         global_environment,
-                        || stack.borrow().current_frame().clone(),
+                        || {
+                            stack
+                                .borrow()
+                                .current_frame()
+                                .to_overridable(name.to_string())
+                        },
                     )),
                     _ => None,
                 }
@@ -1783,5 +1815,38 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         println!("{:#?}", res.borrow().deref());
+    }
+
+    #[test]
+    fn lambda_recursive() {
+        let source_code = r#"
+        factorial: (int) -> int = function(n: int): int {
+            if (n == 0) {
+                return 1;
+            } else {
+                return n * factorial(n - 1);
+            }
+        }
+        factorial(3);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(6), *res.borrow().deref());
+    }
+
+    #[test]
+    fn lambda_path_as_arg() {
+        let source_code = r#"
+            function f(g: () -> int):int {
+                return g();
+            }
+            g: () -> int = function(): int {
+                return 1;
+            }
+            f(g);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 }
