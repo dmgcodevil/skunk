@@ -20,13 +20,13 @@ fn main() -> io::Result<()> {
     println!("{}", contents);
     let node = ast::parse(&contents);
     println!("{:#?}", node);
-    // match type_checker::check(&node) {
-    //     Ok(_) => (),
-    //     Err(e) => {
-    //         eprintln!("Error: {}", e.red());
-    //         std::process::exit(1);
-    //     }
-    // };
+    match type_checker::check(&node) {
+        Ok(_) => (),
+        Err(e) => {
+            eprintln!("Error: {}", e.red());
+            std::process::exit(1);
+        }
+    };
     let result = interpreter::evaluate(&node);
     let res_ref = result.borrow();
     println!("Result:");
