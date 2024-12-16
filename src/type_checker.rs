@@ -198,19 +198,17 @@ fn resolve_access(
         return Ok(curr);
     }
     match access_nodes.get(i).unwrap() {
-        Node::ArrayAccess { .. } => {
-            if let Type::Array { elem_type, .. } = curr {
-                resolve_access(
-                    global_scope,
-                    var_tables,
-                    elem_type.deref().clone(),
-                    i + 1,
-                    access_nodes,
-                )
-            } else {
-                Err("array access to not array variable".to_string())
-            }
-        }
+        Node::ArrayAccess { .. } => match curr {
+            Type::Array { elem_type, .. } => resolve_access(
+                global_scope,
+                var_tables,
+                elem_type.deref().clone(),
+                i + 1,
+                access_nodes,
+            ),
+            Type::Slice { elem_type, .. } => Ok(elem_type.deref().clone()),
+            _ => Err("array access to not array variable".to_string()),
+        },
 
         Node::MemberAccess { member, metadata } => match curr {
             Type::Custom(struct_name) => {
@@ -682,6 +680,16 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_access_slice() {
+        let source_code = r#"
+             arr:int[] = [1];
+             arr[0];
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
     }
 
     #[test]
