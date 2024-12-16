@@ -200,15 +200,15 @@ fn resolve_access(
     match access_nodes.get(i).unwrap() {
         Node::ArrayAccess { .. } => {
             if let Type::Array { elem_type, .. } = curr {
-                return resolve_access(
+                resolve_access(
                     global_scope,
                     var_tables,
                     elem_type.deref().clone(),
                     i + 1,
                     access_nodes,
-                );
+                )
             } else {
-                return Err(format!("array access to not array variable"));
+                Err("array access to not array variable".to_string())
             }
         }
 
@@ -365,6 +365,7 @@ fn resolve_type(
             parameters,
             return_type,
             body,
+            lambda,
         } => {
             let mut var_table = VarTable::new();
             for parameter in parameters {
@@ -400,7 +401,10 @@ fn resolve_type(
                     name, return_type, actual_return_type
                 ))
             } else {
-                Ok(actual_return_type)
+                Ok(Type::Function {
+                    parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+                    return_type: Box::new(return_type.clone()),
+                })
             }
         }
         Node::VariableDeclaration {
@@ -503,7 +507,7 @@ fn resolve_type(
                         return Err(format!("error {}:{}: array `new`. expected arg type is `{:?}` but given `{:?}`",
                                            metadata.span.line,
                                            metadata.span.start,
-                                           elem_type.deref(), arg_type ));
+                                           elem_type.deref(), arg_type));
                     }
                 }
                 Type::Slice { .. } => {}
@@ -660,5 +664,27 @@ mod tests {
     "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_lambda_var() {
+        let source_code = r#"
+            id: (int) -> int = function (a:int): int {
+                return a;
+            }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_lambda_var_invalid_type() {
+        let source_code = r#"
+            id: (string) -> int = function (a:int): int {
+                return a;
+            }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
     }
 }

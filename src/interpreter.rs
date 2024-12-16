@@ -32,8 +32,9 @@ pub enum Value {
     },
     Function {
         name: String,
-        parameters: Vec<(String, Type)>,
+        parameters: Vec<Parameter>,
         return_type: Type,
+        body: Vec<Node>,
     },
     Return(Rc<RefCell<Value>>),
     Executed, // indicates that a branch has been executed
@@ -60,10 +61,11 @@ impl fmt::Display for Value {
                 name,
                 parameters,
                 return_type,
+                body,
             } => {
                 let params_str = parameters
                     .into_iter()
-                    .map(|(n, t)| format!("{}:{}", n, ast::type_to_string(t)))
+                    .map(|p| format!("{}:{}", p.name, ast::type_to_string(&p.sk_type)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(
@@ -101,18 +103,18 @@ struct Parameter {
     sk_type: Type,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct FunctionDefinition {
     name: String,
     parameters: Vec<Parameter>,
     return_type: Type,
     body: Vec<Node>,
+    lambda: bool,
 }
 
 struct GlobalEnvironment {
     structs: HashMap<String, StructDefinition>,
-    functions: HashMap<String, FunctionDefinition>,
-    // todo variables ?
+    functions: HashMap<String, Rc<RefCell<FunctionDefinition>>>,
 }
 
 impl GlobalEnvironment {
@@ -132,10 +134,11 @@ impl GlobalEnvironment {
     }
 
     fn add_function(&mut self, name: String, definition: FunctionDefinition) {
-        self.functions.insert(name, definition);
+        self.functions
+            .insert(name, Rc::new(RefCell::new(definition)));
     }
 
-    fn get_function(&self, name: &str) -> Option<&FunctionDefinition> {
+    fn get_function(&self, name: &str) -> Option<&Rc<RefCell<FunctionDefinition>>> {
         self.functions.get(name)
     }
     fn to_struct_def(&self, v: &Value) -> &StructDefinition {
@@ -336,6 +339,18 @@ pub struct CallFrame {
     locals: Environment,
 }
 
+impl CallFrame {
+    fn to_overridable(&self, name: String) -> CallFrame {
+        CallFrame {
+            name,
+            locals: Environment {
+                variables: self.locals.variables.clone(),
+                overridable: true,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CallStack {
     frames: Vec<CallFrame>,
@@ -392,10 +407,25 @@ fn resolve_member_access(
     if let Node::MemberAccess { member, .. } = node {
         let member_ref = member.as_ref();
         match member_ref {
-            Node::Identifier(name) => Box::new(StructInstanceModifier {
-                instance: current_value,
-                field: name.clone(),
-            }),
+            Node::Identifier(name) => {
+                let current_value_ref = current_value.borrow();
+                match current_value_ref.deref() {
+                    StructInstance { .. } => {
+                        drop(current_value_ref);
+                        Box::new(StructInstanceModifier {
+                            instance: current_value,
+                            field: name.clone(),
+                        })
+                    }
+                    Value::Array { arr, .. } => match name.as_str() {
+                        "len" => Box::new(ReadValueModifier {
+                            value: Rc::new(RefCell::new(Value::Integer(arr.len() as i64))),
+                        }),
+                        _ => unreachable!("{}", format!("unsupported array member: `{}`", name)),
+                    },
+                    _ => unreachable!("unsupported member access"),
+                }
+            }
             Node::FunctionCall { name, .. } => {
                 let global_environment_ref = global_environment.borrow();
                 let struct_def =
@@ -403,16 +433,23 @@ fn resolve_member_access(
                 let fun_def = struct_def.functions.get(name).unwrap();
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
-                let res = evaluate_function(stack, fun_def, member_ref, global_environment, || {
-                    let mut frame = CallFrame {
-                        name: format!("{}.{}", struct_def.name, name),
-                        locals: Environment::new(),
-                    };
-                    frame
-                        .locals
-                        .assign_variable("self", Rc::clone(&current_value));
-                    frame
-                });
+                let res = evaluate_function(
+                    stack,
+                    &fun_def.parameters,
+                    &fun_def.body,
+                    member_ref,
+                    global_environment,
+                    || {
+                        let mut frame = CallFrame {
+                            name: format!("{}.{}", struct_def.name, name),
+                            locals: Environment::new(),
+                        };
+                        frame
+                            .locals
+                            .assign_variable("self", Rc::clone(&current_value));
+                        frame
+                    },
+                );
                 mem::drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
             }
@@ -494,7 +531,8 @@ fn resolve_access(
 
 fn evaluate_function<F>(
     stack: &Rc<RefCell<CallStack>>,
-    fun: &FunctionDefinition,
+    parameters: &Vec<Parameter>,
+    body: &Vec<Node>,
     call_node: &Node,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     frame_creator: F,
@@ -510,8 +548,7 @@ where
             .into_iter()
             .map(|arg| evaluate_node(arg, stack, global_environment))
             .collect();
-        let arguments: Vec<(&Parameter, Rc<RefCell<Value>>)> = fun
-            .parameters
+        let arguments: Vec<(&Parameter, Rc<RefCell<Value>>)> = parameters
             .iter()
             .filter(|p| p.sk_type != Type::SkSelf) // self is added to call stack implicitly
             .zip(args_values.into_iter())
@@ -525,7 +562,7 @@ where
         stack.borrow_mut().push(frame);
 
         let mut result = Rc::new(RefCell::new(Undefined));
-        for n in &fun.body {
+        for n in body {
             if let Value::Return(v) = evaluate_node(&n, stack, global_environment)
                 .borrow()
                 .deref()
@@ -547,6 +584,7 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
         parameters,
         return_type,
         body,
+        lambda,
     } = n
     {
         FunctionDefinition {
@@ -560,6 +598,7 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
                 .collect(),
             return_type: return_type.clone(),
             body: body.clone(), // todo avoid clone
+            lambda: *lambda,
         }
     } else {
         panic!("expected Node::FunctionDeclaration")
@@ -608,16 +647,26 @@ pub fn evaluate_node(
             name,
             parameters,
             return_type,
-            body: _,
+            body,
+            lambda,
         } => {
-            global_environment
-                .borrow_mut()
-                .functions
-                .insert(name.clone(), create_function_definition(node));
+            if !lambda {
+                global_environment.borrow_mut().functions.insert(
+                    name.clone(),
+                    Rc::new(RefCell::new(create_function_definition(node))),
+                );
+            }
             Rc::new(RefCell::new(Value::Function {
                 name: name.to_string(),
-                parameters: parameters.clone(),
+                parameters: parameters
+                    .iter()
+                    .map(|p| Parameter {
+                        name: p.0.clone(),
+                        sk_type: p.1.clone(),
+                    })
+                    .collect(),
                 return_type: return_type.clone(),
+                body: if *lambda { body.clone() } else { Vec::new() },
             }))
         }
         Node::Literal(Literal::Integer(x)) => Rc::new(RefCell::new(Value::Integer(*x))),
@@ -728,15 +777,65 @@ pub fn evaluate_node(
         )
         .get(),
         Node::FunctionCall { name, .. } => {
-            let global_environment_ref = global_environment.borrow();
-            let fun = global_environment_ref.get_function(name).unwrap().clone();
-            // we need to clone FunctionDefinition since `evaluate_function` calls `evaluate_node` that
-            // also can borrow global_environment
-            mem::drop(global_environment_ref);
-            evaluate_function(stack, &fun, node, global_environment, || CallFrame {
-                name: name.to_string(),
-                locals: Environment::new(),
-            })
+            let value_opt = {
+                let stack_ref = stack.borrow();
+                stack_ref
+                    .current_frame()
+                    .locals
+                    .variables
+                    .get(name)
+                    .cloned()
+            };
+
+            let res = if let Some(value) = value_opt {
+                let value_ref = value.borrow();
+                match value_ref.deref() {
+                    Value::Function {
+                        name,
+                        parameters,
+                        return_type,
+                        body,
+                    } => Some(evaluate_function(
+                        stack,
+                        &parameters,
+                        &body,
+                        node,
+                        global_environment,
+                        || {
+                            stack
+                                .borrow()
+                                .current_frame()
+                                .to_overridable(name.to_string())
+                        },
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(res) = res {
+                res
+            } else {
+                let global_environment_ref = global_environment.borrow();
+                let fun = global_environment_ref
+                    .get_function(name)
+                    .expect(format!("function `{}` doesn't exist", name).as_str())
+                    .clone();
+                let fun_ref = fun.borrow();
+                mem::drop(global_environment_ref);
+                evaluate_function(
+                    stack,
+                    &fun_ref.parameters,
+                    &fun_ref.body,
+                    node,
+                    global_environment,
+                    || CallFrame {
+                        name: name.to_string(),
+                        locals: Environment::new(),
+                    },
+                )
+            }
         }
         Node::Block { statements } => {
             let mut frame = CallFrame {
@@ -969,6 +1068,7 @@ pub fn evaluate_node(
     }
 }
 
+use crate::ast::Node::FunctionDeclaration;
 use crate::interpreter::Value::{Return, StructInstance, Undefined, Void};
 use std::fmt::Octal;
 use std::ops::{Deref, DerefMut};
@@ -1715,5 +1815,38 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         println!("{:#?}", res.borrow().deref());
+    }
+
+    #[test]
+    fn lambda_recursive() {
+        let source_code = r#"
+        factorial: (int) -> int = function(n: int): int {
+            if (n == 0) {
+                return 1;
+            } else {
+                return n * factorial(n - 1);
+            }
+        }
+        factorial(3);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(6), *res.borrow().deref());
+    }
+
+    #[test]
+    fn lambda_path_as_arg() {
+        let source_code = r#"
+            function f(g: () -> int):int {
+                return g();
+            }
+            g: () -> int = function(): int {
+                return 1;
+            }
+            f(g);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 }
