@@ -2772,4 +2772,18 @@ mod tests {
 
         println!("{:?}", parse(source_code));
     }
+
+    #[test]
+    fn test_return_function() {
+        let source_code = r#"
+        function f(): (int) -> int {
+            return function(a:int):int {
+                return a;
+            }
+        }
+        g: (int) -> int = f();
+        g(47);
+        "#;
+        println!("{:?}", parse(source_code));
+    }
 }

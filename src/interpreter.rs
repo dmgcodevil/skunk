@@ -1883,4 +1883,21 @@ mod tests {
         let res = evaluate(&program);
         assert_eq!(Value::Integer(47), *res.borrow().deref());
     }
+
+    #[test]
+    fn test_function_return_function() {
+        let source_code = r#"
+        function f(): (int) -> int {
+            return function (a:int): int {
+                return a;
+            }
+        }
+
+        g: (int) -> int = f();
+        g(47);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(47), *res.borrow().deref());
+    }
 }

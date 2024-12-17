@@ -103,7 +103,7 @@ print           = { "print" ~ "(" ~ expression ~ ")" ~ ";" }
 input           = { "input" ~ "(" ~ ")" ~ ";" }
 io              = { print | input }
 
-sk_return        = { "return" ~ expression ~ ";" }
+sk_return        = { "return" ~ (lambda_expr | (expression ~ ";")) }
 
 
 unary_op        = { (unary_plus | unary_minus | negate) ~ primary }

@@ -1,7 +1,6 @@
 use crate::ast::Type::Custom;
 use crate::ast::{Literal, Metadata, Node, Operator, Type};
 use std::collections::HashMap;
-use std::fmt::format;
 use std::ops::Deref;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -30,6 +29,7 @@ impl VarTable {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
 struct VarTables {
     tables: Vec<VarTable>,
 }
@@ -151,12 +151,7 @@ impl GlobalScope {
                     },
                 );
             }
-            Node::FunctionDeclaration {
-                name,
-                parameters,
-                return_type,
-                ..
-            } => {
+            Node::FunctionDeclaration { name, .. } => {
                 self.functions
                     .insert(name.clone(), FunctionSymbol::from_node(node));
             }
@@ -179,12 +174,6 @@ impl GlobalScope {
         }
     }
 }
-
-// fn to_symbol(p: &(String, Type)) -> Symbol {
-//     match p.1 {
-//         Type::Function {}
-//     }
-// }
 
 fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     match (left, right) {
@@ -229,17 +218,12 @@ fn resolve_access(
                 match member.deref() {
                     Node::Identifier(field_name) => {
                         if !struct_symbol.fields.contains_key(field_name) {
-                            // error[E0609]: no field `z` on type `Point`
-                            // --> src/main.rs:10:22
-                            // |
-                            // 10 |     println!("{}", p.z);
-                            // |                      ^ unknown field
                             return Err(format!(
                                 "error {}:{}: no field `{}` on type `{}`",
                                 metadata.span.line, metadata.span.start, field_name, struct_name
                             ));
                         }
-                        return resolve_access(
+                        resolve_access(
                             global_scope,
                             var_tables,
                             struct_symbol
@@ -250,7 +234,7 @@ fn resolve_access(
                                 .clone(),
                             i + 1,
                             access_nodes,
-                        );
+                        )
                     }
                     Node::FunctionCall {
                         name,
@@ -272,9 +256,6 @@ fn resolve_access(
                             struct_symbol.functions.get(name).unwrap(),
                             member.deref(),
                         )?;
-                        // global_scope: &GlobalScope,
-                        // var_tables: &mut VarTables,
-                        // node: &Node,
                         let args_types_res: Result<Vec<Type>, String> = arguments
                             .iter()
                             .map(|arg| resolve_type(global_scope, var_tables, arg))
@@ -282,18 +263,12 @@ fn resolve_access(
                         let args_types = args_types_res?;
                         println!("args_types = {:?}", args_types);
 
-                        return resolve_access(
-                            global_scope,
-                            var_tables,
-                            return_type,
-                            i + 1,
-                            access_nodes,
-                        );
+                        resolve_access(global_scope, var_tables, return_type, i + 1, access_nodes)
                     }
                     _ => panic!("expected member access node"),
                 }
             }
-            _ => return Err(format!("access to member access to not instance structs")),
+            _ => Err(format!("access to member access to not instance structs")),
         },
         _ => unreachable!("unexpected access node"),
     }
@@ -466,7 +441,7 @@ fn resolve_type(
                         ..
                     } => {
                         functions.insert(
-                            name.to_string(),
+                            s.name.clone(),
                             FunctionSymbol {
                                 name: s.name.clone(),
                                 parameters: parameters
@@ -780,7 +755,7 @@ mod tests {
         assert!(check(&program).is_err());
     }
     #[test]
-    fn anonymous_function() {
+    fn test_anonymous_function() {
         let source_code = r#"
         function f(g: () -> int): int {
             return g();
@@ -796,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_function_invalid_type() {
+    fn test_anonymous_function_invalid_type() {
         let source_code = r#"
         function f(g: (int) -> int): int {
             return g("1");
@@ -808,7 +783,21 @@ mod tests {
         "#;
 
         let program = ast::parse(source_code);
-        println!("{:?}", check(&program));
-        // assert!(check(&program).is_err());
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_function_returns_function() {
+        let source_code = r#"
+        function f(): (int) -> int {
+            return function (a:int): int {
+                return a;
+            }
+        }
+        g: (int) -> int = f();
+        g(1);
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
     }
 }
