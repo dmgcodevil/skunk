@@ -156,6 +156,7 @@ impl GlobalEnvironment {
 #[derive(Debug, PartialEq, Clone)]
 struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
+    closures: HashMap<String, Rc<RefCell<Value>>>, //todo remove, instead traverse call stack upwards
     overridable: bool,
 }
 
@@ -308,12 +309,14 @@ impl Environment {
     fn new() -> Self {
         Environment {
             variables: HashMap::new(),
+            closures: HashMap::new(),
             overridable: false,
         }
     }
     fn overridable() -> Self {
         Environment {
             variables: HashMap::new(),
+            closures: HashMap::new(),
             overridable: true,
         }
     }
@@ -330,10 +333,16 @@ impl Environment {
 
     fn get_variable_value(&self, name: &str) -> &Rc<RefCell<Value>> {
         if let Some(var) = self.variables.get(name) {
-            var
-        } else {
-            panic!("variable '{}' not declared", name);
+            return var;
         }
+        if let Some(var) = self.closures.get(name) {
+            return var;
+        }
+        panic!("variable '{}' not declared", name);
+    }
+
+    fn declare_closure(&mut self, name: String, value: Rc<RefCell<Value>>) {
+        self.closures.insert(name, value);
     }
 }
 
@@ -349,6 +358,7 @@ impl CallFrame {
             name,
             locals: Environment {
                 variables: self.locals.variables.clone(),
+                closures: self.locals.closures.clone(),
                 overridable: true,
             },
         }
@@ -562,7 +572,16 @@ where
         for arg in arguments {
             let first = arg.0.name.clone();
             let second = arg.1;
-            frame.locals.variables.insert(first, Rc::clone(&second));
+
+            let second_ref = second.borrow();
+            match second_ref.deref() {
+                Value::Closure { .. } => {
+                    frame.locals.declare_closure(first, Rc::clone(&second));
+                }
+                _ => {
+                    frame.locals.declare_variable(first, Rc::clone(&second));
+                }
+            }
         }
         stack.borrow_mut().push(frame);
 
@@ -697,11 +716,27 @@ pub fn evaluate_node(
                 Rc::new(RefCell::new(Undefined))
             };
             // println!("declared variable {:?}={:?}", name, value);
-            stack
-                .borrow_mut()
-                .current_frame_mut()
-                .locals
-                .declare_variable(name.to_string(), value);
+
+            let value_ref = value.borrow();
+            match value_ref.deref() {
+                Closure { .. } => {
+                    drop(value_ref);
+                    stack
+                        .borrow_mut()
+                        .current_frame_mut()
+                        .locals
+                        .declare_closure(name.to_string(), value)
+                }
+                _ => {
+                    drop(value_ref);
+                    stack
+                        .borrow_mut()
+                        .current_frame_mut()
+                        .locals
+                        .declare_variable(name.to_string(), value)
+                }
+            }
+
             Rc::new(RefCell::new(Value::Variable(name.to_string())))
         }
         Node::ArrayInit { elements } => {
@@ -801,35 +836,12 @@ pub fn evaluate_node(
             // );
             let value_opt = {
                 let stack_ref = stack.borrow();
-                stack_ref
-                    .current_frame()
-                    .locals
-                    .variables
-                    .get(name)
-                    .cloned()
+                stack_ref.current_frame().locals.closures.get(name).cloned()
             };
 
             let res = if let Some(value) = value_opt {
                 let value_ref = value.borrow();
                 match value_ref.deref() {
-                    Value::Function {
-                        name,
-                        parameters,
-                        return_type,
-                        body,
-                    } => Some(evaluate_function(
-                        stack,
-                        &parameters,
-                        &body,
-                        node,
-                        global_environment,
-                        || {
-                            stack
-                                .borrow()
-                                .current_frame()
-                                .to_overridable(name.to_string())
-                        },
-                    )),
                     Value::Closure {
                         function,
                         call_frame,
@@ -840,7 +852,9 @@ pub fn evaluate_node(
                         let mut new_call_frame = call_frame.clone();
                         new_call_frame
                             .locals
-                            .declare_variable(name.to_string(), value.clone());
+                            .declare_closure(name.to_string(), value.clone());
+
+                        //println!("function closure start frame={:?}", new_call_frame);
 
                         // println!("function closure frame={:?}", call_frame);
                         let r = evaluate_function(
@@ -852,6 +866,7 @@ pub fn evaluate_node(
                             || new_call_frame.clone(),
                         );
                         let curr_frame = stack.borrow_mut().pop().unwrap();
+                        // println!("function closure end frame={:?}", curr_frame);
                         let mut result_frame = CallFrame {
                             name: name.to_string(),
                             locals: Environment::new(),
@@ -866,7 +881,7 @@ pub fn evaluate_node(
                             .borrow_mut()
                             .current_frame_mut()
                             .locals
-                            .assign_variable(
+                            .declare_closure(
                                 name.to_string(),
                                 Rc::new(RefCell::new(Closure {
                                     function: function.clone(),
@@ -1903,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_path_as_arg() {
+    fn lambda_pass_as_arg() {
         let source_code = r#"
             function f(g: () -> int):int {
                 return g();
@@ -1980,9 +1995,9 @@ mod tests {
             }
         }
 
-        g: () -> int = f();
-        g();
-        g();
+        counter: () -> int = f();
+        counter();
+        counter();
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
