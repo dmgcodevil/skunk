@@ -1900,4 +1900,23 @@ mod tests {
         let res = evaluate(&program);
         assert_eq!(Value::Integer(47), *res.borrow().deref());
     }
+
+    #[test]
+    fn test_closure() {
+        let source_code = r#"
+        function f(): () -> int {
+            counter: int = 0;
+            return function (): int {
+                counter = counter + 1;
+                return counter;
+            }
+        }
+
+        g: () -> int = f();
+        g();
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
+    }
 }
