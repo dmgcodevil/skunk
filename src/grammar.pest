@@ -108,7 +108,7 @@ sk_return        = { "return" ~ expression ~ ";" }
 
 unary_op        = { (unary_plus | unary_minus | negate) ~ primary }
 expression      = { primary ~ (operation ~ primary)* }
-primary         = { unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
+primary         = { lambda_expr | unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
 
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
 func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }

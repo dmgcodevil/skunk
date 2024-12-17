@@ -2761,4 +2761,15 @@ mod tests {
             parse(source_code)
         )
     }
+
+    #[test]
+    fn anonymous_function() {
+        let source_code = r#"
+        f(function ():int {
+            return 47;
+        });
+        "#;
+
+        println!("{:?}", parse(source_code));
+    }
 }

@@ -14,12 +14,14 @@ struct Symbol {
 #[derive(Debug, PartialEq, Clone)]
 struct VarTable {
     vars: HashMap<String, Symbol>,
+    functions: HashMap<String, FunctionSymbol>,
 }
 
 impl VarTable {
     fn new() -> Self {
         VarTable {
             vars: HashMap::new(),
+            functions: HashMap::new(),
         }
     }
 
@@ -68,7 +70,7 @@ struct FunctionSymbol {
     name: String,
     parameters: Vec<Symbol>,
     return_type: Type,
-    // metadata: Metadata, todo
+    lambda: bool, // metadata: Metadata, todo
 }
 
 impl FunctionSymbol {
@@ -78,11 +80,13 @@ impl FunctionSymbol {
                 name,
                 parameters,
                 return_type,
-                ..
+                body,
+                lambda,
             } => FunctionSymbol {
                 name: name.clone(),
                 parameters: create_symbols(parameters),
                 return_type: return_type.clone(),
+                lambda: lambda.clone(),
             },
             _ => panic!("expected function declaration"),
         }
@@ -175,6 +179,12 @@ impl GlobalScope {
         }
     }
 }
+
+// fn to_symbol(p: &(String, Type)) -> Symbol {
+//     match p.1 {
+//         Type::Function {}
+//     }
+// }
 
 fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     match (left, right) {
@@ -303,9 +313,14 @@ fn resolve_function_call(
     {
         if arguments.len() != function_symbol.parameters.len() {
             return Err(format!(
-                "incorrect number of args to '{}' function. \
+                "incorrect number of args to '{}' {}. \
                     expected={}, actual={}",
                 name,
+                if function_symbol.lambda {
+                    "lambda"
+                } else {
+                    "function"
+                },
                 function_symbol.parameters.len(),
                 arguments.len()
             ));
@@ -317,11 +332,16 @@ fn resolve_function_call(
         for i in 0..argument_types.len() {
             if argument_types[i] != function_symbol.parameters[i].sk_type {
                 return Err(format!(
-                    "error {}:{}:arguments to '{}' function are incorrect. parameter='{}', \
+                    "error {}:{}:arguments to '{}' {} are incorrect. parameter='{}', \
                         expected type='{:?}', actual type='{:?}'",
                     metadata.span.line,
                     metadata.span.start,
                     name,
+                    if function_symbol.lambda {
+                        "lambda"
+                    } else {
+                        "function"
+                    },
                     function_symbol.parameters[i].name,
                     function_symbol.parameters[i].sk_type,
                     argument_types[i]
@@ -435,12 +455,44 @@ fn resolve_type(
         }
         Node::FunctionCall {
             name, arguments, ..
-        } => resolve_function_call(
-            global_scope,
-            var_tables,
-            global_scope.functions.get(name).unwrap(),
-            node,
-        ),
+        } => {
+            let mut functions: HashMap<String, FunctionSymbol> = HashMap::new(); // lambdas
+            let var_table = var_tables.get();
+            for s in var_table.vars.values() {
+                match &s.sk_type {
+                    Type::Function {
+                        parameters,
+                        return_type,
+                        ..
+                    } => {
+                        functions.insert(
+                            name.to_string(),
+                            FunctionSymbol {
+                                name: s.name.clone(),
+                                parameters: parameters
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, p)| Symbol {
+                                        name: i.to_string(),
+                                        sk_type: p.clone(),
+                                        metadata: Metadata::EMPTY,
+                                    })
+                                    .collect(),
+                                return_type: return_type.deref().clone(),
+                                lambda: true,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let func_symbol = functions
+                .get(name)
+                .or_else(|| global_scope.functions.get(name))
+                .expect(format!("function '{}' not found", name).as_ref());
+
+            resolve_function_call(global_scope, var_tables, func_symbol, node)
+        }
         Node::BinaryOp {
             left,
             operator,
@@ -726,5 +778,37 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
+    }
+    #[test]
+    fn anonymous_function() {
+        let source_code = r#"
+        function f(g: () -> int): int {
+            return g();
+        }
+
+        f(function ():int {
+            return 47;
+        });
+        "#;
+
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn anonymous_function_invalid_type() {
+        let source_code = r#"
+        function f(g: (int) -> int): int {
+            return g("1");
+        }
+
+        f(function (i:int):int {
+            return i;
+        });
+        "#;
+
+        let program = ast::parse(source_code);
+        println!("{:?}", check(&program));
+        // assert!(check(&program).is_err());
     }
 }

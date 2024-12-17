@@ -1849,4 +1849,38 @@ mod tests {
         let res = evaluate(&program);
         assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
+
+    #[test]
+    fn anonymous_function() {
+        let source_code = r#"
+        function f(g: () -> int): int {
+            return g();
+        }
+
+        f(function ():int {
+            return 47;
+        });
+        "#;
+
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(47), *res.borrow().deref());
+    }
+
+    #[test]
+    fn anonymous_function_with_params() {
+        let source_code = r#"
+        function f(g: (int) -> int): int {
+            return g(47);
+        }
+
+        f(function (i:int):int {
+            return i;
+        });
+        "#;
+
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(47), *res.borrow().deref());
+    }
 }
