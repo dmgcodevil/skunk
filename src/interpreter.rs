@@ -36,6 +36,10 @@ pub enum Value {
         return_type: Type,
         body: Vec<Node>,
     },
+    Closure {
+        function: FunctionDefinition,
+        call_frame: CallFrame,
+    },
     Return(Rc<RefCell<Value>>),
     Executed, // indicates that a branch has been executed
     Void,
@@ -234,7 +238,7 @@ impl ValueModifier for StackVariableModifier {
             .deref_mut()
             .current_frame_mut()
             .locals
-            .assign_variable(&self.name.clone(), Rc::clone(&value));
+            .assign_variable(self.name.clone(), Rc::clone(&value));
     }
 
     fn get(&self) -> Rc<RefCell<Value>> {
@@ -314,14 +318,14 @@ impl Environment {
         }
     }
 
-    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn declare_variable(&mut self, name: String, value: Rc<RefCell<Value>>) {
         // todo assert that variable doesn't already exists
         self.variables.insert(name.to_string(), value);
     }
 
-    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn assign_variable(&mut self, name: String, value: Rc<RefCell<Value>>) {
         // todo assert that var exists
-        self.variables.insert(name.to_string(), value);
+        self.variables.insert(name, value);
     }
 
     fn get_variable_value(&self, name: &str) -> &Rc<RefCell<Value>> {
@@ -333,7 +337,7 @@ impl Environment {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CallFrame {
     name: String,
     locals: Environment,
@@ -446,10 +450,11 @@ fn resolve_member_access(
                         };
                         frame
                             .locals
-                            .assign_variable("self", Rc::clone(&current_value));
+                            .assign_variable("self".to_string(), Rc::clone(&current_value));
                         frame
                     },
                 );
+                stack.borrow_mut().pop();
                 mem::drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
             }
@@ -571,7 +576,7 @@ where
                 break;
             }
         }
-        stack.borrow_mut().pop();
+        // stack.borrow_mut().pop();
         result
     } else {
         panic!("expected Node::FunctionCall")
@@ -650,24 +655,35 @@ pub fn evaluate_node(
             body,
             lambda,
         } => {
+            let func_def = create_function_definition(node);
             if !lambda {
-                global_environment.borrow_mut().functions.insert(
-                    name.clone(),
-                    Rc::new(RefCell::new(create_function_definition(node))),
-                );
+                global_environment
+                    .borrow_mut()
+                    .functions
+                    .insert(name.clone(), Rc::new(RefCell::new(func_def.clone())));
             }
-            Rc::new(RefCell::new(Value::Function {
-                name: name.to_string(),
-                parameters: parameters
-                    .iter()
-                    .map(|p| Parameter {
-                        name: p.0.clone(),
-                        sk_type: p.1.clone(),
-                    })
-                    .collect(),
-                return_type: return_type.clone(),
-                body: if *lambda { body.clone() } else { Vec::new() },
-            }))
+
+            if *lambda {
+                let frame = stack.borrow().current_frame().clone();
+                // println!("create closure. function {:?}, {:?} ", func_def, frame);
+                Rc::new(RefCell::new(Value::Closure {
+                    function: func_def,
+                    call_frame: frame,
+                }))
+            } else {
+                Rc::new(RefCell::new(Value::Function {
+                    name: name.to_string(),
+                    parameters: parameters
+                        .iter()
+                        .map(|p| Parameter {
+                            name: p.0.clone(),
+                            sk_type: p.1.clone(),
+                        })
+                        .collect(),
+                    return_type: return_type.clone(),
+                    body: Vec::new(),
+                }))
+            }
         }
         Node::Literal(Literal::Integer(x)) => Rc::new(RefCell::new(Value::Integer(*x))),
         Node::Literal(Literal::StringLiteral(x)) => {
@@ -680,11 +696,12 @@ pub fn evaluate_node(
             } else {
                 Rc::new(RefCell::new(Undefined))
             };
+            // println!("declared variable {:?}={:?}", name, value);
             stack
                 .borrow_mut()
                 .current_frame_mut()
                 .locals
-                .declare_variable(name, value);
+                .declare_variable(name.to_string(), value);
             Rc::new(RefCell::new(Value::Variable(name.to_string())))
         }
         Node::ArrayInit { elements } => {
@@ -777,6 +794,11 @@ pub fn evaluate_node(
         )
         .get(),
         Node::FunctionCall { name, .. } => {
+            // println!(
+            //     "function '{:?}' call frame={:?}",
+            //     name,
+            //     stack.borrow().current_frame()
+            // );
             let value_opt = {
                 let stack_ref = stack.borrow();
                 stack_ref
@@ -808,6 +830,51 @@ pub fn evaluate_node(
                                 .to_overridable(name.to_string())
                         },
                     )),
+                    Value::Closure {
+                        function,
+                        call_frame,
+                    } => {
+                        // let closure_stack = CallStack::new();
+                        // closure_stack.push(*call_frame);
+
+                        let mut new_call_frame = call_frame.clone();
+                        new_call_frame
+                            .locals
+                            .declare_variable(name.to_string(), value.clone());
+
+                        // println!("function closure frame={:?}", call_frame);
+                        let r = evaluate_function(
+                            stack,
+                            &function.parameters,
+                            &function.body,
+                            node,
+                            global_environment,
+                            || new_call_frame.clone(),
+                        );
+                        let curr_frame = stack.borrow_mut().pop().unwrap();
+                        let mut result_frame = CallFrame {
+                            name: name.to_string(),
+                            locals: Environment::new(),
+                        };
+                        for (name, v) in curr_frame.locals.variables {
+                            // let mut locals = &mut call_frame.locals;
+                            result_frame
+                                .locals
+                                .assign_variable(name.to_string(), v.clone());
+                        }
+                        stack
+                            .borrow_mut()
+                            .current_frame_mut()
+                            .locals
+                            .assign_variable(
+                                name.to_string(),
+                                Rc::new(RefCell::new(Closure {
+                                    function: function.clone(),
+                                    call_frame: result_frame,
+                                })),
+                            );
+                        Some(r)
+                    }
                     _ => None,
                 }
             } else {
@@ -824,7 +891,7 @@ pub fn evaluate_node(
                     .clone();
                 let fun_ref = fun.borrow();
                 mem::drop(global_environment_ref);
-                evaluate_function(
+                let r = evaluate_function(
                     stack,
                     &fun_ref.parameters,
                     &fun_ref.body,
@@ -834,7 +901,9 @@ pub fn evaluate_node(
                         name: name.to_string(),
                         locals: Environment::new(),
                     },
-                )
+                );
+                stack.borrow_mut().pop();
+                r
             }
         }
         Node::Block { statements } => {
@@ -1068,8 +1137,7 @@ pub fn evaluate_node(
     }
 }
 
-use crate::ast::Node::FunctionDeclaration;
-use crate::interpreter::Value::{Return, StructInstance, Undefined, Void};
+use crate::interpreter::Value::{Closure, Return, StructInstance, Undefined, Void};
 use std::fmt::Octal;
 use std::ops::{Deref, DerefMut};
 
@@ -1914,9 +1982,10 @@ mod tests {
 
         g: () -> int = f();
         g();
+        g();
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(1), *res.borrow().deref());
+        assert_eq!(Value::Integer(2), *res.borrow().deref());
     }
 }
