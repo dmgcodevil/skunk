@@ -159,7 +159,6 @@ struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
 }
 
-
 impl Environment {
     fn new() -> Self {
         Environment {
@@ -207,9 +206,7 @@ impl Environment {
         //println!("Environment::declare_variable={}", name);
         self.variables.insert(name.to_string(), value);
     }
-
 }
-
 
 trait ValueModifier {
     fn set(&mut self, value: Rc<RefCell<Value>>);
@@ -286,8 +283,7 @@ struct StackVariableModifier {
 impl ValueModifier for StackVariableModifier {
     fn set(&mut self, value: Rc<RefCell<Value>>) {
         let mut stack = self.stack.borrow_mut();
-        stack
-            .assign_variable(&self.name, Rc::clone(&value));
+        stack.assign_variable(&self.name, Rc::clone(&value));
     }
 
     fn get(&self) -> Rc<RefCell<Value>> {
@@ -352,7 +348,6 @@ fn to_1d_pos(coordinates: &Vec<i64>, dimensions: &Vec<i64>) -> usize {
     res
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallFrame {
     name: String,
@@ -360,17 +355,15 @@ pub struct CallFrame {
 }
 
 impl CallFrame {
-
-
-    fn new(name:String) -> Self {
+    fn new(name: String) -> Self {
         CallFrame {
-            name:name.to_string(),
-            env:Rc::new(RefCell::new(Environment::new()))
+            name: name.to_string(),
+            env: Rc::new(RefCell::new(Environment::new())),
         }
     }
 
     fn set_parent(&mut self, parent: Rc<RefCell<Environment>>) {
-       // println!("CallFrame-{}:: set_parent", self.name);
+        // println!("CallFrame-{}:: set_parent", self.name);
         let mut env = self.env.borrow_mut();
         if let Some(old_parent) = &env.parent {
             let old_parent = old_parent.borrow();
@@ -394,7 +387,7 @@ impl CallFrame {
     }
 
     fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
-       // println!("CallFrame-{}::declare_variable {}", self.name, name);
+        // println!("CallFrame-{}::declare_variable {}", self.name, name);
         let mut env_ref = self.env.borrow_mut();
         env_ref.declare_variable(name, value);
         drop(env_ref);
@@ -476,7 +469,7 @@ impl CallStack {
         unreachable!("var {} doesn't exist", name);
     }
 
-    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>)  {
+    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
         self.current_frame_mut().declare_variable(name, value);
     }
 
@@ -491,7 +484,6 @@ impl CallStack {
             .last_mut()
             .expect("call stack underflow: no active frames")
     }
-
 }
 
 pub fn evaluate(node: &Node) -> Rc<RefCell<Value>> {
@@ -545,9 +537,12 @@ fn resolve_member_access(
                 let fun_def = struct_def.functions.get(name).unwrap();
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
-                stack.borrow_mut()
+                stack
+                    .borrow_mut()
                     .create_frame_push(format!("{}.{}", struct_def.name, name));
-                stack.borrow_mut().declare_variable("self", Rc::clone(&current_value));
+                stack
+                    .borrow_mut()
+                    .declare_variable("self", Rc::clone(&current_value));
 
                 let res = evaluate_function(
                     stack,
@@ -659,7 +654,9 @@ fn evaluate_function(
         for arg in arguments {
             let first = arg.0.name.clone();
             let second = arg.1;
-            stack.borrow_mut().declare_variable(first.as_str(), Rc::clone(&second))
+            stack
+                .borrow_mut()
+                .declare_variable(first.as_str(), Rc::clone(&second))
         }
         let mut result = Rc::new(RefCell::new(Undefined));
         for n in body {
@@ -790,9 +787,7 @@ pub fn evaluate_node(
                 Rc::new(RefCell::new(Undefined))
             };
 
-            stack
-                .borrow_mut()
-                .declare_variable(name, value);
+            stack.borrow_mut().declare_variable(name, value);
 
             Rc::new(RefCell::new(Value::Variable(name.to_string())))
         }
@@ -1111,6 +1106,10 @@ pub fn evaluate_node(
                     Operator::Or => Rc::new(RefCell::new(Value::Boolean(*a || *b))),
                     _ => panic!("Unsupported operator"),
                 },
+                (Value::String(s1), Value::String(s2)) => match operator {
+                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s1, s2)))),
+                    _ => panic!("Unsupported operator for string concatenation"),
+                },
                 (Value::String(s), Value::Integer(i)) => match operator {
                     Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s, i)))),
                     _ => panic!("Unsupported operator for string concatenation"),
@@ -1140,7 +1139,9 @@ pub fn evaluate_node(
         }
         Node::Identifier(name) => {
             let stack_ref = stack.borrow();
-            let v = stack_ref.get_variable(name).expect(format!("variable '{}' does not exist", name).as_str());
+            let v = stack_ref
+                .get_variable(name)
+                .expect(format!("variable '{}' does not exist", name).as_str());
             let res = Rc::clone(&v);
             drop(stack_ref);
             res
@@ -2048,5 +2049,41 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(3), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_nested_closures() {
+        let source_code = r#"
+        i: int = 0;
+
+        a: () -> () -> int = function(): () -> int {
+            i = i + 1;
+            j: int = 0;
+
+            b: () -> () -> int = function(): () -> int {
+                i = i + 1;
+                j = j + 1;
+                k: int = 0;
+
+                c: () -> int = function(): int {
+                    i = i + 1;
+                    j = j + 1;
+                    k = k + 1;
+                    return i + j + k;
+                }
+
+                return c;
+            }
+
+            return b();
+        }
+
+        f: () -> int = a();
+        f();
+        "#;
+
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(6), *res.borrow().deref());
     }
 }
