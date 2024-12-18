@@ -43,11 +43,11 @@ struct Point {
     x: int;
     y: int;
 
-    function set_x(x: int): void {
+    function set_x(self, x: int): void {
         self.x = x;
     }
 
-    function get_x(): int {
+    function get_x(self): int {
         return self.x;
     }
 }
@@ -63,7 +63,7 @@ function main(): void {
 ```skunk
 function main(): void {
     arr: int[3] = [1, 2, 3];
-    for (i: int = 0; i < 3; i = i + 1) {
+    for (i: int = 0; i < arr.len; i = i + 1) {
         print(arr[i]);
     }
 }

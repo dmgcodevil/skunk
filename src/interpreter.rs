@@ -1431,12 +1431,24 @@ mod tests {
             let source_code = r#"
             arr: int[3] = int[3]::new(1);
             arr[3] = 10;
-        "#;
+            "#;
             let program = ast::parse(source_code);
             let result = std::panic::catch_unwind(|| {
                 evaluate(&program);
             });
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_array_len() {
+            let source_code = r#"
+            arr: int[3] = int[3]::new(1);
+            arr.len;
+            "#;
+            let program = ast::parse(source_code);
+            let res = evaluate(&program);
+            let res_ref = res.borrow();
+            assert_eq!(Value::Integer(3), *res_ref.deref());
         }
 
         #[test]
@@ -1904,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_recursive() {
+    fn test_lambda_recursive() {
         let source_code = r#"
         factorial: (int) -> int = function(n: int): int {
             if (n == 0) {
@@ -1921,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_pass_as_arg() {
+    fn test_lambda_pass_as_arg() {
         let source_code = r#"
             function f(g: () -> int):int {
                 return g();
@@ -1937,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_function() {
+    fn test_anonymous_function() {
         let source_code = r#"
         function f(g: () -> int): int {
             return g();
@@ -1954,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_function_with_params() {
+    fn test_anonymous_function_with_params() {
         let source_code = r#"
         function f(g: (int) -> int): int {
             return g(47);
@@ -2008,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn test_outer() {
+    fn test_closure_capture_outer() {
         let source_code = r#"
             count: int = 0;
             task: () -> int = function(): int {
