@@ -38,6 +38,7 @@ pub enum Value {
     },
     Closure {
         function: FunctionDefinition,
+        env: Rc<RefCell<Environment>>,
     },
     Return(Rc<RefCell<Value>>),
     Executed, // indicates that a branch has been executed
@@ -154,9 +155,61 @@ impl GlobalEnvironment {
 
 #[derive(Debug, PartialEq, Clone)]
 struct Environment {
+    parent: Option<Rc<RefCell<Environment>>>,
     variables: HashMap<String, Rc<RefCell<Value>>>,
-    overridable: bool,
 }
+
+
+impl Environment {
+    fn new() -> Self {
+        Environment {
+            parent: None,
+            variables: HashMap::new(),
+        }
+    }
+
+    fn has_variable(&self, name: &str) -> bool {
+        //println!("Environment::has_variable={}", name);
+        if self.variables.contains_key(name) {
+            return true;
+        }
+        if let Some(parent) = &self.parent {
+            let parent_ref = parent.borrow();
+            let result = parent_ref.has_variable(name);
+            return result;
+        }
+        false
+    }
+
+    fn get_var(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+        //println!("Environment::get_var={}", name);
+        if self.variables.contains_key(name) {
+            Some(self.variables.get(name).unwrap().clone())
+        } else if let Some(parent) = &self.parent {
+            let mut parent_ref = parent.borrow();
+            parent_ref.get_var(name)
+        } else {
+            None
+        }
+    }
+
+    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+        //println!("Environment::assign_variable={}", name);
+        if self.variables.contains_key(name) {
+            self.variables.insert(name.to_string(), value);
+        } else if let Some(parent) = self.parent.clone() {
+            let mut parent_ref = parent.borrow_mut();
+            parent_ref.assign_variable(name, value);
+        }
+    }
+
+    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+        //println!("Environment::declare_variable={}", name);
+        self.variables.insert(name.to_string(), value);
+    }
+
+}
+
 
 trait ValueModifier {
     fn set(&mut self, value: Rc<RefCell<Value>>);
@@ -234,8 +287,7 @@ impl ValueModifier for StackVariableModifier {
     fn set(&mut self, value: Rc<RefCell<Value>>) {
         let mut stack = self.stack.borrow_mut();
         stack
-            .deref_mut()
-            .set_variable(&self.name, Rc::clone(&value));
+            .assign_variable(&self.name, Rc::clone(&value));
     }
 
     fn get(&self) -> Rc<RefCell<Value>> {
@@ -300,48 +352,60 @@ fn to_1d_pos(coordinates: &Vec<i64>, dimensions: &Vec<i64>) -> usize {
     res
 }
 
-impl Environment {
-    fn new() -> Self {
-        Environment {
-            variables: HashMap::new(),
-            overridable: false,
-        }
-    }
-    fn overridable() -> Self {
-        Environment {
-            variables: HashMap::new(),
-            overridable: true,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallFrame {
     name: String,
-    locals: Environment,
+    env: Rc<RefCell<Environment>>,
 }
 
 impl CallFrame {
-    fn to_overridable(&self, name: String) -> CallFrame {
+
+
+    fn new(name:String) -> Self {
         CallFrame {
-            name,
-            locals: Environment {
-                variables: self.locals.variables.clone(),
-                overridable: true,
-            },
+            name:name.to_string(),
+            env:Rc::new(RefCell::new(Environment::new()))
         }
     }
 
-    fn has_variable(&self, name: &str) -> bool {
-        self.locals.variables.contains_key(name)
+    fn set_parent(&mut self, parent: Rc<RefCell<Environment>>) {
+       // println!("CallFrame-{}:: set_parent", self.name);
+        let mut env = self.env.borrow_mut();
+        if let Some(old_parent) = &env.parent {
+            let old_parent = old_parent.borrow();
+            assert_ne!(*old_parent.deref(), *parent.borrow().deref());
+        }
+        env.parent = Some(parent);
+        drop(env)
     }
 
-    fn set_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
-        self.locals.variables.insert(name.to_string(), value);
+    fn has_variable(&self, name: &str) -> bool {
+        //println!("CallFrame-{}::has_variable {}", self.name, name);
+        let env_ref = self.env.borrow();
+        env_ref.has_variable(name)
+    }
+
+    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+        //println!("CallFrame-{}::has_variable {}", self.name, name);
+        let mut env_ref = self.env.borrow_mut();
+        env_ref.assign_variable(name, value);
+        drop(env_ref);
+    }
+
+    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+       // println!("CallFrame-{}::declare_variable {}", self.name, name);
+        let mut env_ref = self.env.borrow_mut();
+        env_ref.declare_variable(name, value);
+        drop(env_ref);
     }
 
     fn get_variable(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
-        self.locals.variables.get(name).cloned()
+        //println!("CallFrame-{}::get_variable {}", self.name, name);
+        let env_ref = self.env.borrow();
+        let res = env_ref.get_var(name);
+        drop(env_ref);
+        res
     }
 }
 
@@ -361,6 +425,23 @@ impl CallStack {
 
     fn pop(&mut self) -> Option<CallFrame> {
         self.frames.pop()
+    }
+
+    // create frame and sets its env.parent = current_frame.env
+    fn create_frame(&self, name: String) -> CallFrame {
+        let mut frame = CallFrame {
+            name: name.to_string(),
+            env: Rc::new(RefCell::new(Environment::new())),
+        };
+        if let Some(curr) = self.frames.last() {
+            frame.set_parent(curr.env.clone());
+        }
+        frame
+    }
+
+    fn create_frame_push(&mut self, name: String) {
+        let frame = self.create_frame(name);
+        self.frames.push(frame);
     }
 
     fn get_closure(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
@@ -385,14 +466,18 @@ impl CallStack {
         None
     }
 
-    fn set_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) -> bool {
+    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) -> bool {
         for frame in self.frames.iter_mut().rev() {
             if frame.has_variable(name) {
-                frame.set_variable(name, value.clone());
+                frame.assign_variable(name, value);
                 return true;
             }
         }
-        false
+        unreachable!("var {} doesn't exist", name);
+    }
+
+    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>)  {
+        self.current_frame_mut().declare_variable(name, value);
     }
 
     fn current_frame(&self) -> &CallFrame {
@@ -406,6 +491,7 @@ impl CallStack {
             .last_mut()
             .expect("call stack underflow: no active frames")
     }
+
 }
 
 pub fn evaluate(node: &Node) -> Rc<RefCell<Value>> {
@@ -413,7 +499,7 @@ pub fn evaluate(node: &Node) -> Rc<RefCell<Value>> {
     let ge = Rc::new(RefCell::new(GlobalEnvironment::new()));
     stack.borrow_mut().push(CallFrame {
         name: "main".to_string(),
-        locals: Environment::new(),
+        env: Rc::new(RefCell::new(Environment::new())),
     });
     evaluate_node(node, &stack, &ge)
 }
@@ -459,6 +545,10 @@ fn resolve_member_access(
                 let fun_def = struct_def.functions.get(name).unwrap();
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
+                let mut frame = stack.borrow_mut()
+                    .create_frame(format!("{}.{}", struct_def.name, name));
+                frame.declare_variable("self", Rc::clone(&current_value));
+
                 let res = evaluate_function(
                     stack,
                     &fun_def.parameters,
@@ -466,12 +556,7 @@ fn resolve_member_access(
                     member_ref,
                     global_environment,
                     || {
-                        let mut frame = CallFrame {
-                            name: format!("{}.{}", struct_def.name, name),
-                            locals: Environment::new(),
-                        };
-                        frame.set_variable("self", Rc::clone(&current_value));
-                        frame
+                        frame.clone()
                     },
                 );
                 // stack.borrow_mut().pop();
@@ -582,7 +667,7 @@ where
         for arg in arguments {
             let first = arg.0.name.clone();
             let second = arg.1;
-            frame.set_variable(first.as_str(), Rc::clone(&second));
+            frame.declare_variable(first.as_str(), Rc::clone(&second));
         }
         stack.borrow_mut().push(frame);
 
@@ -688,7 +773,7 @@ pub fn evaluate_node(
                 // println!("create closure. function {:?}, {:?} ", func_def, frame);
                 Rc::new(RefCell::new(Value::Closure {
                     function: func_def,
-                    // call_frame: frame,
+                    env: frame.env,
                 }))
             } else {
                 Rc::new(RefCell::new(Value::Function {
@@ -720,8 +805,7 @@ pub fn evaluate_node(
 
             stack
                 .borrow_mut()
-                .current_frame_mut()
-                .set_variable(name, value);
+                .declare_variable(name, value);
 
             Rc::new(RefCell::new(Value::Variable(name.to_string())))
         }
@@ -815,11 +899,6 @@ pub fn evaluate_node(
         )
         .get(),
         Node::FunctionCall { name, .. } => {
-            // println!(
-            //     "function '{:?}' call frame={:?}",
-            //     name,
-            //     stack.borrow().current_frame()
-            // );
             let value_opt = {
                 let stack_ref = stack.borrow();
                 stack_ref.get_closure(name)
@@ -828,17 +907,17 @@ pub fn evaluate_node(
             let res = if let Some(value) = value_opt {
                 let value_ref = value.borrow();
                 match value_ref.deref() {
-                    Value::Closure { function } => {
+                    Value::Closure { function, env } => {
+                        let mut frame = CallFrame::new(name.to_string());
+                        frame.set_parent(env.clone());
+
                         let r = evaluate_function(
                             stack,
                             &function.parameters,
                             &function.body,
                             node,
                             global_environment,
-                            || CallFrame {
-                                name: "".to_string(),
-                                locals: Environment::new(),
-                            },
+                            || frame.clone()
                         );
                         Some(r)
                     }
@@ -858,32 +937,23 @@ pub fn evaluate_node(
                     .clone();
                 let fun_ref = fun.borrow();
                 mem::drop(global_environment_ref);
+                let frame = stack.borrow().create_frame(name.to_string());
                 let r = evaluate_function(
                     stack,
                     &fun_ref.parameters,
                     &fun_ref.body,
                     node,
                     global_environment,
-                    || CallFrame {
-                        name: name.to_string(),
-                        locals: Environment::new(),
-                    },
+                    || frame.clone(),
                 );
                 // stack.borrow_mut().pop();
                 r
             }
         }
         Node::Block { statements } => {
-            let mut frame = CallFrame {
-                name: "".to_string(),
-                locals: Environment::overridable(),
-            };
             let mut stack_ref = stack.borrow_mut();
-            for (n, v) in &stack_ref.deref().current_frame().locals.variables {
-                frame.locals.variables.insert(n.to_string(), v.clone());
-            }
-            stack_ref.frames.push(frame);
-            mem::drop(stack_ref);
+            stack_ref.create_frame_push("".to_string());
+            drop(stack_ref);
             let mut res = Rc::new(RefCell::new(Undefined));
             for statement in statements {
                 res = evaluate_node(statement, stack, global_environment);
@@ -1969,6 +2039,32 @@ mod tests {
             }
             task();
         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(3), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_closure_outer() {
+        let source_code = r#"
+        function f(times:int): () -> int {
+            count: int = 0;
+            g: () -> int = function(): int {
+                count = count + 1;
+                if (count == times) {
+                    return count;
+                } else {
+                    return g();
+                }
+            }
+            return g;
+        }
+
+         run: () -> int = f(3);
+         run();
+
+        "#;
+
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(3), *res.borrow().deref());
