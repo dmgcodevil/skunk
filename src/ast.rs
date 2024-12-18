@@ -453,7 +453,6 @@ impl PestImpl {
     }
 
     fn create_struct_init(&self, pair: Pair<Rule>) -> Node {
-        println!("{:?}", pair);
         let mut inner_pairs = pair.into_inner();
         let name_pair = inner_pairs.next().unwrap();
         let name = self.create_identifier(name_pair);
@@ -498,7 +497,6 @@ impl PestImpl {
         let line_num = line_pos.0;
         let col = line_pos.1;
         let input = span.as_str().to_string();
-        println!("{:?}", span);
         Metadata {
             span: Span {
                 start: col,
@@ -2770,6 +2768,20 @@ mod tests {
         });
         "#;
 
+        println!("{:?}", parse(source_code));
+    }
+
+    #[test]
+    fn test_return_function() {
+        let source_code = r#"
+        function f(): (int) -> int {
+            return function(a:int):int {
+                return a;
+            }
+        }
+        g: (int) -> int = f();
+        g(47);
+        "#;
         println!("{:?}", parse(source_code));
     }
 }
