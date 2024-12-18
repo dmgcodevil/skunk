@@ -545,9 +545,9 @@ fn resolve_member_access(
                 let fun_def = struct_def.functions.get(name).unwrap();
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
-                let mut frame = stack.borrow_mut()
-                    .create_frame(format!("{}.{}", struct_def.name, name));
-                frame.declare_variable("self", Rc::clone(&current_value));
+                stack.borrow_mut()
+                    .create_frame_push(format!("{}.{}", struct_def.name, name));
+                stack.borrow_mut().declare_variable("self", Rc::clone(&current_value));
 
                 let res = evaluate_function(
                     stack,
@@ -555,12 +555,9 @@ fn resolve_member_access(
                     &fun_def.body,
                     member_ref,
                     global_environment,
-                    || {
-                        frame.clone()
-                    },
                 );
-                // stack.borrow_mut().pop();
-                mem::drop(global_environment_ref);
+                stack.borrow_mut().pop();
+                drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
             }
             _ => panic!("expected member access, found {:?}", member_ref),
@@ -639,17 +636,13 @@ fn resolve_access(
     current_modifier
 }
 
-fn evaluate_function<F>(
+fn evaluate_function(
     stack: &Rc<RefCell<CallStack>>,
     parameters: &Vec<Parameter>,
     body: &Vec<Node>,
     call_node: &Node,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    frame_creator: F,
-) -> Rc<RefCell<Value>>
-where
-    F: Fn() -> CallFrame,
-{
+) -> Rc<RefCell<Value>> {
     if let Node::FunctionCall {
         name: _, arguments, ..
     } = call_node
@@ -663,14 +656,11 @@ where
             .filter(|p| p.sk_type != Type::SkSelf) // self is added to call stack implicitly
             .zip(args_values.into_iter())
             .collect();
-        let mut frame = frame_creator();
         for arg in arguments {
             let first = arg.0.name.clone();
             let second = arg.1;
-            frame.declare_variable(first.as_str(), Rc::clone(&second));
+            stack.borrow_mut().declare_variable(first.as_str(), Rc::clone(&second))
         }
-        stack.borrow_mut().push(frame);
-
         let mut result = Rc::new(RefCell::new(Undefined));
         for n in body {
             if let Value::Return(v) = evaluate_node(&n, stack, global_environment)
@@ -681,7 +671,6 @@ where
                 break;
             }
         }
-        stack.borrow_mut().pop();
         result
     } else {
         panic!("expected Node::FunctionCall")
@@ -770,7 +759,6 @@ pub fn evaluate_node(
 
             if *lambda {
                 let frame = stack.borrow().current_frame().clone();
-                // println!("create closure. function {:?}, {:?} ", func_def, frame);
                 Rc::new(RefCell::new(Value::Closure {
                     function: func_def,
                     env: frame.env,
@@ -801,7 +789,6 @@ pub fn evaluate_node(
             } else {
                 Rc::new(RefCell::new(Undefined))
             };
-            // println!("declared variable {:?}={:?}", name, value);
 
             stack
                 .borrow_mut()
@@ -910,6 +897,7 @@ pub fn evaluate_node(
                     Value::Closure { function, env } => {
                         let mut frame = CallFrame::new(name.to_string());
                         frame.set_parent(env.clone());
+                        stack.borrow_mut().push(frame);
 
                         let r = evaluate_function(
                             stack,
@@ -917,8 +905,8 @@ pub fn evaluate_node(
                             &function.body,
                             node,
                             global_environment,
-                            || frame.clone()
                         );
+                        stack.borrow_mut().pop();
                         Some(r)
                     }
                     _ => None,
@@ -936,17 +924,16 @@ pub fn evaluate_node(
                     .expect(format!("function `{}` doesn't exist", name).as_str())
                     .clone();
                 let fun_ref = fun.borrow();
-                mem::drop(global_environment_ref);
-                let frame = stack.borrow().create_frame(name.to_string());
+                drop(global_environment_ref);
+                stack.borrow_mut().create_frame_push(name.to_string());
                 let r = evaluate_function(
                     stack,
                     &fun_ref.parameters,
                     &fun_ref.body,
                     node,
                     global_environment,
-                    || frame.clone(),
                 );
-                // stack.borrow_mut().pop();
+                stack.borrow_mut().pop();
                 r
             }
         }
@@ -1152,17 +1139,10 @@ pub fn evaluate_node(
             Rc::new(RefCell::new(Void))
         }
         Node::Identifier(name) => {
-            /*
-            why we need stack_ref as a separate var:
-            The issue you're encountering stems from the fact that calling stack.borrow() creates a
-            temporary value (Ref from the RefCell), and when you chain .current_frame() on it,
-            that temporary Ref is dropped at the end of the statement, leading to a lifetime issue.
-            */
-            let stack_ref = stack.borrow(); // Borrow the RefCell
-            let current_frame = stack_ref.current_frame(); // Access the current frame with a valid borrow
-            let v = stack_ref.get_variable(name).unwrap(); //current_frame.locals.get_variable_value(name);
+            let stack_ref = stack.borrow();
+            let v = stack_ref.get_variable(name).expect(format!("variable '{}' does not exist", name).as_str());
             let res = Rc::clone(&v);
-            mem::drop(stack_ref);
+            drop(stack_ref);
             res
         }
         Node::EOI => Rc::new(RefCell::new(Void)),
