@@ -38,7 +38,6 @@ pub enum Value {
     },
     Closure {
         function: FunctionDefinition,
-        call_frame: CallFrame,
     },
     Return(Rc<RefCell<Value>>),
     Executed, // indicates that a branch has been executed
@@ -156,7 +155,6 @@ impl GlobalEnvironment {
 #[derive(Debug, PartialEq, Clone)]
 struct Environment {
     variables: HashMap<String, Rc<RefCell<Value>>>,
-    closures: HashMap<String, Rc<RefCell<Value>>>, //todo remove, instead traverse call stack upwards
     overridable: bool,
 }
 
@@ -237,9 +235,7 @@ impl ValueModifier for StackVariableModifier {
         let mut stack = self.stack.borrow_mut();
         stack
             .deref_mut()
-            .current_frame_mut()
-            .locals
-            .assign_variable(self.name.clone(), Rc::clone(&value));
+            .set_variable(&self.name, Rc::clone(&value));
     }
 
     fn get(&self) -> Rc<RefCell<Value>> {
@@ -247,9 +243,8 @@ impl ValueModifier for StackVariableModifier {
         Rc::clone(
             &stack
                 .deref()
-                .current_frame()
-                .locals
-                .get_variable_value(&self.name.clone()),
+                .get_variable(&self.name)
+                .expect(format!("Variable '{}' not found", self.name).as_str()),
         )
     }
 }
@@ -309,40 +304,14 @@ impl Environment {
     fn new() -> Self {
         Environment {
             variables: HashMap::new(),
-            closures: HashMap::new(),
             overridable: false,
         }
     }
     fn overridable() -> Self {
         Environment {
             variables: HashMap::new(),
-            closures: HashMap::new(),
             overridable: true,
         }
-    }
-
-    fn declare_variable(&mut self, name: String, value: Rc<RefCell<Value>>) {
-        // todo assert that variable doesn't already exists
-        self.variables.insert(name.to_string(), value);
-    }
-
-    fn assign_variable(&mut self, name: String, value: Rc<RefCell<Value>>) {
-        // todo assert that var exists
-        self.variables.insert(name, value);
-    }
-
-    fn get_variable_value(&self, name: &str) -> &Rc<RefCell<Value>> {
-        if let Some(var) = self.variables.get(name) {
-            return var;
-        }
-        if let Some(var) = self.closures.get(name) {
-            return var;
-        }
-        panic!("variable '{}' not declared", name);
-    }
-
-    fn declare_closure(&mut self, name: String, value: Rc<RefCell<Value>>) {
-        self.closures.insert(name, value);
     }
 }
 
@@ -358,10 +327,21 @@ impl CallFrame {
             name,
             locals: Environment {
                 variables: self.locals.variables.clone(),
-                closures: self.locals.closures.clone(),
                 overridable: true,
             },
         }
+    }
+
+    fn has_variable(&self, name: &str) -> bool {
+        self.locals.variables.contains_key(name)
+    }
+
+    fn set_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+        self.locals.variables.insert(name.to_string(), value);
+    }
+
+    fn get_variable(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+        self.locals.variables.get(name).cloned()
     }
 }
 
@@ -381,6 +361,38 @@ impl CallStack {
 
     fn pop(&mut self) -> Option<CallFrame> {
         self.frames.pop()
+    }
+
+    fn get_closure(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+        for frame in self.frames.iter().rev() {
+            if frame.has_variable(name) {
+                let val = frame.get_variable(name).unwrap();
+                let val_ref = val.borrow();
+                if let Closure { .. } = val_ref.deref() {
+                    return frame.get_variable(name);
+                }
+            }
+        }
+        None
+    }
+
+    fn get_variable(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+        for frame in self.frames.iter().rev() {
+            if frame.has_variable(name) {
+                return frame.get_variable(name);
+            }
+        }
+        None
+    }
+
+    fn set_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) -> bool {
+        for frame in self.frames.iter_mut().rev() {
+            if frame.has_variable(name) {
+                frame.set_variable(name, value.clone());
+                return true;
+            }
+        }
+        false
     }
 
     fn current_frame(&self) -> &CallFrame {
@@ -458,13 +470,11 @@ fn resolve_member_access(
                             name: format!("{}.{}", struct_def.name, name),
                             locals: Environment::new(),
                         };
-                        frame
-                            .locals
-                            .assign_variable("self".to_string(), Rc::clone(&current_value));
+                        frame.set_variable("self", Rc::clone(&current_value));
                         frame
                     },
                 );
-                stack.borrow_mut().pop();
+                // stack.borrow_mut().pop();
                 mem::drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
             }
@@ -572,16 +582,7 @@ where
         for arg in arguments {
             let first = arg.0.name.clone();
             let second = arg.1;
-
-            let second_ref = second.borrow();
-            match second_ref.deref() {
-                Value::Closure { .. } => {
-                    frame.locals.declare_closure(first, Rc::clone(&second));
-                }
-                _ => {
-                    frame.locals.declare_variable(first, Rc::clone(&second));
-                }
-            }
+            frame.set_variable(first.as_str(), Rc::clone(&second));
         }
         stack.borrow_mut().push(frame);
 
@@ -595,7 +596,7 @@ where
                 break;
             }
         }
-        // stack.borrow_mut().pop();
+        stack.borrow_mut().pop();
         result
     } else {
         panic!("expected Node::FunctionCall")
@@ -687,7 +688,7 @@ pub fn evaluate_node(
                 // println!("create closure. function {:?}, {:?} ", func_def, frame);
                 Rc::new(RefCell::new(Value::Closure {
                     function: func_def,
-                    call_frame: frame,
+                    // call_frame: frame,
                 }))
             } else {
                 Rc::new(RefCell::new(Value::Function {
@@ -717,25 +718,10 @@ pub fn evaluate_node(
             };
             // println!("declared variable {:?}={:?}", name, value);
 
-            let value_ref = value.borrow();
-            match value_ref.deref() {
-                Closure { .. } => {
-                    drop(value_ref);
-                    stack
-                        .borrow_mut()
-                        .current_frame_mut()
-                        .locals
-                        .declare_closure(name.to_string(), value)
-                }
-                _ => {
-                    drop(value_ref);
-                    stack
-                        .borrow_mut()
-                        .current_frame_mut()
-                        .locals
-                        .declare_variable(name.to_string(), value)
-                }
-            }
+            stack
+                .borrow_mut()
+                .current_frame_mut()
+                .set_variable(name, value);
 
             Rc::new(RefCell::new(Value::Variable(name.to_string())))
         }
@@ -836,58 +822,24 @@ pub fn evaluate_node(
             // );
             let value_opt = {
                 let stack_ref = stack.borrow();
-                stack_ref.current_frame().locals.closures.get(name).cloned()
+                stack_ref.get_closure(name)
             };
 
             let res = if let Some(value) = value_opt {
                 let value_ref = value.borrow();
                 match value_ref.deref() {
-                    Value::Closure {
-                        function,
-                        call_frame,
-                    } => {
-                        // let closure_stack = CallStack::new();
-                        // closure_stack.push(*call_frame);
-
-                        let mut new_call_frame = call_frame.clone();
-                        new_call_frame
-                            .locals
-                            .declare_closure(name.to_string(), value.clone());
-
-                        //println!("function closure start frame={:?}", new_call_frame);
-
-                        // println!("function closure frame={:?}", call_frame);
+                    Value::Closure { function } => {
                         let r = evaluate_function(
                             stack,
                             &function.parameters,
                             &function.body,
                             node,
                             global_environment,
-                            || new_call_frame.clone(),
+                            || CallFrame {
+                                name: "".to_string(),
+                                locals: Environment::new(),
+                            },
                         );
-                        let curr_frame = stack.borrow_mut().pop().unwrap();
-                        // println!("function closure end frame={:?}", curr_frame);
-                        let mut result_frame = CallFrame {
-                            name: name.to_string(),
-                            locals: Environment::new(),
-                        };
-                        for (name, v) in curr_frame.locals.variables {
-                            // let mut locals = &mut call_frame.locals;
-                            result_frame
-                                .locals
-                                .assign_variable(name.to_string(), v.clone());
-                        }
-                        stack
-                            .borrow_mut()
-                            .current_frame_mut()
-                            .locals
-                            .declare_closure(
-                                name.to_string(),
-                                Rc::new(RefCell::new(Closure {
-                                    function: function.clone(),
-                                    call_frame: result_frame,
-                                })),
-                            );
                         Some(r)
                     }
                     _ => None,
@@ -917,7 +869,7 @@ pub fn evaluate_node(
                         locals: Environment::new(),
                     },
                 );
-                stack.borrow_mut().pop();
+                // stack.borrow_mut().pop();
                 r
             }
         }
@@ -1138,7 +1090,7 @@ pub fn evaluate_node(
             */
             let stack_ref = stack.borrow(); // Borrow the RefCell
             let current_frame = stack_ref.current_frame(); // Access the current frame with a valid borrow
-            let v = current_frame.locals.get_variable_value(name);
+            let v = stack_ref.get_variable(name).unwrap(); //current_frame.locals.get_variable_value(name);
             let res = Rc::clone(&v);
             mem::drop(stack_ref);
             res
@@ -1377,7 +1329,7 @@ mod tests {
                 arr: int[3] = int[3]::new(1);
                 return arr;
             }
-            arr = createArray();
+            arr:int[] = createArray();
             arr[2];
         "#;
             let program = ast::parse(source_code);
@@ -1890,7 +1842,7 @@ mod tests {
                 }
 
             }
-            list = List{size: 3, capacity: 2};
+            list:List = List{size: 3, capacity: 2};
             //list.has_space();
             list.grow();
             print("capacity=" + list.capacity);
@@ -1988,10 +1940,10 @@ mod tests {
     fn test_closure() {
         let source_code = r#"
         function f(): () -> int {
-            counter: int = 0;
+            c: int = 0;
             return function (): int {
-                counter = counter + 1;
-                return counter;
+                c = c + 1;
+                return c;
             }
         }
 
@@ -2002,5 +1954,23 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(2), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_outer() {
+        let source_code = r#"
+            count: int = 0;
+            task: () -> int = function(): int {
+                if(count == 3) {
+                    return 3;
+                }
+                count = count + 1;
+                return task();
+            }
+            task();
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(3), *res.borrow().deref());
     }
 }
