@@ -307,25 +307,19 @@ impl Profiling {
     fn sk_debug_stack(stack: &Rc<RefCell<CallStack>>) {
         let stack_ref = stack.borrow();
         println!("--- Debugging Call Stack ---");
-
-        // Traverse frames
         for (i, frame) in stack_ref.frames.iter().enumerate() {
             println!("Frame {}: {}", i, frame.name);
 
-            // Start from the current environment
             let mut current_env = Some(frame.env.clone());
 
             while let Some(env_rc) = current_env {
                 let env = env_rc.borrow();
 
-                // Print variables in the current environment
                 for (var_name, var_value) in &env.variables {
                     let var_value_ref = var_value.borrow();
                     println!("  Environment id: '{}'", &env.id);
                     println!("      Variable '{}' -> {:?}", var_name, var_value_ref);
                 }
-
-                // Move to the parent environment
                 current_env = env.parent.clone();
             }
 
