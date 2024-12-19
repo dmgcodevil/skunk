@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::{HashMap, LinkedList};
+use sysinfo::{Pid, System};
 
 use crate::ast;
 use ast::Literal;
@@ -294,6 +295,106 @@ impl ValueModifier for StackVariableModifier {
                 .get_variable(&self.name)
                 .expect(format!("Variable '{}' not found", self.name).as_str()),
         )
+    }
+}
+
+struct Profiling {}
+
+impl Profiling {
+    fn sk_debug_stack(stack: &Rc<RefCell<CallStack>>) {
+        let stack_ref = stack.borrow();
+        println!("--- Debugging Call Stack ---");
+
+        // Traverse frames
+        for (i, frame) in stack_ref.frames.iter().enumerate() {
+            println!("Frame {}: {}", i, frame.name);
+
+            // Start from the current environment
+            let mut current_env = Some(frame.env.clone());
+
+            while let Some(env_rc) = current_env {
+                let env = env_rc.borrow();
+
+                // Print variables in the current environment
+                for (var_name, var_value) in &env.variables {
+                    let var_value_ref = var_value.borrow();
+                    println!("  Variable '{}' -> {:?}", var_name, var_value_ref);
+                }
+
+                // Move to the parent environment
+                current_env = env.parent.clone();
+            }
+
+            println!("----------------------------");
+        }
+    }
+
+    fn sk_debug_mem_sysinfo() {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let current_pid = Pid::from_u32(std::process::id());
+        if let Some(process) = system.process(current_pid) {
+            println!("Current Process Information:");
+            println!("  Name: {:?}", process.name());
+            println!("  Executable Path: {:?}", process.exe());
+            println!("  Current Working Directory: {:?}", process.cwd());
+            println!("  Memory Usage: {:?} KB", process.memory());
+            println!("  Virtual Memory Usage: {:?} KB", process.virtual_memory());
+            println!("  CPU Usage: {:.2}%", process.cpu_usage());
+            println!("  Status: {:?}", process.status());
+        } else {
+            println!("Failed to retrieve information about the current process.");
+        }
+    }
+
+    fn estimate_value_size(value: &Rc<RefCell<Value>>) -> usize {
+        match &*value.borrow() {
+            Value::Integer(_) => std::mem::size_of::<i64>(),
+            Value::String(s) => std::mem::size_of::<String>() + s.capacity(),
+            Value::Array { arr, .. } => {
+                arr.iter()
+                    .map(|elem| Profiling::estimate_value_size(elem))
+                    .sum::<usize>()
+                    + std::mem::size_of::<Vec<Rc<RefCell<Value>>>>()
+            }
+            Value::StructInstance { fields, .. } => {
+                fields
+                    .iter()
+                    .map(|(_, v)| Profiling::estimate_value_size(v))
+                    .sum::<usize>()
+                    + std::mem::size_of::<HashMap<String, Rc<RefCell<Value>>>>()
+            }
+            Value::Function {
+                name,
+                parameters,
+                body,
+                ..
+            } => {
+                std::mem::size_of::<String>()
+                    + name.capacity()
+                    + parameters.len() * std::mem::size_of::<Parameter>()
+                    + body.len() * std::mem::size_of::<Node>()
+            }
+            Value::Closure { function, env } => {
+                std::mem::size_of_val(&function) + std::mem::size_of_val(env)
+            }
+            _ => 0, // Handle other cases as needed
+        }
+    }
+
+    fn sk_debug_mem_programmatic(stack: &CallStack) {
+        println!("Memory Usage (programmatic):");
+        for frame in &stack.frames {
+            println!("  Frame: {}", frame.name);
+            let frame_mem: usize = frame
+                .env
+                .borrow()
+                .variables
+                .values()
+                .map(|val| Profiling::estimate_value_size(val))
+                .sum();
+            println!("    Memory Used: {} bytes", frame_mem);
+        }
     }
 }
 
@@ -881,6 +982,17 @@ pub fn evaluate_node(
         )
         .get(),
         Node::FunctionCall { name, .. } => {
+            if name == "sk_debug_mem" {
+                Profiling::sk_debug_mem_sysinfo();
+                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
+                return Rc::new(RefCell::new(Value::Undefined));
+            }
+
+            if name == "sk_debug_stack" {
+                Profiling::sk_debug_stack(stack);
+                return Rc::new(RefCell::new(Value::Undefined));
+            }
+
             let value_opt = {
                 let stack_ref = stack.borrow();
                 stack_ref.get_closure(name)
@@ -920,7 +1032,9 @@ pub fn evaluate_node(
                     .clone();
                 let fun_ref = fun.borrow();
                 drop(global_environment_ref);
-                stack.borrow_mut().create_frame_push(name.to_string());
+                stack
+                    .borrow_mut()
+                    .create_frame_push(format!("function_call_{}", name));
                 let r = evaluate_function(
                     stack,
                     &fun_ref.parameters,
