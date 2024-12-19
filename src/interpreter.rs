@@ -12,6 +12,7 @@ use std::fmt;
 use std::io::BufRead;
 use std::mem;
 use std::rc::Rc;
+use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -156,6 +157,7 @@ impl GlobalEnvironment {
 
 #[derive(Debug, PartialEq, Clone)]
 struct Environment {
+    id: String,
     parent: Option<Rc<RefCell<Environment>>>,
     variables: HashMap<String, Rc<RefCell<Value>>>,
 }
@@ -163,6 +165,7 @@ struct Environment {
 impl Environment {
     fn new() -> Self {
         Environment {
+            id: Uuid::new_v4().to_string(),
             parent: None,
             variables: HashMap::new(),
         }
@@ -318,7 +321,8 @@ impl Profiling {
                 // Print variables in the current environment
                 for (var_name, var_value) in &env.variables {
                     let var_value_ref = var_value.borrow();
-                    println!("  Variable '{}' -> {:?}", var_name, var_value_ref);
+                    println!("  Environment id: '{}'", &env.id);
+                    println!("      Variable '{}' -> {:?}", var_name, var_value_ref);
                 }
 
                 // Move to the parent environment
