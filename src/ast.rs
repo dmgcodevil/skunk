@@ -73,8 +73,8 @@ pub enum Node {
         operand: Box<Node>,
     },
     FunctionCall {
-        name: String,         // The function name
-        arguments: Vec<Node>, // The arguments are a list of expression nodes
+        name: String,              // The function name
+        arguments: Vec<Vec<Node>>, // The arguments are a list of expression nodes
         metadata: Metadata,
     },
     ArrayAccess {
@@ -419,13 +419,23 @@ impl PestImpl {
         Node::Access { nodes }
     }
 
+    fn create_arg_list(&self, pair: Pair<Rule>) -> Vec<Node> {
+        assert_eq!(pair.as_rule(), Rule::arg_list);
+        let mut pairs = pair.into_inner();
+        let mut args: Vec<Node> = Vec::new();
+        while let Some(inner_pair) = pairs.next() {
+            args.push(self.create_ast(inner_pair));
+        }
+        args
+    }
+
     fn create_function_call(&self, pair: Pair<Rule>) -> Node {
         let metadata = (self.metadata_creator)(&pair);
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut arguments = Vec::new();
-        while let Some(arg_pair) = inner_pairs.next() {
-            arguments.push(self.create_ast(arg_pair));
+        while let Some(arg_list) = inner_pairs.next() {
+            arguments.push(self.create_arg_list(arg_list));
         }
         Node::FunctionCall {
             name,
@@ -1095,7 +1105,7 @@ mod tests {
                         var_type: Type::Int,
                         value: Some(Box::new(Node::FunctionCall {
                             name: "f".to_string(),
-                            arguments: [].to_vec(),
+                            arguments: [[].to_vec()].to_vec(),
                             metadata: Metadata::EMPTY
                         })),
                         metadata: Metadata::EMPTY
@@ -1274,10 +1284,10 @@ mod tests {
                             var_type: Type::Int,
                             value: Some(Box::new(Node::FunctionCall {
                                 name: "sum".to_string(),
-                                arguments: Vec::from([
+                                arguments: Vec::from([Vec::from([
                                     Node::Literal(Literal::Integer(1)),
                                     Node::Literal(Literal::Integer(2))
-                                ]),
+                                ])]),
                                 metadata: Metadata::EMPTY
                             })),
                             metadata: Metadata::EMPTY
@@ -1937,7 +1947,7 @@ mod tests {
                     },
                     Node::FunctionCall {
                         name: "test".to_string(),
-                        arguments: vec![],
+                        arguments: vec![vec![]],
                         metadata: Metadata::EMPTY
                     },
                     Node::EOI
@@ -2327,7 +2337,7 @@ mod tests {
                             Node::MemberAccess {
                                 member: Box::new(Node::FunctionCall {
                                     name: "f".to_string(),
-                                    arguments: [].to_vec(),
+                                    arguments: [[].to_vec()].to_vec(),
                                     metadata: Metadata::EMPTY
                                 }),
                                 metadata: Metadata::EMPTY
@@ -2768,20 +2778,110 @@ mod tests {
         });
         "#;
 
-        println!("{:?}", parse(source_code));
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::FunctionCall {
+                        name: "f".to_string(),
+                        arguments: vec![vec![Node::FunctionDeclaration {
+                            name: "anonymous".to_string(),
+                            parameters: vec![],
+                            return_type: Type::Int,
+                            body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(47))))],
+                            lambda: true,
+                        }]],
+                        metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
     }
 
     #[test]
     fn test_return_function() {
         let source_code = r#"
-        function f(): (int) -> int {
-            return function(a:int):int {
-                return a;
-            }
+    function f(): (int) -> int {
+        return function(a:int):int {
+            return a;
         }
-        g: (int) -> int = f();
-        g(47);
+    }
+    g: (int) -> int = f();
+    g(47);
+    "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::FunctionDeclaration {
+                        name: "f".to_string(),
+                        parameters: vec![], // Empty parameter list
+                        return_type: Type::Function {
+                            parameters: vec![Type::Int],
+                            return_type: Box::new(Type::Int),
+                        },
+                        body: vec![Node::Return(Box::new(Node::FunctionDeclaration {
+                            name: "anonymous".to_string(),
+                            parameters: vec![("a".to_string(), Type::Int)],
+                            return_type: Type::Int,
+                            body: vec![Node::Return(Box::new(Node::Access {
+                                nodes: vec![Node::Identifier("a".to_string())],
+                            }))],
+                            lambda: true,
+                        }))],
+                        lambda: false,
+                    },
+                    Node::VariableDeclaration {
+                        name: "g".to_string(),
+                        var_type: Type::Function {
+                            parameters: vec![Type::Int],
+                            return_type: Box::new(Type::Int),
+                        },
+                        value: Some(Box::new(Node::FunctionCall {
+                            name: "f".to_string(),
+                            arguments: vec![vec![]],
+                            metadata: Metadata::EMPTY
+                        })),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::FunctionCall {
+                        name: "g".to_string(),
+                        arguments: vec![vec![Node::Literal(Literal::Integer(47))]],
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_function_chain() {
+        let source_code = r#"
+            f()(1)(2,3);
         "#;
-        println!("{:?}", parse(source_code));
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::FunctionCall {
+                        name: "f".to_string(),
+                        arguments: vec![
+                            vec![],
+                            vec![Node::Literal(Literal::Integer(1))],
+                            vec![
+                                Node::Literal(Literal::Integer(2)),
+                                Node::Literal(Literal::Integer(3))
+                            ]
+                        ],
+                        metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
     }
 }
