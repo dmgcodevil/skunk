@@ -165,7 +165,7 @@ struct Environment {
 impl Environment {
     fn new() -> Self {
         Environment {
-            id: Uuid::new_v4().to_string(),
+            id: "".to_string(), //Uuid::new_v4().to_string(), // uncomment for debugging
             parent: None,
             variables: HashMap::new(),
         }
@@ -629,7 +629,7 @@ fn resolve_member_access(
                     _ => unreachable!("unsupported member access"),
                 }
             }
-            Node::FunctionCall { name, .. } => {
+            Node::FunctionCall { name, arguments, .. } => {
                 let global_environment_ref = global_environment.borrow();
                 let struct_def =
                     global_environment_ref.to_struct_def(current_value.borrow().deref());
@@ -645,6 +645,7 @@ fn resolve_member_access(
 
                 let res = evaluate_function(
                     stack,
+                    arguments.first().unwrap(),
                     &fun_def.parameters,
                     &fun_def.body,
                     member_ref,
@@ -732,13 +733,14 @@ fn resolve_access(
 
 fn evaluate_function(
     stack: &Rc<RefCell<CallStack>>,
+    arguments: &Vec<Node>,
     parameters: &Vec<Parameter>,
     body: &Vec<Node>,
     call_node: &Node,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> Rc<RefCell<Value>> {
     if let Node::FunctionCall {
-        name: _, arguments, ..
+        name: _, ..
     } = call_node
     {
         let args_values: Vec<_> = arguments
@@ -979,7 +981,7 @@ pub fn evaluate_node(
             nodes,
         )
         .get(),
-        Node::FunctionCall { name, .. } => {
+        Node::FunctionCall { name, arguments,.. } => {
             if name == "sk_debug_mem" {
                 Profiling::sk_debug_mem_sysinfo();
                 Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
@@ -997,6 +999,16 @@ pub fn evaluate_node(
             };
 
             let res = if let Some(value) = value_opt {
+                // we have closure
+                /*
+                iterate arguments groups
+                for each group execute evaluate_function
+                set the result
+
+
+                */
+
+
                 let value_ref = value.borrow();
                 match value_ref.deref() {
                     Value::Closure { function, env } => {
@@ -1004,8 +1016,11 @@ pub fn evaluate_node(
                         frame.set_parent(env.clone());
                         stack.borrow_mut().push(frame);
 
+                        // todo
+
                         let r = evaluate_function(
                             stack,
+                            arguments.first().unwrap(),
                             &function.parameters,
                             &function.body,
                             node,
@@ -1035,6 +1050,7 @@ pub fn evaluate_node(
                     .create_frame_push(format!("function_call_{}", name));
                 let r = evaluate_function(
                     stack,
+                    arguments.first().unwrap(),
                     &fun_ref.parameters,
                     &fun_ref.body,
                     node,

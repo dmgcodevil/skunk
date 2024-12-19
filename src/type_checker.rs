@@ -256,7 +256,7 @@ fn resolve_access(
                             struct_symbol.functions.get(name).unwrap(),
                             member.deref(),
                         )?;
-                        let args_types_res: Result<Vec<Type>, String> = arguments
+                        let args_types_res: Result<Vec<Type>, String> = arguments.first().expect("at least one arg group is required")
                             .iter()
                             .map(|arg| resolve_type(global_scope, var_tables, arg))
                             .collect();
@@ -286,7 +286,7 @@ fn resolve_function_call(
         metadata,
     } = node
     {
-        if arguments.len() != function_symbol.parameters.len() {
+        if arguments.first().unwrap().len() != function_symbol.parameters.len() {
             return Err(format!(
                 "incorrect number of args to '{}' {}. \
                     expected={}, actual={}",
@@ -297,11 +297,11 @@ fn resolve_function_call(
                     "function"
                 },
                 function_symbol.parameters.len(),
-                arguments.len()
+                arguments.first().unwrap().len()
             ));
         }
         let mut argument_types = Vec::new();
-        for arg in arguments {
+        for arg in arguments.first().expect("at least one argument is required") {
             argument_types.push(resolve_type(global_scope, var_tables, arg)?);
         }
         for i in 0..argument_types.len() {

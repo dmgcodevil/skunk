@@ -111,12 +111,8 @@ expression      = { primary ~ (operation ~ primary)* }
 primary         = { lambda_expr | unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
 
 literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
-func_call       = { IDENTIFIER ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
-
-// Member or array Access
-// nested alternative to flat, experimental
-// member_access =   { (array_access | func_call | IDENTIFIER)+  ~ ("." ~ access)+ }
-// access = { member_access | array_access | IDENTIFIER }
+arg_list        = { (expression ~ ("," ~ expression)*)? }
+func_call       = { IDENTIFIER ~ ("(" ~ arg_list ~ ")")+ }
 
 member_access = { "." ~ (func_call | IDENTIFIER) }
 chained_access = {  ( func_call | IDENTIFIER ) ~ (array_access | member_access)+ }

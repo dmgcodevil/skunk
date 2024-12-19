@@ -74,7 +74,7 @@ pub enum Node {
     },
     FunctionCall {
         name: String,         // The function name
-        arguments: Vec<Node>, // The arguments are a list of expression nodes
+        arguments: Vec<Vec<Node>>, // The arguments are a list of expression nodes
         metadata: Metadata,
     },
     ArrayAccess {
@@ -419,13 +419,24 @@ impl PestImpl {
         Node::Access { nodes }
     }
 
+
+    fn create_arg_list(&self, pair: Pair<Rule>) -> Vec<Node> {
+        assert_eq!(pair.as_rule(), Rule::arg_list);
+        let mut pairs = pair.into_inner();
+        let mut args: Vec<Node> = Vec::new();
+        while let Some(inner_pair) = pairs.next() {
+            args.push(self.create_ast(inner_pair));
+        }
+        args
+    }
+
     fn create_function_call(&self, pair: Pair<Rule>) -> Node {
         let metadata = (self.metadata_creator)(&pair);
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut arguments = Vec::new();
-        while let Some(arg_pair) = inner_pairs.next() {
-            arguments.push(self.create_ast(arg_pair));
+        while let Some(arg_list) = inner_pairs.next() {
+            arguments.push(self.create_arg_list(arg_list));
         }
         Node::FunctionCall {
             name,
@@ -1095,7 +1106,7 @@ mod tests {
                         var_type: Type::Int,
                         value: Some(Box::new(Node::FunctionCall {
                             name: "f".to_string(),
-                            arguments: [].to_vec(),
+                            arguments: [[].to_vec()].to_vec(),
                             metadata: Metadata::EMPTY
                         })),
                         metadata: Metadata::EMPTY
@@ -1275,8 +1286,10 @@ mod tests {
                             value: Some(Box::new(Node::FunctionCall {
                                 name: "sum".to_string(),
                                 arguments: Vec::from([
-                                    Node::Literal(Literal::Integer(1)),
-                                    Node::Literal(Literal::Integer(2))
+                                    Vec::from([
+                                        Node::Literal(Literal::Integer(1)),
+                                        Node::Literal(Literal::Integer(2))
+                                    ])
                                 ]),
                                 metadata: Metadata::EMPTY
                             })),
@@ -1937,7 +1950,7 @@ mod tests {
                     },
                     Node::FunctionCall {
                         name: "test".to_string(),
-                        arguments: vec![],
+                        arguments: vec![vec![]],
                         metadata: Metadata::EMPTY
                     },
                     Node::EOI
@@ -2327,7 +2340,7 @@ mod tests {
                             Node::MemberAccess {
                                 member: Box::new(Node::FunctionCall {
                                     name: "f".to_string(),
-                                    arguments: [].to_vec(),
+                                    arguments: [[].to_vec()].to_vec(),
                                     metadata: Metadata::EMPTY
                                 }),
                                 metadata: Metadata::EMPTY
@@ -2781,6 +2794,14 @@ mod tests {
         }
         g: (int) -> int = f();
         g(47);
+        "#;
+        println!("{:?}", parse(source_code));
+    }
+
+    #[test]
+    fn test_function_chain() {
+        let source_code = r#"
+            f()(1)()(2,3);
         "#;
         println!("{:?}", parse(source_code));
     }
