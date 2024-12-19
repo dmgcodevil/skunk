@@ -629,7 +629,9 @@ fn resolve_member_access(
                     _ => unreachable!("unsupported member access"),
                 }
             }
-            Node::FunctionCall { name, arguments, .. } => {
+            Node::FunctionCall {
+                name, arguments, ..
+            } => {
                 let global_environment_ref = global_environment.borrow();
                 let struct_def =
                     global_environment_ref.to_struct_def(current_value.borrow().deref());
@@ -793,15 +795,12 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
     }
 }
 
-
-/*
-
-f()()
-
-*/
-fn evaluate_closure(value: Rc<RefCell<Value>>, arguments: &Vec<Vec<Node>>,
-                    stack: &Rc<RefCell<CallStack>>,
-                    global_environment: &Rc<RefCell<GlobalEnvironment>>) -> Rc<RefCell<Value>> {
+fn evaluate_closure(
+    value: Rc<RefCell<Value>>,
+    arguments: &Vec<Vec<Node>>,
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+) -> Rc<RefCell<Value>> {
     let mut curr = value;
     let mut result = Rc::new(RefCell::new(Undefined));
     for arg in arguments {
@@ -982,8 +981,8 @@ pub fn evaluate_node(
             0,
             nodes,
         )
-            .get()
-            .clone(),
+        .get()
+        .clone(),
         Node::Assignment { var, value, .. } => match var.as_ref() {
             Node::Access { nodes } => {
                 let mut modifier = resolve_access(
@@ -1007,8 +1006,10 @@ pub fn evaluate_node(
             0,
             nodes,
         )
-            .get(),
-        Node::FunctionCall { name, arguments, .. } => {
+        .get(),
+        Node::FunctionCall {
+            name, arguments, ..
+        } => {
             if name == "sk_debug_mem" {
                 Profiling::sk_debug_mem_sysinfo();
                 Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
@@ -1026,7 +1027,12 @@ pub fn evaluate_node(
             };
 
             let res = if let Some(value) = value_opt {
-                Some(evaluate_closure(value, arguments, stack, global_environment))
+                Some(evaluate_closure(
+                    value,
+                    arguments,
+                    stack,
+                    global_environment,
+                ))
             } else {
                 None
             };
@@ -1052,7 +1058,12 @@ pub fn evaluate_node(
                     global_environment,
                 );
                 stack.borrow_mut().pop();
-                r
+                if arguments.len() > 1 {
+                    // r must be a function (closure)
+                    evaluate_closure(r, &arguments[1..].to_vec(), stack, global_environment)
+                } else {
+                    r
+                }
             }
         }
         Node::Block { statements } => {
@@ -1362,7 +1373,7 @@ mod tests {
                             Rc::new(RefCell::new(Value::Integer(1))),
                             Rc::new(RefCell::new(Value::Integer(2)))
                         ]
-                            .to_vec(),
+                        .to_vec(),
                         dimensions: [2].to_vec()
                     }))
                 )])
@@ -2114,8 +2125,7 @@ mod tests {
             }
         }
 
-        g: (int) -> int = f();
-        g(47);
+        f()(47);
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
@@ -2176,9 +2186,7 @@ mod tests {
             return g;
         }
 
-         run: () -> int = f(3);
-         run();
-
+         f(3)();
         "#;
 
         let program = ast::parse(source_code);
@@ -2212,9 +2220,7 @@ mod tests {
 
             return b();
         }
-
-        f: () -> int = a();
-        f();
+        a()();
         "#;
 
         let program = ast::parse(source_code);

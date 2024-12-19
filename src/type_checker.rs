@@ -256,7 +256,9 @@ fn resolve_access(
                             struct_symbol.functions.get(name).unwrap(),
                             member.deref(),
                         )?;
-                        let args_types_res: Result<Vec<Type>, String> = arguments.first().expect("at least one arg group is required")
+                        let args_types_res: Result<Vec<Type>, String> = arguments
+                            .first()
+                            .expect("at least one arg group is required")
                             .iter()
                             .map(|arg| resolve_type(global_scope, var_tables, arg))
                             .collect();
@@ -301,7 +303,10 @@ fn resolve_function_call(
             ));
         }
         let mut argument_types = Vec::new();
-        for arg in arguments.first().expect("at least one argument is required") {
+        for arg in arguments
+            .first()
+            .expect("at least one argument is required")
+        {
             argument_types.push(resolve_type(global_scope, var_tables, arg)?);
         }
         for i in 0..argument_types.len() {
