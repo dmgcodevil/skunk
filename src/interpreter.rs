@@ -1004,33 +1004,33 @@ pub fn evaluate_node(
                 iterate arguments groups
                 for each group execute evaluate_function
                 set the result
-
-
                 */
-
-
-                let value_ref = value.borrow();
-                match value_ref.deref() {
-                    Value::Closure { function, env } => {
-                        let mut frame = CallFrame::new(name.to_string());
-                        frame.set_parent(env.clone());
-                        stack.borrow_mut().push(frame);
-
-                        // todo
-
-                        let r = evaluate_function(
-                            stack,
-                            arguments.first().unwrap(),
-                            &function.parameters,
-                            &function.body,
-                            node,
-                            global_environment,
-                        );
-                        stack.borrow_mut().pop();
-                        Some(r)
+                let mut curr = value;
+                let mut result = Rc::new(RefCell::new(Undefined));
+                for arg in arguments {
+                    let value_ref = curr.borrow();
+                    match value_ref.deref() {
+                        Value::Closure { function, env } => {
+                            let mut frame = CallFrame::new(name.to_string());
+                            frame.set_parent(env.clone());
+                            stack.borrow_mut().push(frame);
+                            let r = evaluate_function(
+                                stack,
+                                arguments.first().unwrap(),
+                                &function.parameters,
+                                &function.body,
+                                node,
+                                global_environment,
+                            );
+                            drop(value_ref);
+                            stack.borrow_mut().pop();
+                            curr = r.clone();
+                            result = r;
+                        }
+                        _ => unreachable!("not a closure"),
                     }
-                    _ => None,
                 }
+                Some(result)
             } else {
                 None
             };
