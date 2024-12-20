@@ -402,7 +402,7 @@ impl ResolveResult {
 fn assert_type(curr: Type, new: Type) -> Result<Type, String> {
     if new != Type::Void {
         if curr != Type::Void && curr != new {
-            Err(format!("expected type {:?}, found type {:?}", new, curr))
+            Err(format!("expected type {:?}, found type {:?}", curr, new))
         } else {
             Ok(new)
         }

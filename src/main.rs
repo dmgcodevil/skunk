@@ -10,7 +10,7 @@ use std::ops::Deref;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let type_checker_enabled: bool = false;
+    let type_checker_enabled: bool = true;
     if args.len() < 1 {
         eprintln!("Usage: <file_path>");
         std::process::exit(1);
