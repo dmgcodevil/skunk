@@ -293,7 +293,7 @@ fn resolve_access(
                             .map(|arg| resolve_type(global_scope, symbol_tables, arg))
                             .collect();
                         let args_types = args_types_res?; // why ?
-                        // println!("args_types = {:?}", args_types);
+                                                          // println!("args_types = {:?}", args_types);
 
                         resolve_access(
                             global_scope,
