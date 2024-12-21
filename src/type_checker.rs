@@ -1,5 +1,7 @@
+use crate::ast::Type::Void;
 use crate::ast::{Literal, Metadata, Node, Operator, Type};
 use std::collections::HashMap;
+use std::fmt::format;
 use std::ops::Deref;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -205,10 +207,41 @@ fn resolve_eq(left: &Type, right: &Type) -> Result<Type, String> {
     }
 }
 
+fn resolve_not_eq(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Boolean),
+        (Type::Boolean, Type::Boolean) => Ok(Type::Boolean),
+        _ => Err(format!(
+            "unexpected types for '==' : {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
 fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     match (left, right) {
         (Type::Int, Type::Int) => Ok(Type::Int),
         (Type::String, Type::String) => Ok(Type::String),
+        _ => Err(format!(
+            "unexpected types for +: {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
+fn resolve_multiply(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Int),
+        _ => Err(format!(
+            "unexpected types for +: {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
+fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Int),
         _ => Err(format!(
             "unexpected types for +: {:?} and {:?}",
             left, right
@@ -290,7 +323,7 @@ fn resolve_access(
                             .first()
                             .expect("at least one arg group is required")
                             .iter()
-                            .map(|arg| resolve_type(global_scope, symbol_tables, arg))
+                            .map(|arg| resolve_type(global_scope, symbol_tables, arg, None))
                             .collect();
                         let args_types = args_types_res?; // why ?
                                                           // println!("args_types = {:?}", args_types);
@@ -343,7 +376,7 @@ fn resolve_function_call(
                     }
                     let mut argument_types = Vec::new();
                     for arg in args {
-                        argument_types.push(resolve_type(global_scope, symbol_tables, arg)?);
+                        argument_types.push(resolve_type(global_scope, symbol_tables, arg, None)?);
                     }
                     for i in 0..argument_types.len() {
                         if argument_types[i].sk_type != parameters[i] {
@@ -415,11 +448,12 @@ fn resolve_type(
     global_scope: &GlobalScope,
     symbol_tables: &mut SymbolTables,
     node: &Node,
+    expected_type_opt: Option<&Type>,
 ) -> Result<ResolveResult, String> {
     match node {
         Node::Program { statements } => {
             for statement in statements {
-                let res = resolve_type(global_scope, symbol_tables, statement);
+                let res = resolve_type(global_scope, symbol_tables, statement, None);
                 match &res {
                     Err(e) => return Err(e.to_string()),
                     _ => (),
@@ -446,6 +480,7 @@ fn resolve_type(
             //     "function declaration {}, return_type={:?}, lambda={:?}, body={:?}",
             //     name, return_type, lambda, body
             // );
+            let mut returned = false;
             let mut symbol_table = SymbolTable::new();
             for parameter in parameters {
                 symbol_table.add(Symbol {
@@ -456,12 +491,19 @@ fn resolve_type(
             symbol_tables.add(symbol_table);
             let mut actual_return_type = Type::Void;
             for n in body {
-                let t = resolve_type(global_scope, symbol_tables, n)?;
+                let t = resolve_type(global_scope, symbol_tables, n, Some(return_type))?;
                 if t.returned {
+                    returned = true;
                     actual_return_type = assert_type(actual_return_type, t.sk_type)?;
+                } else {
+                    actual_return_type = t.sk_type
                 }
             }
             symbol_tables.pop();
+
+            if !returned && *return_type != Void {
+                return Err("missing return statement".to_string());
+            }
 
             if actual_return_type != *return_type {
                 Err(format!(
@@ -487,7 +529,13 @@ fn resolve_type(
                 sk_type: var_type.clone(),
             });
             if let Some(body) = value {
-                let value_type = resolve_type(global_scope, symbol_tables, &body.deref())?.sk_type;
+                let value_type = resolve_type(
+                    global_scope,
+                    symbol_tables,
+                    &body.deref(),
+                    expected_type_opt,
+                )?
+                .sk_type;
                 if *var_type != value_type {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
@@ -520,11 +568,24 @@ fn resolve_type(
             operator,
             right,
         } => {
-            let left_type = resolve_type(global_scope, symbol_tables, left.deref())?.sk_type;
-            let right_type = resolve_type(global_scope, symbol_tables, right.deref())?.sk_type;
+            let left_type =
+                resolve_type(global_scope, symbol_tables, left.deref(), expected_type_opt)?.sk_type;
+            let right_type = resolve_type(
+                global_scope,
+                symbol_tables,
+                right.deref(),
+                expected_type_opt,
+            )?
+            .sk_type;
             match operator {
                 Operator::Add => {
                     resolve_add(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::Multiply => {
+                    resolve_multiply(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::Mod => {
+                    resolve_mod(&left_type, &right_type).map(|t| ResolveResult::new(t))
                 }
                 Operator::LessThan
                 | Operator::GreaterThan
@@ -535,12 +596,22 @@ fn resolve_type(
                 Operator::Equals => {
                     resolve_eq(&left_type, &right_type).map(|t| ResolveResult::new(t))
                 }
+                Operator::NotEquals => {
+                    resolve_not_eq(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
                 _ => unreachable!("todo {:?}", operator),
             }
         }
         Node::Assignment { var, value, .. } => {
-            let var_type = resolve_type(global_scope, symbol_tables, var.deref())?.sk_type;
-            let value_type = resolve_type(global_scope, symbol_tables, value.deref())?.sk_type;
+            let var_type =
+                resolve_type(global_scope, symbol_tables, var.deref(), expected_type_opt)?.sk_type;
+            let value_type = resolve_type(
+                global_scope,
+                symbol_tables,
+                value.deref(),
+                expected_type_opt,
+            )?
+            .sk_type;
             if var_type != value_type {
                 // todo include var name, metadata
                 Err(format!(
@@ -554,9 +625,11 @@ fn resolve_type(
         }
         Node::ArrayInit { elements } => {
             assert!(elements.len() > 0, "array init cannot be empty");
-            let mut curr: Type = resolve_type(global_scope, symbol_tables, &elements[0])?.sk_type;
+            let mut curr: Type =
+                resolve_type(global_scope, symbol_tables, &elements[0], expected_type_opt)?.sk_type;
             for i in 1..elements.len() {
-                let t = resolve_type(global_scope, symbol_tables, &elements[i])?.sk_type;
+                let t = resolve_type(global_scope, symbol_tables, &elements[i], expected_type_opt)?
+                    .sk_type;
                 if t != curr {
                     return Err("invalid arr value type".to_string());
                 }
@@ -583,7 +656,13 @@ fn resolve_type(
             res
         }
         Node::Access { nodes } => {
-            let start = resolve_type(global_scope, symbol_tables, nodes.get(0).unwrap())?.sk_type;
+            let start = resolve_type(
+                global_scope,
+                symbol_tables,
+                nodes.get(0).unwrap(),
+                expected_type_opt,
+            )?
+            .sk_type;
             resolve_access(global_scope, symbol_tables, start, 1, nodes)
                 .map(|t| ResolveResult::new(t))
         }
@@ -605,8 +684,12 @@ fn resolve_type(
                             metadata.span.line, metadata.span.start,
                         ));
                     }
-                    let arg_type =
-                        resolve_type(global_scope, symbol_tables, arguments.get(0).unwrap())?;
+                    let arg_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        arguments.get(0).unwrap(),
+                        expected_type_opt,
+                    )?;
                     if arg_type.sk_type != *elem_type.deref() {
                         return Err(format!("error {}:{}: array `new`. expected arg type is `{:?}` but given `{:?}`",
                                            metadata.span.line,
@@ -626,7 +709,7 @@ fn resolve_type(
             symbol_tables.add(var_table);
             let mut result = Type::Void;
             for statement in statements {
-                let res = resolve_type(global_scope, symbol_tables, statement)?;
+                let res = resolve_type(global_scope, symbol_tables, statement, expected_type_opt)?;
                 if res.returned {
                     result = assert_type(result, Type::Void)?;
                 }
@@ -643,7 +726,9 @@ fn resolve_type(
             else_block,
             else_if_blocks,
         } => {
-            let cond_type = resolve_type(global_scope, symbol_tables, condition)?.sk_type;
+            let mut returned = false;
+            let cond_type =
+                resolve_type(global_scope, symbol_tables, condition, expected_type_opt)?.sk_type;
             if cond_type != Type::Boolean {
                 return Err(format!(
                     "if condition type mismatch. expected boolean, got {:?}",
@@ -654,40 +739,105 @@ fn resolve_type(
             // let mut types = HashSet::new();
             let mut result = Type::Void;
             for n in body {
-                let res = resolve_type(global_scope, symbol_tables, n)?;
+                let res = resolve_type(global_scope, symbol_tables, n, expected_type_opt)?;
                 if res.returned {
+                    returned = true;
                     // println!("if returns = {:?}", res);
                     result = assert_type(result, res.sk_type)?;
                 }
             }
             for n in else_if_blocks {
-                let res = resolve_type(global_scope, symbol_tables, n)?;
+                let res = resolve_type(global_scope, symbol_tables, n, expected_type_opt)?;
                 if res.returned {
                     // println!("else_if returns = {:?}", res);
                     result = assert_type(result, res.sk_type)?;
+                } else {
+                    returned = false;
                 }
             }
 
             if let Some(nodes) = else_block {
                 for n in nodes {
-                    let res = resolve_type(global_scope, symbol_tables, n)?;
+                    let res = resolve_type(global_scope, symbol_tables, n, expected_type_opt)?;
                     if res.returned {
                         // println!("else returns = {:?}", res);
                         result = assert_type(result, res.sk_type)?;
+                    } else {
+                        returned = false;
                     }
                 }
+            } else {
+                returned = false;
             }
-            if result != Type::Void {
+            if returned {
                 Ok(ResolveResult::returned(result))
             } else {
                 Ok(ResolveResult::new(Type::Void))
             }
         }
+        Node::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(init_node) = init {
+                resolve_type(global_scope, symbol_tables, init_node, None)?;
+            }
+
+            if let Some(cond_node) = condition {
+                let cond_type = resolve_type(global_scope, symbol_tables, cond_node, None)?.sk_type;
+                if cond_type != Type::Boolean {
+                    return Err(format!(
+                        "For loop condition must be of type Boolean, got {:?}",
+                        cond_type
+                    ));
+                }
+            }
+
+            if let Some(update_node) = update {
+                resolve_type(global_scope, symbol_tables, update_node, None)?;
+            }
+
+            let mut returned = false;
+            let mut body_return_type = Type::Void;
+            for statement in body {
+                let res = resolve_type(global_scope, symbol_tables, statement, None)?;
+                if res.returned {
+                    returned = true;
+                    body_return_type = assert_type(body_return_type, res.sk_type)?;
+                }
+            }
+            Ok(if returned {
+                ResolveResult::returned(body_return_type)
+            } else {
+                ResolveResult::new(Type::Void)
+            })
+        }
+
         Node::Print(n) => {
-            resolve_type(global_scope, symbol_tables, n.deref())?; // verify string
+            resolve_type(global_scope, symbol_tables, n.deref(), expected_type_opt)?; // verify string
             Ok(ResolveResult::new(Type::Void))
         }
-        Node::Return(body) => Ok(resolve_type(global_scope, symbol_tables, body)?.to_returned()),
+        Node::Return(body_opt) => {
+            let mut res = ResolveResult::returned(Type::Void);
+            if let Some(body) = body_opt {
+                res = resolve_type(global_scope, symbol_tables, body, expected_type_opt)?
+                    .to_returned();
+            }
+            if let Some(expected_type) = expected_type_opt {
+                if *expected_type != res.sk_type {
+                    return Err(format!(
+                        "return invalid type. expected={:?}, actual={:?}",
+                        expected_type, res.sk_type
+                    ));
+                }
+            }
+            Ok(res)
+        }
+        Node::UnaryOp { operator, operand } => {
+            resolve_type(global_scope, symbol_tables, operand, expected_type_opt)
+        }
         _ => unreachable!("{}", format!("{:?}", node)),
     }
 }
@@ -704,7 +854,7 @@ pub fn check(node: &Node) -> Result<(), String> {
         }
         _ => panic!("expected program node"),
     }
-    match resolve_type(&mut global_scope, &mut var_tables, node) {
+    match resolve_type(&mut global_scope, &mut var_tables, node, None) {
         Err(e) => Err(e.to_string()),
         Ok(_) => Ok(()),
     }
@@ -937,6 +1087,249 @@ mod tests {
         f(3)();
         "#;
 
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_return_in_if() {
+        let source_code = r#"
+        function f(a: int): int {
+            if (a > 0) {
+                return a;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_missing_return_in_else() {
+        let source_code = r#"
+        function f(a: int): int {
+            if (a > 0) {
+                return a;
+            } else {
+                print("log");
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_complete_return_in_if_else() {
+        let source_code = r#"
+        function f(a: int): int {
+            if (a > 0) {
+                return a;
+            } else {
+                return 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_return_in_nested_if() {
+        let source_code = r#"
+        function f(a: int, b: int): int {
+            if (a > 0) {
+                if (b > 0) {
+                    return a + b;
+                } else {
+                    return a;
+                }
+            } else {
+                return 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_return_in_nested_if() {
+        let source_code = r#"
+        function f(a: int, b: int): int {
+            if (a > 0) {
+                if (b > 0) {
+                    return a + b;
+                }
+            } else {
+                return 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_return_in_for_loop() {
+        let source_code = r#"
+        function f(limit: int): int {
+            for (i: int = 0; i < limit; i = i + 1) {
+                if (i == 5) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_return_in_for_loop() {
+        let source_code = r#"
+        function f(limit: int): int {
+            for (i: int = 0; i < limit; i = i + 1) {
+                if (i == 5) {
+                    return i;
+                }
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_return_in_nested_for_loops() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; i = i + 1) {
+                for (j: int = 0; j < 10; j = j + 1) {
+                    if (i + j == 10) {
+                        return i * 10 + j;
+                    }
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_empty_for_loop_body() {
+        let source_code = r#"
+        function f(limit: int): int {
+            for (i: int = 0; i < limit; i = i + 1) {}
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_for_loop_without_condition() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; ; i = i + 1) {
+                if (i == 10) {
+                    return i;
+                }
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_for_loop_without_update() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; ) {
+                if (i == 5) {
+                    return i;
+                }
+                i = i + 1; // Manual update
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_for_loop_without_initialization() {
+        let source_code = r#"
+        function f(): int {
+            i: int = 0;
+            for (; i < 10; i = i + 1) {
+                if (i == 5) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_complex_for_loop_with_nested_control() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; i = i + 1) {
+                if (i % 2 == 0) {
+                    for (j: int = 0; j < 5; j = j + 1) {
+                        if (j == 3) {
+                            return i * 10 + j;
+                        }
+                    }
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    // #[test] todo
+    fn test_unreachable_code_after_for_loop() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; i = i + 1) {
+                return i;
+            }
+            // This code should be unreachable
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_function_call_inside_control_flow() {
+        let source_code = r#"
+        function g(): int {
+            return 42;
+        }
+
+        function f(a: int): int {
+            if (a > 0) {
+                return g();
+            } else {
+                return 0;
+            }
+        }
+        "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
     }

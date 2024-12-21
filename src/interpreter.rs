@@ -12,7 +12,6 @@ use std::fmt;
 use std::io::BufRead;
 use std::mem;
 use std::rc::Rc;
-use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -165,7 +164,7 @@ struct Environment {
 impl Environment {
     fn new() -> Self {
         Environment {
-            id: "".to_string(), //Uuid::new_v4().to_string(), // uncomment for debugging
+            id: "".to_string(), //uuid::Uuid::new_v4().to_string(), // uncomment for debugging
             parent: None,
             variables: HashMap::new(),
         }
@@ -519,7 +518,7 @@ impl CallStack {
         self.frames.pop()
     }
 
-    // create frame and sets its env.parent = current_frame.env
+    /// create frame and sets its env.parent = current_frame.env
     fn create_frame(&self, name: String) -> CallFrame {
         let mut frame = CallFrame {
             name: name.to_string(),
@@ -654,17 +653,6 @@ fn resolve_member_access(
                 stack.borrow_mut().pop();
                 drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
-
-                // let res = evaluate_function(
-                //     stack,
-                //     arguments.first().unwrap(),
-                //     &fun_def.parameters,
-                //     &fun_def.body,
-                //     global_environment,
-                // );
-                // stack.borrow_mut().pop();
-                // drop(global_environment_ref);
-                // Box::new(ReadValueModifier { value: res })
             }
             _ => panic!("expected member access, found {:?}", member_ref),
         }
@@ -887,7 +875,6 @@ fn evaluate_function_call(
                     })
                     .expect(format!("function `{}` doesn't exist", name).as_str())
                     .clone();
-                // let fun_ref = fun.borrow();
                 drop(global_environment_ref);
                 stack
                     .borrow_mut()
@@ -1307,9 +1294,13 @@ pub fn evaluate_node(
             res
         }
         Node::EOI => Rc::new(RefCell::new(Void)),
-        Node::Return(n) => {
-            let val = evaluate_node(n, stack, global_environment);
-            Rc::new(RefCell::new(Return(Rc::clone(&val))))
+        Node::Return(body_opt) => {
+            if let Some(body) = body_opt {
+                let val = evaluate_node(body, stack, global_environment);
+                Rc::new(RefCell::new(Return(Rc::clone(&val))))
+            } else {
+                Rc::new(RefCell::new(Void))
+            }
         }
         _ => panic!("Unexpected node type: {:?}", node),
     }
@@ -1788,7 +1779,7 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         let res_ref = res.borrow();
-        assert_eq!(Value::Integer(10), *res_ref.deref()); // Sum is 1+2+3 before hitting limit
+        assert_eq!(Value::Integer(10), *res_ref.deref());
     }
 
     #[test]
@@ -1858,7 +1849,7 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         let res_ref = res.borrow();
-        assert_eq!(Value::Integer(1212), *res_ref.deref()); // even_sum = 12, odd_sum = 6
+        assert_eq!(Value::Integer(1212), *res_ref.deref());
     }
 
     #[test]
@@ -2028,7 +2019,6 @@ mod tests {
         assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 
-    // nested blocks tests
     #[test]
     fn test_nested_block_shadowing() {
         let source_code = r#"
@@ -2067,13 +2057,12 @@ mod tests {
 
             }
             list:List = List{size: 3, capacity: 2};
-            //list.has_space();
             list.grow();
-            print("capacity=" + list.capacity);
+            list.capacity;
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        println!("{:#?}", res.borrow().deref());
+        assert_eq!(Value::Integer(4), *res.borrow().deref());
     }
 
     #[test]
