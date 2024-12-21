@@ -12,7 +12,6 @@ use std::fmt;
 use std::io::BufRead;
 use std::mem;
 use std::rc::Rc;
-use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -165,7 +164,7 @@ struct Environment {
 impl Environment {
     fn new() -> Self {
         Environment {
-            id: "".to_string(), //Uuid::new_v4().to_string(), // uncomment for debugging
+            id: "".to_string(), //uuid::Uuid::new_v4().to_string(), // uncomment for debugging
             parent: None,
             variables: HashMap::new(),
         }
@@ -519,7 +518,7 @@ impl CallStack {
         self.frames.pop()
     }
 
-    // create frame and sets its env.parent = current_frame.env
+    /// create frame and sets its env.parent = current_frame.env
     fn create_frame(&self, name: String) -> CallFrame {
         let mut frame = CallFrame {
             name: name.to_string(),
@@ -645,12 +644,11 @@ fn resolve_member_access(
                     .borrow_mut()
                     .declare_variable("self", Rc::clone(&current_value));
 
-                let res = evaluate_function(
+                let res = evaluate_function_call(
+                    member_ref,
                     stack,
-                    arguments.first().unwrap(),
-                    &fun_def.parameters,
-                    &fun_def.body,
                     global_environment,
+                    Some(fun_def.clone()),
                 );
                 stack.borrow_mut().pop();
                 drop(global_environment_ref);
@@ -826,6 +824,79 @@ fn evaluate_closure(
         }
     }
     result
+}
+
+fn evaluate_function_call(
+    node: &Node,
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+    fun: Option<FunctionDefinition>,
+) -> Rc<RefCell<Value>> {
+    match node {
+        Node::FunctionCall {
+            name, arguments, ..
+        } => {
+            if name == "sk_debug_mem" {
+                Profiling::sk_debug_mem_sysinfo();
+                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
+                return Rc::new(RefCell::new(Value::Undefined));
+            }
+
+            if name == "sk_debug_stack" {
+                Profiling::sk_debug_stack(stack);
+                return Rc::new(RefCell::new(Value::Undefined));
+            }
+
+            let value_opt = {
+                let stack_ref = stack.borrow();
+                stack_ref.get_closure(name)
+            };
+
+            let res = if let Some(value) = value_opt {
+                Some(evaluate_closure(
+                    value,
+                    arguments,
+                    stack,
+                    global_environment,
+                ))
+            } else {
+                None
+            };
+
+            if let Some(res) = res {
+                res
+            } else {
+                let global_environment_ref = global_environment.borrow();
+                let fun = fun
+                    .or_else(|| {
+                        global_environment_ref
+                            .get_function(name)
+                            .map(|f| f.borrow().clone())
+                    })
+                    .expect(format!("function `{}` doesn't exist", name).as_str())
+                    .clone();
+                drop(global_environment_ref);
+                stack
+                    .borrow_mut()
+                    .create_frame_push(format!("function_call_{}", name));
+                let r = evaluate_function(
+                    stack,
+                    arguments.first().unwrap(),
+                    &fun.parameters,
+                    &fun.body,
+                    global_environment,
+                );
+                stack.borrow_mut().pop();
+                if arguments.len() > 1 {
+                    // r must be a function (closure)
+                    evaluate_closure(r, &arguments[1..].to_vec(), stack, global_environment)
+                } else {
+                    r
+                }
+            }
+        }
+        _ => panic!("expected function call"),
+    }
 }
 
 pub fn evaluate_node(
@@ -1007,65 +1078,7 @@ pub fn evaluate_node(
             nodes,
         )
         .get(),
-        Node::FunctionCall {
-            name, arguments, ..
-        } => {
-            if name == "sk_debug_mem" {
-                Profiling::sk_debug_mem_sysinfo();
-                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
-                return Rc::new(RefCell::new(Value::Undefined));
-            }
-
-            if name == "sk_debug_stack" {
-                Profiling::sk_debug_stack(stack);
-                return Rc::new(RefCell::new(Value::Undefined));
-            }
-
-            let value_opt = {
-                let stack_ref = stack.borrow();
-                stack_ref.get_closure(name)
-            };
-
-            let res = if let Some(value) = value_opt {
-                Some(evaluate_closure(
-                    value,
-                    arguments,
-                    stack,
-                    global_environment,
-                ))
-            } else {
-                None
-            };
-
-            if let Some(res) = res {
-                res
-            } else {
-                let global_environment_ref = global_environment.borrow();
-                let fun = global_environment_ref
-                    .get_function(name)
-                    .expect(format!("function `{}` doesn't exist", name).as_str())
-                    .clone();
-                let fun_ref = fun.borrow();
-                drop(global_environment_ref);
-                stack
-                    .borrow_mut()
-                    .create_frame_push(format!("function_call_{}", name));
-                let r = evaluate_function(
-                    stack,
-                    arguments.first().unwrap(),
-                    &fun_ref.parameters,
-                    &fun_ref.body,
-                    global_environment,
-                );
-                stack.borrow_mut().pop();
-                if arguments.len() > 1 {
-                    // r must be a function (closure)
-                    evaluate_closure(r, &arguments[1..].to_vec(), stack, global_environment)
-                } else {
-                    r
-                }
-            }
-        }
+        Node::FunctionCall { .. } => evaluate_function_call(node, stack, global_environment, None),
         Node::Block { statements } => {
             let mut stack_ref = stack.borrow_mut();
             stack_ref.create_frame_push("".to_string());
@@ -1281,15 +1294,20 @@ pub fn evaluate_node(
             res
         }
         Node::EOI => Rc::new(RefCell::new(Void)),
-        Node::Return(n) => {
-            let val = evaluate_node(n, stack, global_environment);
-            Rc::new(RefCell::new(Return(Rc::clone(&val))))
+        Node::Return(body_opt) => {
+            if let Some(body) = body_opt {
+                let val = evaluate_node(body, stack, global_environment);
+                Rc::new(RefCell::new(Return(Rc::clone(&val))))
+            } else {
+                Rc::new(RefCell::new(Void))
+            }
         }
         _ => panic!("Unexpected node type: {:?}", node),
     }
 }
 
 use crate::interpreter::Value::{Closure, Return, StructInstance, Undefined, Void};
+use pest::Stack;
 use std::fmt::Octal;
 use std::ops::{Deref, DerefMut};
 
@@ -1761,7 +1779,7 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         let res_ref = res.borrow();
-        assert_eq!(Value::Integer(10), *res_ref.deref()); // Sum is 1+2+3 before hitting limit
+        assert_eq!(Value::Integer(10), *res_ref.deref());
     }
 
     #[test]
@@ -1831,7 +1849,7 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         let res_ref = res.borrow();
-        assert_eq!(Value::Integer(1212), *res_ref.deref()); // even_sum = 12, odd_sum = 6
+        assert_eq!(Value::Integer(1212), *res_ref.deref());
     }
 
     #[test]
@@ -2001,7 +2019,6 @@ mod tests {
         assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 
-    // nested blocks tests
     #[test]
     fn test_nested_block_shadowing() {
         let source_code = r#"
@@ -2040,13 +2057,12 @@ mod tests {
 
             }
             list:List = List{size: 3, capacity: 2};
-            //list.has_space();
             list.grow();
-            print("capacity=" + list.capacity);
+            list.capacity;
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        println!("{:#?}", res.borrow().deref());
+        assert_eq!(Value::Integer(4), *res.borrow().deref());
     }
 
     #[test]
@@ -2226,5 +2242,23 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(6), *res.borrow().deref());
+    }
+
+    #[test]
+    fn test_struct_lambda() {
+        let source_code = r#"
+        struct Foo {
+            function f(self): (int) -> int {
+                return function(i:int): int {
+                    return i;
+                }
+            }
+        }
+        foo:Foo = Foo{};
+        foo.f()(1);
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
 }

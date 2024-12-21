@@ -56,9 +56,9 @@ pub enum Node {
         update: Option<Box<Node>>,    // Update is a statement node
         body: Vec<Node>,              // The body is a list of nodes
     },
-    Return(Box<Node>), // The return value is an expression node
-    Print(Box<Node>),  // The print expression is an expression node
-    Input,             // Read data from keyboard
+    Return(Option<Box<Node>>), // The return value is an expression node
+    Print(Box<Node>),          // The print expression is an expression node
+    Input,                     // Read data from keyboard
 
     // Expressions
     Literal(Literal),   // Represents a literal value (int, string, bool)
@@ -255,7 +255,11 @@ impl PestImpl {
             Rule::inline_array_init => self.create_inline_array_init(pair),
             Rule::sk_return => {
                 let mut pairs = pair.into_inner();
-                Node::Return(Box::new(self.create_ast(pairs.next().unwrap())))
+                if pairs.len() != 0 {
+                    Node::Return(Some(Box::new(self.create_ast(pairs.next().unwrap()))))
+                } else {
+                    Node::Return(None)
+                }
             }
             Rule::io => {
                 let p = pair.into_inner().next().unwrap();
@@ -1268,11 +1272,11 @@ mod tests {
                             ("b".to_string(), Type::Int)
                         ]),
                         return_type: Type::Int,
-                        body: Vec::from([Node::Return(Box::new(Node::BinaryOp {
+                        body: Vec::from([Node::Return(Some(Box::new(Node::BinaryOp {
                             left: Box::new(access_var("a")),
                             operator: Operator::Add,
                             right: Box::new(access_var("b"))
-                        }))]),
+                        })))]),
                         lambda: false,
                     },
                     Node::FunctionDeclaration {
@@ -1354,11 +1358,11 @@ mod tests {
                             name: "distance".to_string(),
                             parameters: [].to_vec(),
                             return_type: Type::Int,
-                            body: Vec::from([Node::Return(Box::new(Node::BinaryOp {
+                            body: Vec::from([Node::Return(Some(Box::new(Node::BinaryOp {
                                 left: Box::new(access_var("x")),
                                 operator: Operator::Subtract,
                                 right: Box::new(access_var("y"))
-                            }))]),
+                            })))]),
                             lambda: false,
                         }]
                         .to_vec()
@@ -1931,17 +1935,17 @@ mod tests {
                                         operator: Operator::Equals,
                                         right: Box::new(Node::Literal(Literal::Integer(0))),
                                     }),
-                                    body: vec![Node::Return(Box::new(Node::Access {
+                                    body: vec![Node::Return(Some(Box::new(Node::Access {
                                         nodes: vec![Node::Identifier("i".to_string())],
-                                    })),],
+                                    })))],
                                     else_if_blocks: vec![],
                                     else_block: None,
                                 },],
                             },
-                            Node::Return(Box::new(Node::UnaryOp {
+                            Node::Return(Some(Box::new(Node::UnaryOp {
                                 operator: UnaryOperator::Minus,
                                 operand: Box::new(Node::Literal(Literal::Integer(1))),
-                            })),
+                            }))),
                         ],
                         lambda: false,
                     },
@@ -2717,7 +2721,7 @@ mod tests {
                                 ("b".to_string(), Type::Int),
                             ],
                             return_type: Type::Int,
-                            body: vec![Node::Return(Box::new(Node::BinaryOp {
+                            body: vec![Node::Return(Some(Box::new(Node::BinaryOp {
                                 left: Box::new(Node::Access {
                                     nodes: vec![Node::Identifier("a".to_string())],
                                 }),
@@ -2725,7 +2729,7 @@ mod tests {
                                 right: Box::new(Node::Access {
                                     nodes: vec![Node::Identifier("b".to_string())],
                                 }),
-                            }))],
+                            })))],
                             lambda: true,
                         })),
                         metadata: Metadata::EMPTY
@@ -2758,7 +2762,9 @@ mod tests {
                             name: "anonymous".to_string(),
                             parameters: vec![], // No parameters in the declaration
                             return_type: Type::Int,
-                            body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(42))))],
+                            body: vec![Node::Return(Some(Box::new(Node::Literal(
+                                Literal::Integer(42)
+                            ))))],
                             lambda: true,
                         })),
                         metadata: Metadata::EMPTY
@@ -2787,7 +2793,9 @@ mod tests {
                             name: "anonymous".to_string(),
                             parameters: vec![],
                             return_type: Type::Int,
-                            body: vec![Node::Return(Box::new(Node::Literal(Literal::Integer(47))))],
+                            body: vec![Node::Return(Some(Box::new(Node::Literal(
+                                Literal::Integer(47)
+                            ))))],
                             lambda: true,
                         }]],
                         metadata: Metadata::EMPTY
@@ -2821,15 +2829,15 @@ mod tests {
                             parameters: vec![Type::Int],
                             return_type: Box::new(Type::Int),
                         },
-                        body: vec![Node::Return(Box::new(Node::FunctionDeclaration {
+                        body: vec![Node::Return(Some(Box::new(Node::FunctionDeclaration {
                             name: "anonymous".to_string(),
                             parameters: vec![("a".to_string(), Type::Int)],
                             return_type: Type::Int,
-                            body: vec![Node::Return(Box::new(Node::Access {
+                            body: vec![Node::Return(Some(Box::new(Node::Access {
                                 nodes: vec![Node::Identifier("a".to_string())],
-                            }))],
+                            })))],
                             lambda: true,
-                        }))],
+                        })))],
                         lambda: false,
                     },
                     Node::VariableDeclaration {

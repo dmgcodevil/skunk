@@ -1,44 +1,56 @@
-use crate::ast::Type::Custom;
+use crate::ast::Type::Void;
 use crate::ast::{Literal, Metadata, Node, Operator, Type};
 use std::collections::HashMap;
+use std::fmt::format;
 use std::ops::Deref;
 
 #[derive(Debug, PartialEq, Clone)]
 struct Symbol {
     name: String,
     sk_type: Type,
-    metadata: Metadata, // we can say where var is defined
 }
 
 #[derive(Debug, PartialEq, Clone)]
-struct VarTable {
-    vars: HashMap<String, Symbol>,
-    functions: HashMap<String, FunctionSymbol>,
+struct StructSymbol {
+    name: String,
+    fields: HashMap<String, Symbol>,
+    functions: HashMap<String, Symbol>,
 }
 
-impl VarTable {
+#[derive(Debug, PartialEq, Clone)]
+struct SymbolTable {
+    vars: HashMap<String, Symbol>,
+}
+
+impl SymbolTable {
     fn new() -> Self {
-        VarTable {
+        SymbolTable {
             vars: HashMap::new(),
-            functions: HashMap::new(),
         }
     }
 
-    fn add(&mut self, var: Symbol) {
-        self.vars.insert(var.name.clone(), var);
+    fn add(&mut self, s: Symbol) {
+        self.vars.insert(s.name.clone(), s);
+    }
+
+    fn get(&self, name: &str) -> Option<&Symbol> {
+        self.vars.get(name)
+    }
+    fn has_var(&self, name: &str) -> bool {
+        self.vars.contains_key(name)
     }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-struct VarTables {
-    tables: Vec<VarTable>,
+struct SymbolTables {
+    tables: Vec<SymbolTable>,
 }
 
-impl VarTables {
+impl SymbolTables {
     fn new() -> Self {
-        VarTables { tables: vec![] }
+        SymbolTables { tables: vec![] }
     }
-    fn add(&mut self, var_table: VarTable) {
+    fn add(&mut self, var_table: SymbolTable) {
         self.tables.push(var_table);
     }
 
@@ -46,11 +58,31 @@ impl VarTables {
         self.tables.pop();
     }
 
-    fn get(&self) -> &VarTable {
+    fn get(&self) -> &SymbolTable {
         &self.tables.last().unwrap()
     }
-    fn get_mut(&mut self) -> &mut VarTable {
+    fn get_mut(&mut self) -> &mut SymbolTable {
         self.tables.last_mut().unwrap()
+    }
+
+    fn get_symbol(&self, name: &str) -> Option<&Symbol> {
+        for table in self.tables.iter().rev() {
+            if table.has_var(name) {
+                return table.get(name);
+            }
+        }
+        None
+    }
+    fn get_fun(&self, name: &str) -> Option<Symbol> {
+        let s = self.get_symbol(name);
+        if let Some(s) = s {
+            match s.sk_type {
+                Type::Function { .. } => Some(s.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -60,51 +92,32 @@ fn create_symbols(declarations: &Vec<(String, Type)>) -> Vec<Symbol> {
         .map(|d| Symbol {
             name: d.0.clone(),
             sk_type: d.1.clone(),
-            metadata: Metadata::EMPTY,
         })
         .collect()
 }
 
-#[derive(Debug, PartialEq, Clone)]
-struct FunctionSymbol {
-    name: String,
-    parameters: Vec<Symbol>,
-    return_type: Type,
-    lambda: bool, // metadata: Metadata, todo
-}
-
-impl FunctionSymbol {
-    fn from_node(node: &Node) -> Self {
-        match node {
-            Node::FunctionDeclaration {
-                name,
-                parameters,
-                return_type,
-                body,
-                lambda,
-            } => FunctionSymbol {
-                name: name.clone(),
-                parameters: create_symbols(parameters),
-                return_type: return_type.clone(),
-                lambda: lambda.clone(),
+fn func_decl_node_to_symbol(node: &Node) -> Symbol {
+    match node {
+        Node::FunctionDeclaration {
+            name,
+            parameters,
+            return_type,
+            ..
+        } => Symbol {
+            name: name.to_string(),
+            sk_type: Type::Function {
+                parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+                return_type: Box::new(return_type.clone()),
             },
-            _ => panic!("expected function declaration"),
-        }
+        },
+        _ => panic!("expected function declaration"),
     }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-struct StructSymbol {
-    name: String,
-    fields: HashMap<String, Symbol>,
-    functions: HashMap<String, FunctionSymbol>,
-    // metadata: Metadata, todo
 }
 
 #[derive(Debug, PartialEq, Clone)]
 struct GlobalScope {
     structs: HashMap<String, StructSymbol>,
-    functions: HashMap<String, FunctionSymbol>,
+    functions: HashMap<String, Symbol>,
     variables: HashMap<String, Symbol>,
 }
 
@@ -136,7 +149,6 @@ impl GlobalScope {
                                     Symbol {
                                         name: field.0.to_string(),
                                         sk_type: field.1.clone(),
-                                        metadata: Metadata::EMPTY,
                                     },
                                 )
                             })
@@ -144,7 +156,7 @@ impl GlobalScope {
                         functions: functions
                             .iter()
                             .map(|n| {
-                                let fun_symbol = FunctionSymbol::from_node(n);
+                                let fun_symbol = func_decl_node_to_symbol(n);
                                 (fun_symbol.name.clone(), fun_symbol)
                             })
                             .collect::<HashMap<_, _>>(),
@@ -153,7 +165,7 @@ impl GlobalScope {
             }
             Node::FunctionDeclaration { name, .. } => {
                 self.functions
-                    .insert(name.clone(), FunctionSymbol::from_node(node));
+                    .insert(name.clone(), func_decl_node_to_symbol(node));
             }
             Node::VariableDeclaration {
                 var_type,
@@ -166,12 +178,43 @@ impl GlobalScope {
                     Symbol {
                         name: name.clone(),
                         sk_type: var_type.clone(),
-                        metadata: metadata.clone(),
                     },
                 );
             }
             _ => {}
         }
+    }
+}
+
+fn resolve_cmp(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Boolean),
+        _ => Err(format!(
+            "unexpected types for < > <= >= : {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+fn resolve_eq(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Boolean),
+        (Type::String, Type::String) => Ok(Type::Boolean),
+        (Type::Boolean, Type::Boolean) => Ok(Type::Boolean),
+        _ => Err(format!(
+            "unexpected types for '==' : {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
+fn resolve_not_eq(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Boolean),
+        (Type::Boolean, Type::Boolean) => Ok(Type::Boolean),
+        _ => Err(format!(
+            "unexpected types for '==' : {:?} and {:?}",
+            left, right
+        )),
     }
 }
 
@@ -186,9 +229,29 @@ fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     }
 }
 
+fn resolve_multiply(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Int),
+        _ => Err(format!(
+            "unexpected types for +: {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
+fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Int),
+        _ => Err(format!(
+            "unexpected types for +: {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
 fn resolve_access(
     global_scope: &GlobalScope,
-    var_tables: &mut VarTables,
+    symbol_tables: &mut SymbolTables,
     curr: Type,
     i: usize,
     access_nodes: &Vec<Node>,
@@ -200,7 +263,7 @@ fn resolve_access(
         Node::ArrayAccess { .. } => match curr {
             Type::Array { elem_type, .. } => resolve_access(
                 global_scope,
-                var_tables,
+                symbol_tables,
                 elem_type.deref().clone(),
                 i + 1,
                 access_nodes,
@@ -225,7 +288,7 @@ fn resolve_access(
                         }
                         resolve_access(
                             global_scope,
-                            var_tables,
+                            symbol_tables,
                             struct_symbol
                                 .fields
                                 .get(field_name)
@@ -252,20 +315,26 @@ fn resolve_access(
                         }
                         let return_type = resolve_function_call(
                             global_scope,
-                            var_tables,
+                            symbol_tables,
                             struct_symbol.functions.get(name).unwrap(),
                             member.deref(),
                         )?;
-                        let args_types_res: Result<Vec<Type>, String> = arguments
+                        let args_types_res: Result<Vec<ResolveResult>, String> = arguments
                             .first()
                             .expect("at least one arg group is required")
                             .iter()
-                            .map(|arg| resolve_type(global_scope, var_tables, arg))
+                            .map(|arg| resolve_type(global_scope, symbol_tables, arg, None))
                             .collect();
-                        let args_types = args_types_res?;
-                        println!("args_types = {:?}", args_types);
+                        let args_types = args_types_res?; // why ?
+                                                          // println!("args_types = {:?}", args_types);
 
-                        resolve_access(global_scope, var_tables, return_type, i + 1, access_nodes)
+                        resolve_access(
+                            global_scope,
+                            symbol_tables,
+                            return_type,
+                            i + 1,
+                            access_nodes,
+                        )
                     }
                     _ => panic!("expected member access node"),
                 }
@@ -278,8 +347,8 @@ fn resolve_access(
 
 fn resolve_function_call(
     global_scope: &GlobalScope,
-    var_tables: &mut VarTables,
-    function_symbol: &FunctionSymbol,
+    symbol_tables: &mut SymbolTables,
+    function_symbol: &Symbol,
     node: &Node,
 ) -> Result<Type, String> {
     if let Node::FunctionCall {
@@ -288,76 +357,118 @@ fn resolve_function_call(
         metadata,
     } = node
     {
-        if arguments.first().unwrap().len() != function_symbol.parameters.len() {
-            return Err(format!(
-                "incorrect number of args to '{}' {}. \
-                    expected={}, actual={}",
-                name,
-                if function_symbol.lambda {
-                    "lambda"
-                } else {
-                    "function"
-                },
-                function_symbol.parameters.len(),
-                arguments.first().unwrap().len()
-            ));
-        }
-        let mut argument_types = Vec::new();
-        for arg in arguments
-            .first()
-            .expect("at least one argument is required")
-        {
-            argument_types.push(resolve_type(global_scope, var_tables, arg)?);
-        }
-        for i in 0..argument_types.len() {
-            if argument_types[i] != function_symbol.parameters[i].sk_type {
-                return Err(format!(
-                    "error {}:{}:arguments to '{}' {} are incorrect. parameter='{}', \
-                        expected type='{:?}', actual type='{:?}'",
-                    metadata.span.line,
-                    metadata.span.start,
-                    name,
-                    if function_symbol.lambda {
-                        "lambda"
-                    } else {
-                        "function"
-                    },
-                    function_symbol.parameters[i].name,
-                    function_symbol.parameters[i].sk_type,
-                    argument_types[i]
-                ));
+        // println!("resolve_function_call={:?}", function_symbol);
+        let mut curr_type = &function_symbol.sk_type;
+        for args in arguments {
+            match curr_type {
+                Type::Function {
+                    parameters,
+                    return_type,
+                    ..
+                } => {
+                    if args.len() != parameters.len() {
+                        return Err(format!(
+                            "incorrect number of args to function {}. expected={}, actual={}",
+                            name,
+                            parameters.len(),
+                            args.len()
+                        ));
+                    }
+                    let mut argument_types = Vec::new();
+                    for arg in args {
+                        argument_types.push(resolve_type(global_scope, symbol_tables, arg, None)?);
+                    }
+                    for i in 0..argument_types.len() {
+                        if argument_types[i].sk_type != parameters[i] {
+                            return Err(format!(
+                                "error {}:{}:arguments to function '{}' are incorrect. \
+                                parameter pos='{}', expected type='{:?}', actual type='{:?}'",
+                                metadata.span.line,
+                                metadata.span.start,
+                                name,
+                                i,
+                                parameters[i],
+                                argument_types[i]
+                            ));
+                        }
+                    }
+                    curr_type = return_type;
+                }
+                _ => panic!("expected function call"),
             }
         }
-        Ok(function_symbol.return_type.clone())
+        Ok(curr_type.clone())
     } else {
-        panic!("incorrect node")
+        panic!("expected function call");
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct ResolveResult {
+    sk_type: Type,
+    returned: bool,
+}
+
+impl ResolveResult {
+    fn new(sk_type: Type) -> Self {
+        ResolveResult {
+            sk_type,
+            returned: false,
+        }
+    }
+
+    fn returned(sk_type: Type) -> Self {
+        ResolveResult {
+            sk_type,
+            returned: true,
+        }
+    }
+
+    fn to_returned(&self) -> ResolveResult {
+        ResolveResult {
+            sk_type: self.sk_type.clone(),
+            returned: true,
+        }
+    }
+}
+
+fn assert_type(curr: Type, new: Type) -> Result<Type, String> {
+    if new != Type::Void {
+        if curr != Type::Void && curr != new {
+            Err(format!("expected type {:?}, found type {:?}", curr, new))
+        } else {
+            Ok(new)
+        }
+    } else {
+        Ok(curr)
     }
 }
 
 fn resolve_type(
     global_scope: &GlobalScope,
-    var_tables: &mut VarTables,
+    symbol_tables: &mut SymbolTables,
     node: &Node,
-) -> Result<Type, String> {
+    expected_type_opt: Option<&Type>,
+) -> Result<ResolveResult, String> {
     match node {
         Node::Program { statements } => {
             for statement in statements {
-                let res = resolve_type(global_scope, var_tables, statement);
+                let res = resolve_type(global_scope, symbol_tables, statement, None);
                 match &res {
                     Err(e) => return Err(e.to_string()),
                     _ => (),
                 }
             }
-            Ok(Type::Void)
+            Ok(ResolveResult::new(Type::Void))
         }
         Node::StructInitialization { name, .. } => {
             if !global_scope.structs.contains_key(name) {
                 Err("struct doesn't exist".to_string())
             } else {
-                Ok(Custom(name.clone()))
+                Ok(ResolveResult::new(Type::Custom(name.clone())))
             }
         }
-        Node::StructDeclaration { name, .. } => Ok(Custom(name.clone())),
+        Node::StructDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
         Node::FunctionDeclaration {
             name,
             parameters,
@@ -365,44 +476,45 @@ fn resolve_type(
             body,
             lambda,
         } => {
-            let mut var_table = VarTable::new();
+            // println!(
+            //     "function declaration {}, return_type={:?}, lambda={:?}, body={:?}",
+            //     name, return_type, lambda, body
+            // );
+            let mut returned = false;
+            let mut symbol_table = SymbolTable::new();
             for parameter in parameters {
-                var_table.add(Symbol {
+                symbol_table.add(Symbol {
                     name: parameter.0.clone(),
                     sk_type: parameter.1.clone(),
-                    metadata: Metadata::EMPTY, // todo
                 })
             }
-            var_tables.add(var_table);
+            symbol_tables.add(symbol_table);
             let mut actual_return_type = Type::Void;
-            let mut res = Ok(Type::Void);
             for n in body {
-                res = resolve_type(global_scope, var_tables, n);
-                match &res {
-                    Err(e) => break,
-                    Ok(t) => match n {
-                        Node::Return(_) => {
-                            actual_return_type = (*t).clone();
-                            break;
-                        }
-                        _ => (),
-                    },
+                let t = resolve_type(global_scope, symbol_tables, n, Some(return_type))?;
+                if t.returned {
+                    returned = true;
+                    actual_return_type = assert_type(actual_return_type, t.sk_type)?;
+                } else {
+                    actual_return_type = t.sk_type
                 }
             }
-            var_tables.pop();
-            if let Err(_) = res {
-                return res;
+            symbol_tables.pop();
+
+            if !returned && *return_type != Void {
+                return Err("missing return statement".to_string());
             }
+
             if actual_return_type != *return_type {
                 Err(format!(
                     "function '{}' return type mismatch. expected={:?}, actual={:?}",
                     name, return_type, actual_return_type
                 ))
             } else {
-                Ok(Type::Function {
+                Ok(ResolveResult::new(Type::Function {
                     parameters: parameters.iter().map(|p| p.1.clone()).collect(),
                     return_type: Box::new(return_type.clone()),
-                })
+                }))
             }
         }
         Node::VariableDeclaration {
@@ -411,13 +523,19 @@ fn resolve_type(
             value,
             metadata,
         } => {
-            var_tables.get_mut().add(Symbol {
+            // println!("variable declaration {}:{:?}", name, var_type);
+            symbol_tables.get_mut().add(Symbol {
                 name: name.clone(),
                 sk_type: var_type.clone(),
-                metadata: metadata.clone(),
             });
             if let Some(body) = value {
-                let value_type = resolve_type(global_scope, var_tables, &body.deref())?;
+                let value_type = resolve_type(
+                    global_scope,
+                    symbol_tables,
+                    &body.deref(),
+                    expected_type_opt,
+                )?
+                .sk_type;
                 if *var_type != value_type {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
@@ -427,67 +545,73 @@ fn resolve_type(
                         metadata
                     ))
                 } else {
-                    Ok(var_type.clone())
+                    // println!("result variable declaration {}:{:?}", name, var_type);
+                    Ok(ResolveResult::new(var_type.clone()))
                 }
             } else {
-                Ok(var_type.clone())
+                Ok(ResolveResult::new(var_type.clone()))
             }
         }
         Node::FunctionCall {
             name, arguments, ..
         } => {
-            let mut functions: HashMap<String, FunctionSymbol> = HashMap::new(); // lambdas
-            let var_table = var_tables.get();
-            for s in var_table.vars.values() {
-                match &s.sk_type {
-                    Type::Function {
-                        parameters,
-                        return_type,
-                        ..
-                    } => {
-                        functions.insert(
-                            s.name.clone(),
-                            FunctionSymbol {
-                                name: s.name.clone(),
-                                parameters: parameters
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, p)| Symbol {
-                                        name: i.to_string(),
-                                        sk_type: p.clone(),
-                                        metadata: Metadata::EMPTY,
-                                    })
-                                    .collect(),
-                                return_type: return_type.deref().clone(),
-                                lambda: true,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            let func_symbol = functions
-                .get(name)
-                .or_else(|| global_scope.functions.get(name))
+            let func_symbol = symbol_tables
+                .get_fun(name)
+                .or_else(|| global_scope.functions.get(name).cloned())
                 .expect(format!("function '{}' not found", name).as_ref());
 
-            resolve_function_call(global_scope, var_tables, func_symbol, node)
+            resolve_function_call(global_scope, symbol_tables, &func_symbol, node)
+                .map(|t| ResolveResult::new(t))
         }
         Node::BinaryOp {
             left,
             operator,
             right,
         } => {
-            let left_type = resolve_type(global_scope, var_tables, left.deref())?;
-            let right_type = resolve_type(global_scope, var_tables, right.deref())?;
+            let left_type =
+                resolve_type(global_scope, symbol_tables, left.deref(), expected_type_opt)?.sk_type;
+            let right_type = resolve_type(
+                global_scope,
+                symbol_tables,
+                right.deref(),
+                expected_type_opt,
+            )?
+            .sk_type;
             match operator {
-                Operator::Add => resolve_add(&left_type, &right_type),
-                _ => unreachable!("todo"),
+                Operator::Add => {
+                    resolve_add(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::Multiply => {
+                    resolve_multiply(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::Mod => {
+                    resolve_mod(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::LessThan
+                | Operator::GreaterThan
+                | Operator::GreaterThanOrEqual
+                | Operator::LessThanOrEqual => {
+                    resolve_cmp(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::Equals => {
+                    resolve_eq(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::NotEquals => {
+                    resolve_not_eq(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                _ => unreachable!("todo {:?}", operator),
             }
         }
         Node::Assignment { var, value, .. } => {
-            let var_type = resolve_type(global_scope, var_tables, var.deref())?;
-            let value_type = resolve_type(global_scope, var_tables, value.deref())?;
+            let var_type =
+                resolve_type(global_scope, symbol_tables, var.deref(), expected_type_opt)?.sk_type;
+            let value_type = resolve_type(
+                global_scope,
+                symbol_tables,
+                value.deref(),
+                expected_type_opt,
+            )?
+            .sk_type;
             if var_type != value_type {
                 // todo include var name, metadata
                 Err(format!(
@@ -495,37 +619,52 @@ fn resolve_type(
                     var_type, value_type
                 ))
             } else {
-                Ok(var_type.clone())
+                // Ok(var_type.clone())
+                Ok(ResolveResult::new(var_type.clone()))
             }
         }
         Node::ArrayInit { elements } => {
             assert!(elements.len() > 0, "array init cannot be empty");
-            let mut curr: Type = resolve_type(global_scope, var_tables, &elements[0])?;
+            let mut curr: Type =
+                resolve_type(global_scope, symbol_tables, &elements[0], expected_type_opt)?.sk_type;
             for i in 1..elements.len() {
-                let t = resolve_type(global_scope, var_tables, &elements[i])?;
+                let t = resolve_type(global_scope, symbol_tables, &elements[i], expected_type_opt)?
+                    .sk_type;
                 if t != curr {
                     return Err("invalid arr value type".to_string());
                 }
                 curr = t;
             }
-            Ok(Type::Slice {
+            Ok(ResolveResult::new(Type::Slice {
                 elem_type: Box::new(curr),
-            })
+            }))
         }
-        Node::Literal(Literal::Integer(_)) => Ok(Type::Int),
-        Node::Literal(Literal::Boolean(_)) => Ok(Type::Boolean),
-        Node::Literal(Literal::StringLiteral(_)) => Ok(Type::String),
-        Node::EOI => Ok(Type::Void),
-        Node::Identifier(name) => var_tables
-            .get()
-            .vars
-            .get(name)
-            .map(|v| v.sk_type.clone())
-            .or(global_scope.variables.get(name).map(|v| v.sk_type.clone()))
-            .ok_or(format!("unknown variable '{}'", name)),
+        Node::Literal(Literal::Integer(_)) => Ok(ResolveResult::new(Type::Int)),
+        Node::Literal(Literal::Boolean(_)) => Ok(ResolveResult::new(Type::Boolean)),
+        Node::Literal(Literal::StringLiteral(_)) => Ok(ResolveResult::new(Type::String)),
+        Node::EOI => Ok(ResolveResult::new(Type::Void)),
+        Node::Identifier(name) => {
+            let res = symbol_tables
+                .get_symbol(name)
+                .map(|v| ResolveResult::new(v.sk_type.clone()))
+                .or(global_scope
+                    .variables
+                    .get(name)
+                    .map(|v| ResolveResult::new(v.sk_type.clone())))
+                .ok_or(format!("unknown variable '{}'", name));
+            // println!("resolve identifier {}, res={:?}", name, res);
+            res
+        }
         Node::Access { nodes } => {
-            let start = resolve_type(global_scope, var_tables, nodes.get(0).unwrap())?;
-            resolve_access(global_scope, var_tables, start, 1, nodes)
+            let start = resolve_type(
+                global_scope,
+                symbol_tables,
+                nodes.get(0).unwrap(),
+                expected_type_opt,
+            )?
+            .sk_type;
+            resolve_access(global_scope, symbol_tables, start, 1, nodes)
+                .map(|t| ResolveResult::new(t))
         }
         Node::StaticFunctionCall {
             _type,
@@ -545,9 +684,13 @@ fn resolve_type(
                             metadata.span.line, metadata.span.start,
                         ));
                     }
-                    let arg_type =
-                        resolve_type(global_scope, var_tables, arguments.get(0).unwrap())?;
-                    if arg_type != *elem_type.deref() {
+                    let arg_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        arguments.get(0).unwrap(),
+                        expected_type_opt,
+                    )?;
+                    if arg_type.sk_type != *elem_type.deref() {
                         return Err(format!("error {}:{}: array `new`. expected arg type is `{:?}` but given `{:?}`",
                                            metadata.span.line,
                                            metadata.span.start,
@@ -555,33 +698,153 @@ fn resolve_type(
                     }
                 }
                 Type::Slice { .. } => {}
-                Custom(_) => {}
+                Type::Custom(_) => {}
                 Type::Function { .. } => {}
                 Type::SkSelf => {}
             }
-            Ok(_type.clone())
+            Ok(ResolveResult::new(_type.clone()))
         }
-        Node::Return(body) => resolve_type(global_scope, var_tables, body),
         Node::Block { statements } => {
-            let var_table = var_tables.get().clone();
-            var_tables.add(var_table);
-
+            let var_table = symbol_tables.get().clone();
+            symbol_tables.add(var_table);
+            let mut result = Type::Void;
             for statement in statements {
-                let res = resolve_type(global_scope, var_tables, statement);
-                if let Err(_) = res {
-                    return res;
+                let res = resolve_type(global_scope, symbol_tables, statement, expected_type_opt)?;
+                if res.returned {
+                    result = assert_type(result, Type::Void)?;
                 }
             }
-            Ok(Type::Void) // do we need to check Return node ?
+            if result != Type::Void {
+                Ok(ResolveResult::returned(result))
+            } else {
+                Ok(ResolveResult::new(Type::Void))
+            }
         }
-        Node::Print(n) => resolve_type(global_scope, var_tables, n.deref()),
+        Node::If {
+            condition,
+            body,
+            else_block,
+            else_if_blocks,
+        } => {
+            let mut returned = false;
+            let cond_type =
+                resolve_type(global_scope, symbol_tables, condition, expected_type_opt)?.sk_type;
+            if cond_type != Type::Boolean {
+                return Err(format!(
+                    "if condition type mismatch. expected boolean, got {:?}",
+                    cond_type
+                ));
+            }
+
+            // let mut types = HashSet::new();
+            let mut result = Type::Void;
+            for n in body {
+                let res = resolve_type(global_scope, symbol_tables, n, expected_type_opt)?;
+                if res.returned {
+                    returned = true;
+                    // println!("if returns = {:?}", res);
+                    result = assert_type(result, res.sk_type)?;
+                }
+            }
+            for n in else_if_blocks {
+                let res = resolve_type(global_scope, symbol_tables, n, expected_type_opt)?;
+                if res.returned {
+                    // println!("else_if returns = {:?}", res);
+                    result = assert_type(result, res.sk_type)?;
+                } else {
+                    returned = false;
+                }
+            }
+
+            if let Some(nodes) = else_block {
+                for n in nodes {
+                    let res = resolve_type(global_scope, symbol_tables, n, expected_type_opt)?;
+                    if res.returned {
+                        // println!("else returns = {:?}", res);
+                        result = assert_type(result, res.sk_type)?;
+                    } else {
+                        returned = false;
+                    }
+                }
+            } else {
+                returned = false;
+            }
+            if returned {
+                Ok(ResolveResult::returned(result))
+            } else {
+                Ok(ResolveResult::new(Type::Void))
+            }
+        }
+        Node::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(init_node) = init {
+                resolve_type(global_scope, symbol_tables, init_node, None)?;
+            }
+
+            if let Some(cond_node) = condition {
+                let cond_type = resolve_type(global_scope, symbol_tables, cond_node, None)?.sk_type;
+                if cond_type != Type::Boolean {
+                    return Err(format!(
+                        "For loop condition must be of type Boolean, got {:?}",
+                        cond_type
+                    ));
+                }
+            }
+
+            if let Some(update_node) = update {
+                resolve_type(global_scope, symbol_tables, update_node, None)?;
+            }
+
+            let mut returned = false;
+            let mut body_return_type = Type::Void;
+            for statement in body {
+                let res = resolve_type(global_scope, symbol_tables, statement, None)?;
+                if res.returned {
+                    returned = true;
+                    body_return_type = assert_type(body_return_type, res.sk_type)?;
+                }
+            }
+            Ok(if returned {
+                ResolveResult::returned(body_return_type)
+            } else {
+                ResolveResult::new(Type::Void)
+            })
+        }
+
+        Node::Print(n) => {
+            resolve_type(global_scope, symbol_tables, n.deref(), expected_type_opt)?; // verify string
+            Ok(ResolveResult::new(Type::Void))
+        }
+        Node::Return(body_opt) => {
+            let mut res = ResolveResult::returned(Type::Void);
+            if let Some(body) = body_opt {
+                res = resolve_type(global_scope, symbol_tables, body, expected_type_opt)?
+                    .to_returned();
+            }
+            if let Some(expected_type) = expected_type_opt {
+                if *expected_type != res.sk_type {
+                    return Err(format!(
+                        "return invalid type. expected={:?}, actual={:?}",
+                        expected_type, res.sk_type
+                    ));
+                }
+            }
+            Ok(res)
+        }
+        Node::UnaryOp { operator, operand } => {
+            resolve_type(global_scope, symbol_tables, operand, expected_type_opt)
+        }
         _ => unreachable!("{}", format!("{:?}", node)),
     }
 }
 
 pub fn check(node: &Node) -> Result<(), String> {
-    let mut var_tables = VarTables::new();
-    var_tables.add(VarTable::new());
+    let mut var_tables = SymbolTables::new();
+    var_tables.add(SymbolTable::new());
     let mut global_scope = GlobalScope::new();
     match node {
         Node::Program { statements } => {
@@ -591,7 +854,7 @@ pub fn check(node: &Node) -> Result<(), String> {
         }
         _ => panic!("expected program node"),
     }
-    match resolve_type(&mut global_scope, &mut var_tables, node) {
+    match resolve_type(&mut global_scope, &mut var_tables, node, None) {
         Err(e) => Err(e.to_string()),
         Ok(_) => Ok(()),
     }
@@ -801,6 +1064,271 @@ mod tests {
         }
         g: (int) -> int = f();
         g(1);
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_lambda() {
+        let source_code = r#"
+        function f(times:int): () -> int {
+            count: int = 0;
+            g: () -> int = function(): int {
+                count = count + 1;
+                if (count == times) {
+                    return count;
+                } else {
+                    return g();
+                }
+            }
+            return g;
+        }
+        f(3)();
+        "#;
+
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_return_in_if() {
+        let source_code = r#"
+        function f(a: int): int {
+            if (a > 0) {
+                return a;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_missing_return_in_else() {
+        let source_code = r#"
+        function f(a: int): int {
+            if (a > 0) {
+                return a;
+            } else {
+                print("log");
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_complete_return_in_if_else() {
+        let source_code = r#"
+        function f(a: int): int {
+            if (a > 0) {
+                return a;
+            } else {
+                return 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_return_in_nested_if() {
+        let source_code = r#"
+        function f(a: int, b: int): int {
+            if (a > 0) {
+                if (b > 0) {
+                    return a + b;
+                } else {
+                    return a;
+                }
+            } else {
+                return 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_return_in_nested_if() {
+        let source_code = r#"
+        function f(a: int, b: int): int {
+            if (a > 0) {
+                if (b > 0) {
+                    return a + b;
+                }
+            } else {
+                return 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_return_in_for_loop() {
+        let source_code = r#"
+        function f(limit: int): int {
+            for (i: int = 0; i < limit; i = i + 1) {
+                if (i == 5) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_return_in_for_loop() {
+        let source_code = r#"
+        function f(limit: int): int {
+            for (i: int = 0; i < limit; i = i + 1) {
+                if (i == 5) {
+                    return i;
+                }
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_return_in_nested_for_loops() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; i = i + 1) {
+                for (j: int = 0; j < 10; j = j + 1) {
+                    if (i + j == 10) {
+                        return i * 10 + j;
+                    }
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_empty_for_loop_body() {
+        let source_code = r#"
+        function f(limit: int): int {
+            for (i: int = 0; i < limit; i = i + 1) {}
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_for_loop_without_condition() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; ; i = i + 1) {
+                if (i == 10) {
+                    return i;
+                }
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_for_loop_without_update() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; ) {
+                if (i == 5) {
+                    return i;
+                }
+                i = i + 1; // Manual update
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_for_loop_without_initialization() {
+        let source_code = r#"
+        function f(): int {
+            i: int = 0;
+            for (; i < 10; i = i + 1) {
+                if (i == 5) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_complex_for_loop_with_nested_control() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; i = i + 1) {
+                if (i % 2 == 0) {
+                    for (j: int = 0; j < 5; j = j + 1) {
+                        if (j == 3) {
+                            return i * 10 + j;
+                        }
+                    }
+                }
+            }
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    // #[test] todo
+    fn test_unreachable_code_after_for_loop() {
+        let source_code = r#"
+        function f(): int {
+            for (i: int = 0; i < 10; i = i + 1) {
+                return i;
+            }
+            // This code should be unreachable
+            return -1;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_function_call_inside_control_flow() {
+        let source_code = r#"
+        function g(): int {
+            return 42;
+        }
+
+        function f(a: int): int {
+            if (a > 0) {
+                return g();
+            } else {
+                return 0;
+            }
+        }
         "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
