@@ -222,6 +222,18 @@ fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
     match (left, right) {
         (Type::Int, Type::Int) => Ok(Type::Int),
         (Type::String, Type::String) => Ok(Type::String),
+        (Type::Int, Type::String) => Ok(Type::String),
+        (Type::String, Type::Int) => Ok(Type::String),
+        _ => Err(format!(
+            "unexpected types for +: {:?} and {:?}",
+            left, right
+        )),
+    }
+}
+
+fn resolve_subtract(left: &Type, right: &Type) -> Result<Type, String> {
+    match (left, right) {
+        (Type::Int, Type::Int) => Ok(Type::Int),
         _ => Err(format!(
             "unexpected types for +: {:?} and {:?}",
             left, right
@@ -366,6 +378,10 @@ fn resolve_function_call(
                     return_type,
                     ..
                 } => {
+                    let mut parameters = &parameters[0..];
+                    if parameters.len() > 0 && *parameters.first().unwrap() == Type::SkSelf {
+                        parameters = &parameters[1..];
+                    }
                     if args.len() != parameters.len() {
                         return Err(format!(
                             "incorrect number of args to function {}. expected={}, actual={}",
@@ -493,10 +509,12 @@ fn resolve_type(
             for n in body {
                 let t = resolve_type(global_scope, symbol_tables, n, Some(return_type))?;
                 if t.returned {
+                    println!(
+                        "function '{}', return type={:?}, actual={:?}",
+                        name, return_type, t.sk_type
+                    );
                     returned = true;
                     actual_return_type = assert_type(actual_return_type, t.sk_type)?;
-                } else {
-                    actual_return_type = t.sk_type
                 }
             }
             symbol_tables.pop();
@@ -580,6 +598,9 @@ fn resolve_type(
             match operator {
                 Operator::Add => {
                     resolve_add(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::Subtract => {
+                    resolve_subtract(&left_type, &right_type).map(|t| ResolveResult::new(t))
                 }
                 Operator::Multiply => {
                     resolve_multiply(&left_type, &right_type).map(|t| ResolveResult::new(t))
@@ -822,14 +843,17 @@ fn resolve_type(
         Node::Return(body_opt) => {
             let mut res = ResolveResult::returned(Type::Void);
             if let Some(body) = body_opt {
-                res = resolve_type(global_scope, symbol_tables, body, expected_type_opt)?
-                    .to_returned();
+                res = resolve_type(global_scope, symbol_tables, body, None)?.to_returned();
+                println!(
+                    "return body: {:?}, type={:?}, expected={:?}",
+                    body, res, expected_type_opt
+                );
             }
             if let Some(expected_type) = expected_type_opt {
                 if *expected_type != res.sk_type {
                     return Err(format!(
-                        "return invalid type. expected={:?}, actual={:?}",
-                        expected_type, res.sk_type
+                        "return invalid type. expected={:?}, actual={:?}, body={:?}",
+                        expected_type, res.sk_type, body_opt
                     ));
                 }
             }
@@ -871,19 +895,19 @@ mod tests {
             x:int;
             y:int;
 
-            function set_x(x:int) {
+            function set_x(self, x:int) {
                 self.x = x;
             }
 
-            function get_x():int {
+            function get_x(self):int {
                return self.x;
             }
 
-            function set_y(y:int) {
+            function set_y(self, y:int) {
                 self.y = y;
             }
 
-            function get_y():int {
+            function get_y(self):int {
                 return self.y;
             }
         }
@@ -906,11 +930,11 @@ mod tests {
     #[test]
     fn test_function_call_wrong_args() {
         let source_code = r#"
-    function foo(a: int): int {
-        return a;
-    }
-    foo("string"); // This should fail
-    "#;
+        function foo(a: int): int {
+            return a;
+        }
+        foo("string");
+        "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
     }
@@ -918,13 +942,13 @@ mod tests {
     #[test]
     fn test_struct_field_not_exist() {
         let source_code = r#"
-    struct Point {
-        x: int;
-        y: int;
-    }
-    p: Point = Point { x: 0, y: 0 };
-    a = p.z; // 'z' field does not exist
-    "#;
+        struct Point {
+            x: int;
+            y: int;
+        }
+        p: Point = Point { x: 0, y: 0 };
+        a = p.z; // 'z' field does not exist
+        "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
     }
@@ -932,10 +956,10 @@ mod tests {
     #[test]
     fn test_function_return_type_mismatch() {
         let source_code = r#"
-    function foo(): int {
-        return "string"; // Should fail since return type is expected to be int
-    }
-    "#;
+        function foo(): int {
+            return "string";
+        }
+        "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
     }
@@ -943,9 +967,9 @@ mod tests {
     #[test]
     fn test_array_access_wrong_type() {
         let source_code = r#"
-    arr: int[5] = int[5]::new(1);
-    s: string = arr[0]; // Should fail: assigning int to string
-    "#;
+        arr: int[5] = int[5]::new(1);
+        s: string = arr[0];
+        "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
     }
@@ -990,13 +1014,13 @@ mod tests {
     #[test]
     fn test_variable_scope_nested_block() {
         let source_code = r#"
-    a: int = 5;
-    {
-        a: string = "nested";
-        print(a); // Should refer to 'string' type
-    }
-    print(a); // Should refer to 'int' type
-    "#;
+        a: int = 5;
+        {
+            a: string = "nested";
+            print(a); // Should refer to 'string' type
+        }
+        print(a); // Should refer to 'int' type
+        "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
     }
@@ -1060,7 +1084,7 @@ mod tests {
         function f(): (int) -> int {
             return function (a:int): int {
                 return a;
-            }
+            };
         }
         g: (int) -> int = f();
         g(1);
@@ -1087,6 +1111,71 @@ mod tests {
         f(3)();
         "#;
 
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_nested_lambda() {
+        let source_code = r#"
+        nested: () -> () -> int = function(): () -> int {
+            inner_count: int = 0;
+            return function(): int {
+                inner_count = inner_count + 1;
+                return inner_count;
+            };
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_nested_lambdas() {
+        let source_code = r#"
+        i: int = 0;
+
+        a: () -> () -> int = function(): () -> int {
+            i = i + 1;
+            j: int = 0;
+
+            b: () -> () -> int = function(): () -> int {
+                i = i + 1;
+                j = j + 1;
+                k: int = 0;
+
+                c: () -> int = function(): int {
+                    i = i + 1;
+                    j = j + 1;
+                    k = k + 1;
+                    return i + j + k;
+                }
+
+                return c;
+            }
+
+            return b();
+        }
+
+        f: () -> int = a();
+        res: int = f();
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_return_lambda() {
+        let source_code = r#"
+        function counter(): () -> int {
+        c: int = 0;
+        return function(): int {
+            c = c + 1;
+            return c;
+        };
+        }
+        count: () -> int = counter();
+        "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
     }

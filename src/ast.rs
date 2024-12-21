@@ -2810,14 +2810,14 @@ mod tests {
     #[test]
     fn test_return_function() {
         let source_code = r#"
-    function f(): (int) -> int {
-        return function(a:int):int {
-            return a;
+        function f(): (int) -> int {
+            return function(a:int):int {
+                return a;
+            };
         }
-    }
-    g: (int) -> int = f();
-    g(47);
-    "#;
+        g: (int) -> int = f();
+        g(47);
+        "#;
 
         assert_eq!(
             Node::Program {

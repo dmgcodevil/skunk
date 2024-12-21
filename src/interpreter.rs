@@ -2138,7 +2138,7 @@ mod tests {
         function f(): (int) -> int {
             return function (a:int): int {
                 return a;
-            }
+            };
         }
 
         f()(47);
@@ -2156,7 +2156,7 @@ mod tests {
             return function (): int {
                 c = c + 1;
                 return c;
-            }
+            };
         }
 
         counter: () -> int = f();
@@ -2251,7 +2251,7 @@ mod tests {
             function f(self): (int) -> int {
                 return function(i:int): int {
                     return i;
-                }
+                };
             }
         }
         foo:Foo = Foo{};
