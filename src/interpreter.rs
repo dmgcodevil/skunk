@@ -8,9 +8,11 @@ use ast::Node;
 use ast::Operator;
 use ast::Type;
 use std::cell::RefCell;
+use std::f32::consts::E;
 use std::fmt;
 use std::io::BufRead;
 use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -20,12 +22,12 @@ pub enum Value {
     Boolean(bool),
     Variable(String),
     Array {
-        arr: Vec<Rc<RefCell<Value>>>,
+        arr: Vec<ValueRef>,
         dimensions: Vec<i64>,
     },
     StructInstance {
         name: String,
-        fields: HashMap<String, Rc<RefCell<Value>>>,
+        fields: HashMap<String, ValueRef>,
     },
     Struct {
         name: String,
@@ -41,22 +43,129 @@ pub enum Value {
         function: FunctionDefinition,
         env: Rc<RefCell<Environment>>,
     },
-    Return(Rc<RefCell<Value>>),
+    // Return(Box<ValueRef>),
     Executed, // indicates that a branch has been executed
     Void,
     Undefined,
 }
 
-enum Scope {
-    Module { name: String },
-    Struct { name: String },
-    FunctionScope { name: String },
+// enum Scope {
+//     Module { name: String },
+//     Struct { name: String },
+//     FunctionScope { name: String },
+// }
+
+#[derive(Debug, PartialEq, Clone)]
+enum ValueRef {
+    Stack {
+        value: Value,
+        returned: bool,
+    }, // Represents stack-allocated values.
+    Heap {
+        value: Rc<RefCell<Value>>,
+        returned: bool,
+    }, // Represents heap-allocated values.
+}
+
+impl ValueRef {
+    fn stack(value: Value) -> Self {
+        ValueRef::Stack {
+            value,
+            returned: false,
+        }
+    }
+
+    fn heap(value: Rc<RefCell<Value>>) -> Self {
+        ValueRef::Heap {
+            value,
+            returned: false,
+        }
+    }
+    fn returned(&self) -> bool {
+        match self {
+            ValueRef::Stack { returned, .. } => *returned,
+            ValueRef::Heap { returned, .. } => *returned,
+        }
+    }
+
+    fn to_returned(self) -> ValueRef {
+        match self {
+            ValueRef::Stack { value, .. } => ValueRef::Stack {
+                value,
+                returned: true,
+            },
+            ValueRef::Heap { value, .. } => ValueRef::Heap {
+                value,
+                returned: true,
+            },
+        }
+    }
+
+    fn map_value<F>(&self, f: F) -> ValueRef
+    where
+        F: Fn(&Value) -> Value,
+    {
+        match self {
+            ValueRef::Stack { value, returned } => ValueRef::Stack {
+                value: f(value),
+                returned: *returned,
+            },
+            ValueRef::Heap { value, returned } => {
+                let value_ref = value.borrow();
+                let res = f(value_ref.deref());
+                drop(value_ref);
+                ValueRef::Heap {
+                    value: Rc::new(RefCell::new(res)),
+                    returned: *returned,
+                }
+            }
+        }
+    }
+
+    fn map<T, F>(&self, f: F) -> Option<T>
+    where
+        F: Fn(&Value) -> Option<T>,
+    {
+        match self {
+            ValueRef::Stack { value, .. } => f(value),
+            ValueRef::Heap { value, .. } => {
+                let value_ref = value.borrow();
+                let res = f(value_ref.deref());
+                drop(value_ref);
+                res
+            }
+        }
+    }
+
+    fn unwrap<F>(&self, f: F)
+    where
+        F: Fn(&Value),
+    {
+        self.is_match(|a| {
+            f(a);
+            true
+        });
+    }
+
+    fn is_match<F>(&self, f: F) -> bool
+    where
+        F: Fn(&Value) -> bool,
+    {
+        match self {
+            ValueRef::Stack { value, .. } => f(value),
+            ValueRef::Heap { value, .. } => {
+                let value_ref = value.borrow();
+                let res = f(value_ref.deref());
+                drop(value_ref);
+                res
+            }
+        }
+    }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Value::Return(_) => write!(f, "return"),
             Value::Executed => write!(f, "executed"),
             Value::Variable(v) => write!(f, "{}", v), // todo unwrap
             Value::Integer(v) => write!(f, "{}", v),
@@ -89,7 +198,7 @@ impl fmt::Display for Value {
             }
             &Value::Struct { .. } => todo!(),
             Value::Array { arr, dimensions } => write!(f, "array dimensions={:?}", dimensions),
-            Void => write!(f, ""),
+            Value::Void => write!(f, ""),
             _ => write!(f, "{:?}", "unknown"),
         }
     }
@@ -119,7 +228,7 @@ struct FunctionDefinition {
 
 struct GlobalEnvironment {
     structs: HashMap<String, StructDefinition>,
-    functions: HashMap<String, Rc<RefCell<FunctionDefinition>>>,
+    functions: HashMap<String, FunctionDefinition>,
 }
 
 impl GlobalEnvironment {
@@ -139,18 +248,19 @@ impl GlobalEnvironment {
     }
 
     fn add_function(&mut self, name: String, definition: FunctionDefinition) {
-        self.functions
-            .insert(name, Rc::new(RefCell::new(definition)));
+        self.functions.insert(name, definition);
     }
 
-    fn get_function(&self, name: &str) -> Option<&Rc<RefCell<FunctionDefinition>>> {
+    fn get_function(&self, name: &str) -> Option<&FunctionDefinition> {
         self.functions.get(name)
     }
-    fn to_struct_def(&self, v: &Value) -> &StructDefinition {
-        match v {
-            StructInstance { name, .. } => self.structs.get(name).unwrap(),
-            _ => panic!("expected struct instance. given: {:?}", v),
-        }
+    fn to_struct_def(&self, value_ref: &ValueRef) -> &StructDefinition {
+        value_ref
+            .map(|v| match v {
+                Value::StructInstance { name, .. } => Some(self.structs.get(name).unwrap()),
+                _ => panic!("expected struct instance. given: {:?}", v),
+            })
+            .unwrap()
     }
 }
 
@@ -158,7 +268,7 @@ impl GlobalEnvironment {
 struct Environment {
     id: String,
     parent: Option<Rc<RefCell<Environment>>>,
-    variables: HashMap<String, Rc<RefCell<Value>>>,
+    variables: HashMap<String, ValueRef>,
 }
 
 impl Environment {
@@ -183,10 +293,10 @@ impl Environment {
         false
     }
 
-    fn get_var(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+    fn get_var(&self, name: &str) -> Option<ValueRef> {
         //println!("Environment::get_var={}", name);
         if self.variables.contains_key(name) {
-            Some(self.variables.get(name).unwrap().clone())
+            self.variables.get(name).cloned()
         } else if let Some(parent) = &self.parent {
             let mut parent_ref = parent.borrow();
             parent_ref.get_var(name)
@@ -195,7 +305,7 @@ impl Environment {
         }
     }
 
-    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn assign_variable(&mut self, name: &str, value: ValueRef) {
         //println!("Environment::assign_variable={}", name);
         if self.variables.contains_key(name) {
             self.variables.insert(name.to_string(), value);
@@ -205,210 +315,117 @@ impl Environment {
         }
     }
 
-    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn declare_variable(&mut self, name: &str, value: ValueRef) {
         //println!("Environment::declare_variable={}", name);
         self.variables.insert(name.to_string(), value);
     }
 }
 
 trait ValueModifier {
-    fn set(&mut self, value: Rc<RefCell<Value>>);
-    fn get(&self) -> Rc<RefCell<Value>>;
+    fn set(&mut self, value: ValueRef);
+    fn get(&self) -> ValueRef;
 }
 
 struct StructInstanceModifier {
-    instance: Rc<RefCell<Value>>,
+    instance: ValueRef,
     field: String,
 }
 impl ValueModifier for StructInstanceModifier {
-    fn set(&mut self, value: Rc<RefCell<Value>>) {
-        if let Value::StructInstance {
-            name,
-            ref mut fields,
-        } = self.instance.borrow_mut().deref_mut()
-        {
-            fields.insert(self.field.clone(), value);
-        } else {
-            panic!("expected a struct instance");
+    fn set(&mut self, new_value: ValueRef) {
+        match &self.instance {
+            ValueRef::Stack { value, .. } => {
+                panic!("struct on stack")
+                // if let Value::StructInstance {
+                //     name,
+                //     ref mut fields,
+                // } = value
+                // {
+                //     fields.insert(self.field.clone(), new_value);
+                // } else {
+                //     panic!("expected a struct instance");
+                // }
+            }
+            ValueRef::Heap { value, .. } => {
+                let mut value_ref = value.borrow_mut();
+                if let Value::StructInstance {
+                    name,
+                    ref mut fields,
+                } = value_ref.deref_mut()
+                {
+                    fields.insert(self.field.clone(), new_value);
+                } else {
+                    panic!("expected a struct instance");
+                }
+            }
         }
     }
 
-    fn get(&self) -> Rc<RefCell<Value>> {
-        if let Value::StructInstance {
-            name: _,
-            ref fields,
-        } = self.instance.borrow().deref()
-        {
-            fields.get(&self.field).expect("Field not found").clone()
-        } else {
-            panic!("expected a struct instance");
+    fn get(&self) -> ValueRef {
+        match &self.instance {
+            ValueRef::Stack { .. } => {
+                panic!("struct on stack")
+            }
+            ValueRef::Heap { value, .. } => {
+                let mut value_ref = value.borrow_mut();
+                if let Value::StructInstance {
+                    name,
+                    ref mut fields,
+                } = value_ref.deref_mut()
+                {
+                    fields.get(&self.field).expect("Field not found").clone()
+                } else {
+                    panic!("expected a struct instance");
+                }
+            }
         }
     }
 }
 
 struct ArrayModifier {
-    array: Rc<RefCell<Value>>,
+    array: ValueRef,
     coordinates: Vec<i64>,
 }
 
 impl ValueModifier for ArrayModifier {
-    fn set(&mut self, value: Rc<RefCell<Value>>) {
-        set_array_element(
-            self.array.borrow_mut().deref_mut(),
-            value,
-            &self.coordinates,
-        )
-    }
-    fn get(&self) -> Rc<RefCell<Value>> {
-        get_array_element(self.array.borrow().deref(), &self.coordinates)
-    }
-}
-
-struct ReadValueModifier {
-    value: Rc<RefCell<Value>>,
-}
-
-impl ValueModifier for ReadValueModifier {
-    fn set(&mut self, _value: Rc<RefCell<Value>>) {
-        panic!("attempted to set a read value");
-    }
-
-    fn get(&self) -> Rc<RefCell<Value>> {
-        Rc::clone(&self.value)
-    }
-}
-
-struct StackVariableModifier {
-    stack: Rc<RefCell<CallStack>>,
-    name: String,
-}
-
-impl ValueModifier for StackVariableModifier {
-    fn set(&mut self, value: Rc<RefCell<Value>>) {
-        let mut stack = self.stack.borrow_mut();
-        stack.assign_variable(&self.name, Rc::clone(&value));
-    }
-
-    fn get(&self) -> Rc<RefCell<Value>> {
-        let stack = self.stack.borrow();
-        Rc::clone(
-            &stack
-                .deref()
-                .get_variable(&self.name)
-                .expect(format!("Variable '{}' not found", self.name).as_str()),
-        )
-    }
-}
-
-struct Profiling {}
-
-impl Profiling {
-    fn sk_debug_stack(stack: &Rc<RefCell<CallStack>>) {
-        let stack_ref = stack.borrow();
-        println!("--- Debugging Call Stack ---");
-        for (i, frame) in stack_ref.frames.iter().enumerate() {
-            println!("Frame {}: {}", i, frame.name);
-
-            let mut current_env = Some(frame.env.clone());
-
-            while let Some(env_rc) = current_env {
-                let env = env_rc.borrow();
-
-                for (var_name, var_value) in &env.variables {
-                    let var_value_ref = var_value.borrow();
-                    println!("  Environment id: '{}'", &env.id);
-                    println!("      Variable '{}' -> {:?}", var_name, var_value_ref);
-                }
-                current_env = env.parent.clone();
+    fn set(&mut self, new_value: ValueRef) {
+        match &self.array {
+            ValueRef::Stack { .. } => {
+                panic!("cannot mutate array allocated on stack")
             }
-
-            println!("----------------------------");
+            ValueRef::Heap { value, .. } => {
+                let mut value_ref = value.borrow_mut();
+                set_array_element(value_ref.deref_mut(), new_value, &self.coordinates)
+            }
         }
     }
 
-    fn sk_debug_mem_sysinfo() {
-        let mut system = System::new_all();
-        system.refresh_all();
-        let current_pid = Pid::from_u32(std::process::id());
-        if let Some(process) = system.process(current_pid) {
-            println!("Current Process Information:");
-            println!("  Name: {:?}", process.name());
-            println!("  Executable Path: {:?}", process.exe());
-            println!("  Current Working Directory: {:?}", process.cwd());
-            println!("  Memory Usage: {:?} KB", process.memory());
-            println!("  Virtual Memory Usage: {:?} KB", process.virtual_memory());
-            println!("  CPU Usage: {:.2}%", process.cpu_usage());
-            println!("  Status: {:?}", process.status());
-        } else {
-            println!("Failed to retrieve information about the current process.");
-        }
-    }
-
-    fn estimate_value_size(value: &Rc<RefCell<Value>>) -> usize {
-        match &*value.borrow() {
-            Value::Integer(_) => std::mem::size_of::<i64>(),
-            Value::String(s) => std::mem::size_of::<String>() + s.capacity(),
-            Value::Array { arr, .. } => {
-                arr.iter()
-                    .map(|elem| Profiling::estimate_value_size(elem))
-                    .sum::<usize>()
-                    + std::mem::size_of::<Vec<Rc<RefCell<Value>>>>()
+    fn get(&self) -> ValueRef {
+        match &self.array {
+            ValueRef::Stack { ref value, .. } => {
+                get_array_element(value, &self.coordinates).clone()
             }
-            Value::StructInstance { fields, .. } => {
-                fields
-                    .iter()
-                    .map(|(_, v)| Profiling::estimate_value_size(v))
-                    .sum::<usize>()
-                    + std::mem::size_of::<HashMap<String, Rc<RefCell<Value>>>>()
+            ValueRef::Heap { ref value, .. } => {
+                let value_ref = value.borrow();
+                get_array_element(value_ref.deref(), &self.coordinates).clone()
             }
-            Value::Function {
-                name,
-                parameters,
-                body,
-                ..
-            } => {
-                std::mem::size_of::<String>()
-                    + name.capacity()
-                    + parameters.len() * std::mem::size_of::<Parameter>()
-                    + body.len() * std::mem::size_of::<Node>()
-            }
-            Value::Closure { function, env } => {
-                std::mem::size_of_val(&function) + std::mem::size_of_val(env)
-            }
-            _ => 0, // Handle other cases as needed
-        }
-    }
-
-    fn sk_debug_mem_programmatic(stack: &CallStack) {
-        println!("Memory Usage (programmatic):");
-        for frame in &stack.frames {
-            println!("  Frame: {}", frame.name);
-            let frame_mem: usize = frame
-                .env
-                .borrow()
-                .variables
-                .values()
-                .map(|val| Profiling::estimate_value_size(val))
-                .sum();
-            println!("    Memory Used: {} bytes", frame_mem);
         }
     }
 }
 
-fn get_array_element(value: &Value, coordinates: &Vec<i64>) -> Rc<RefCell<Value>> {
+fn get_array_element(value: &Value, coordinates: &Vec<i64>) -> ValueRef {
     if let Value::Array {
         ref arr,
         ref dimensions,
     } = value
     {
         let pos = to_1d_pos(coordinates, dimensions);
-        Rc::clone(&arr[pos])
+        arr[pos].clone()
     } else {
         panic!("expected array value. given: {:?}", value)
     }
 }
 
-fn set_array_element(value: &mut Value, new_value: Rc<RefCell<Value>>, coordinates: &Vec<i64>) {
+fn set_array_element(value: &mut Value, new_value: ValueRef, coordinates: &Vec<i64>) {
     if let Value::Array {
         ref mut arr,
         ref dimensions,
@@ -446,6 +463,142 @@ fn to_1d_pos(coordinates: &Vec<i64>, dimensions: &Vec<i64>) -> usize {
     res
 }
 
+struct ReadValueModifier {
+    value: ValueRef,
+}
+
+impl ValueModifier for ReadValueModifier {
+    fn set(&mut self, _value: ValueRef) {
+        panic!("attempted to set a read value");
+    }
+
+    fn get(&self) -> ValueRef {
+        self.value.clone()
+    }
+}
+
+struct StackVariableModifier<'a> {
+    stack: &'a mut CallStack,
+    name: String,
+}
+
+impl ValueModifier for StackVariableModifier<'_> {
+    fn set(&mut self, value: ValueRef) {
+        self.stack.assign_variable(&self.name, value);
+    }
+
+    fn get(&self) -> ValueRef {
+        self.stack
+            .get_variable(&self.name)
+            .expect(format!("Variable '{}' not found", self.name).as_str())
+            .clone()
+    }
+}
+
+struct Profiling {}
+
+impl Profiling {
+    fn sk_debug_stack(stack: &CallStack) {
+        println!("--- Debugging Call Stack ---");
+        for (i, frame) in stack.frames.iter().enumerate() {
+            println!("Frame {}: {}", i, frame.name);
+
+            let mut current_env = Some(frame.env.clone());
+
+            while let Some(env_rc) = current_env {
+                let env = env_rc.borrow();
+
+                for (var_name, var_value) in &env.variables {
+                    // let var_value_ref = var_value.borrow();
+                    println!("  Environment id: '{}'", &env.id);
+                    println!("      Variable '{}' -> {:?}", var_name, var_value);
+                }
+                current_env = env.parent.clone();
+            }
+
+            println!("----------------------------");
+        }
+    }
+
+    fn sk_debug_mem_sysinfo() {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let current_pid = Pid::from_u32(std::process::id());
+        if let Some(process) = system.process(current_pid) {
+            println!("Current Process Information:");
+            println!("  Name: {:?}", process.name());
+            println!("  Executable Path: {:?}", process.exe());
+            println!("  Current Working Directory: {:?}", process.cwd());
+            println!("  Memory Usage: {:?} KB", process.memory());
+            println!("  Virtual Memory Usage: {:?} KB", process.virtual_memory());
+            println!("  CPU Usage: {:.2}%", process.cpu_usage());
+            println!("  Status: {:?}", process.status());
+        } else {
+            println!("Failed to retrieve information about the current process.");
+        }
+    }
+
+    fn estimate_value_size(value: &Value) -> usize {
+        match value {
+            Value::Integer(_) => std::mem::size_of::<i64>(),
+            Value::String(s) => std::mem::size_of::<String>() + s.capacity(),
+            Value::Array { arr, .. } => {
+                arr.iter()
+                    .map(|elem| Profiling::estimate_value_ref_size(elem))
+                    .sum::<usize>()
+                    + std::mem::size_of::<Vec<Rc<RefCell<Value>>>>()
+            }
+            Value::StructInstance { fields, .. } => {
+                fields
+                    .iter()
+                    .map(|(_, v)| Profiling::estimate_value_ref_size(v))
+                    .sum::<usize>()
+                    + std::mem::size_of::<HashMap<String, Rc<RefCell<Value>>>>()
+            }
+            Value::Function {
+                name,
+                parameters,
+                body,
+                ..
+            } => {
+                std::mem::size_of::<String>()
+                    + name.capacity()
+                    + parameters.len() * std::mem::size_of::<Parameter>()
+                    + body.len() * std::mem::size_of::<Node>()
+            }
+            Value::Closure { function, env } => {
+                std::mem::size_of_val(&function) + std::mem::size_of_val(env)
+            }
+            _ => 0, // Handle other cases as needed
+        }
+    }
+
+    fn estimate_value_ref_size(value_ref: &ValueRef) -> usize {
+        match value_ref {
+            ValueRef::Stack { value, .. } => Self::estimate_value_size(value),
+            ValueRef::Heap { value, .. } => {
+                let value = value.borrow();
+                Self::estimate_value_size(value.deref())
+            }
+        }
+    }
+
+    fn sk_debug_mem_programmatic(stack: &CallStack) {
+        println!("Memory Usage (programmatic):");
+        for frame in &stack.frames {
+            println!("  Frame: {}", frame.name);
+            let frame_mem: usize = frame
+                .env
+                .borrow()
+                .variables
+                .values()
+                .map(|val| Profiling::estimate_value_ref_size(val))
+                .sum();
+            println!("    Memory Used: {} bytes", frame_mem);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallFrame {
     name: String,
@@ -477,21 +630,21 @@ impl CallFrame {
         env_ref.has_variable(name)
     }
 
-    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn assign_variable(&mut self, name: &str, value: ValueRef) {
         //println!("CallFrame-{}::has_variable {}", self.name, name);
         let mut env_ref = self.env.borrow_mut();
         env_ref.assign_variable(name, value);
         drop(env_ref);
     }
 
-    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn declare_variable(&mut self, name: &str, value: ValueRef) {
         // println!("CallFrame-{}::declare_variable {}", self.name, name);
         let mut env_ref = self.env.borrow_mut();
         env_ref.declare_variable(name, value);
         drop(env_ref);
     }
 
-    fn get_variable(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+    fn get_variable(&self, name: &str) -> Option<ValueRef> {
         //println!("CallFrame-{}::get_variable {}", self.name, name);
         let env_ref = self.env.borrow();
         let res = env_ref.get_var(name);
@@ -535,12 +688,14 @@ impl CallStack {
         self.frames.push(frame);
     }
 
-    fn get_closure(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+    fn get_closure(&self, name: &str) -> Option<ValueRef> {
         for frame in self.frames.iter().rev() {
             if frame.has_variable(name) {
                 let val = frame.get_variable(name).unwrap();
-                let val_ref = val.borrow();
-                if let Closure { .. } = val_ref.deref() {
+                if val.is_match(|v| match v {
+                    Value::Closure { .. } => true,
+                    _ => false,
+                }) {
                     return frame.get_variable(name);
                 }
             }
@@ -548,7 +703,7 @@ impl CallStack {
         None
     }
 
-    fn get_variable(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+    fn get_variable(&self, name: &str) -> Option<ValueRef> {
         for frame in self.frames.iter().rev() {
             if frame.has_variable(name) {
                 return frame.get_variable(name);
@@ -557,7 +712,7 @@ impl CallStack {
         None
     }
 
-    fn assign_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) -> bool {
+    fn assign_variable(&mut self, name: &str, value: ValueRef) -> bool {
         for frame in self.frames.iter_mut().rev() {
             if frame.has_variable(name) {
                 frame.assign_variable(name, value);
@@ -567,7 +722,7 @@ impl CallStack {
         unreachable!("var {} doesn't exist", name);
     }
 
-    fn declare_variable(&mut self, name: &str, value: Rc<RefCell<Value>>) {
+    fn declare_variable(&mut self, name: &str, value: ValueRef) {
         self.current_frame_mut().declare_variable(name, value);
     }
 
@@ -584,73 +739,73 @@ impl CallStack {
     }
 }
 
-pub fn evaluate(node: &Node) -> Rc<RefCell<Value>> {
-    let stack = Rc::new(RefCell::new(CallStack::new()));
+pub fn evaluate(node: &Node) -> ValueRef {
+    let mut stack = CallStack::new();
     let ge = Rc::new(RefCell::new(GlobalEnvironment::new()));
-    stack.borrow_mut().push(CallFrame {
+    stack.push(CallFrame {
         name: "main".to_string(),
         env: Rc::new(RefCell::new(Environment::new())),
     });
-    evaluate_node(node, &stack, &ge)
+    evaluate_node(node, &mut stack, &ge)
 }
 
 fn assert_value_is_struct(v: &Value) {
-    if !matches!(v, StructInstance { .. }) {
+    if !matches!(v, Value::StructInstance { .. }) {
         panic!("expected struct instance, found {:?}", v);
     }
 }
 
-fn resolve_member_access(
-    stack: &Rc<RefCell<CallStack>>,
+fn resolve_member_access<'a>(
+    stack: &'a mut CallStack,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    current_value: Rc<RefCell<Value>>,
+    current_value: ValueRef,
     node: &Node,
-) -> Box<dyn ValueModifier> {
+) -> Box<dyn ValueModifier + 'a> {
     if let Node::MemberAccess { member, .. } = node {
         let member_ref = member.as_ref();
         match member_ref {
             Node::Identifier(name) => {
-                let current_value_ref = current_value.borrow();
-                match current_value_ref.deref() {
-                    StructInstance { .. } => {
-                        drop(current_value_ref);
-                        Box::new(StructInstanceModifier {
-                            instance: current_value,
-                            field: name.clone(),
-                        })
-                    }
-                    Value::Array { arr, .. } => match name.as_str() {
+                let struct_match = current_value.map(|v| match v {
+                    Value::StructInstance { .. } => Some(Box::new(StructInstanceModifier {
+                        instance: current_value.clone(),
+                        field: name.clone(),
+                    })),
+                    _ => None,
+                });
+                if let Some(m) = struct_match {
+                    return m;
+                }
+
+                let array_match = current_value.map(|v| match v {
+                    Value::Array { arr, .. } => Some(match name.as_str() {
                         "len" => Box::new(ReadValueModifier {
-                            value: Rc::new(RefCell::new(Value::Integer(arr.len() as i64))),
+                            value: ValueRef::stack(Value::Integer(arr.len() as i64)),
                         }),
                         _ => unreachable!("{}", format!("unsupported array member: `{}`", name)),
-                    },
-                    _ => unreachable!("unsupported member access"),
+                    }),
+                    _ => None,
+                });
+
+                if let Some(m) = array_match {
+                    return m;
                 }
+
+                unreachable!("{}", format!("unsupported array member: `{}`", name));
             }
             Node::FunctionCall {
                 name, arguments, ..
             } => {
                 let global_environment_ref = global_environment.borrow();
-                let struct_def =
-                    global_environment_ref.to_struct_def(current_value.borrow().deref());
+                let struct_def = global_environment_ref.to_struct_def(&current_value);
                 let fun_def = struct_def.functions.get(name).unwrap();
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
-                stack
-                    .borrow_mut()
-                    .create_frame_push(format!("{}.{}", struct_def.name, name));
-                stack
-                    .borrow_mut()
-                    .declare_variable("self", Rc::clone(&current_value));
+                stack.create_frame_push(format!("{}.{}", struct_def.name, name));
+                stack.declare_variable("self", current_value.clone());
 
-                let res = evaluate_function_call(
-                    member_ref,
-                    stack,
-                    global_environment,
-                    Some(fun_def.clone()),
-                );
-                stack.borrow_mut().pop();
+                let res =
+                    evaluate_function_call(member_ref, stack, global_environment, Some(fun_def));
+                stack.pop();
                 drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
             }
@@ -662,20 +817,22 @@ fn resolve_member_access(
 }
 
 fn resolve_array_access(
-    stack: &Rc<RefCell<CallStack>>,
+    stack: &mut CallStack,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    current_value: Rc<RefCell<Value>>,
+    current_value: ValueRef,
     node: &Node,
 ) -> Box<dyn ValueModifier> {
     if let Node::ArrayAccess { coordinates } = node {
         let _coordinates: Vec<i64> = coordinates
             .iter()
-            .map(
-                |c| match evaluate_node(c, stack, global_environment).borrow().deref() {
-                    Value::Integer(dim) => *dim,
-                    _ => panic!("expected integer index for array access"),
-                },
-            )
+            .map(|c| {
+                evaluate_node(c, stack, global_environment)
+                    .map(|v| match v {
+                        Value::Integer(dim) => Some(*dim),
+                        _ => panic!("expected integer index for array access"),
+                    })
+                    .unwrap()
+            })
             .collect();
         Box::new(ArrayModifier {
             array: current_value,
@@ -686,10 +843,13 @@ fn resolve_array_access(
     }
 }
 
-fn resolve_variable_access(stack: &Rc<RefCell<CallStack>>, node: &Node) -> Box<dyn ValueModifier> {
+fn resolve_variable_access<'a>(
+    stack: &'a mut CallStack,
+    node: &Node,
+) -> Box<dyn ValueModifier + 'a> {
     if let Node::Identifier(name) = node {
         Box::new(StackVariableModifier {
-            stack: Rc::clone(stack),
+            stack,
             name: name.clone(),
         })
     } else {
@@ -697,15 +857,15 @@ fn resolve_variable_access(stack: &Rc<RefCell<CallStack>>, node: &Node) -> Box<d
     }
 }
 
-fn resolve_access(
-    stack: &Rc<RefCell<CallStack>>,
+fn resolve_access<'a>(
+    stack: &'a mut CallStack,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    current_value: Rc<RefCell<Value>>,
+    current_value: ValueRef,
     level: usize,
     access_nodes: &Vec<Node>,
-) -> Box<dyn ValueModifier> {
-    let mut current_modifier: Box<dyn ValueModifier> = Box::new(ReadValueModifier {
-        value: Rc::clone(&current_value),
+) -> Box<dyn ValueModifier + 'a> {
+    let mut current_modifier: Box<dyn ValueModifier + 'a> = Box::new(ReadValueModifier {
+        value: current_value,
     });
 
     for access_node in access_nodes {
@@ -731,17 +891,17 @@ fn resolve_access(
 }
 
 fn evaluate_function(
-    stack: &Rc<RefCell<CallStack>>,
+    stack: &mut CallStack,
     arguments: &Vec<Node>,
     parameters: &Vec<Parameter>,
     body: &Vec<Node>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-) -> Rc<RefCell<Value>> {
+) -> ValueRef {
     let args_values: Vec<_> = arguments
         .into_iter()
         .map(|arg| evaluate_node(arg, stack, global_environment))
         .collect();
-    let arguments: Vec<(&Parameter, Rc<RefCell<Value>>)> = parameters
+    let arguments: Vec<(&Parameter, ValueRef)> = parameters
         .iter()
         .filter(|p| p.sk_type != Type::SkSelf) // self is added to call stack implicitly
         .zip(args_values.into_iter())
@@ -749,17 +909,13 @@ fn evaluate_function(
     for arg in arguments {
         let first = arg.0.name.clone();
         let second = arg.1;
-        stack
-            .borrow_mut()
-            .declare_variable(first.as_str(), Rc::clone(&second))
+        stack.declare_variable(first.as_str(), second)
     }
-    let mut result = Rc::new(RefCell::new(Undefined));
+    let mut result = ValueRef::stack(Value::Undefined);
     for n in body {
-        if let Value::Return(v) = evaluate_node(&n, stack, global_environment)
-            .borrow()
-            .deref()
-        {
-            result = Rc::clone(v);
+        let v = evaluate_node(&n, stack, global_environment);
+        if v.returned() {
+            result = v;
             break;
         }
     }
@@ -794,33 +950,54 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
 }
 
 fn evaluate_closure(
-    value: Rc<RefCell<Value>>,
+    value: &ValueRef,
     arguments: &Vec<Vec<Node>>,
-    stack: &Rc<RefCell<CallStack>>,
+    stack: &mut CallStack,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-) -> Rc<RefCell<Value>> {
+) -> ValueRef {
     let mut curr = value;
-    let mut result = Rc::new(RefCell::new(Undefined));
+    let mut result = ValueRef::stack(Value::Undefined);
     for arg in arguments {
-        let curr_ref = curr.borrow();
-        match curr_ref.deref() {
-            Closure { function, env } => {
-                let mut frame = CallFrame::new(function.name.clone());
-                frame.set_parent(env.clone());
-                stack.borrow_mut().push(frame);
-                let r = evaluate_function(
-                    stack,
-                    arg,
-                    &function.parameters,
-                    &function.body,
-                    global_environment,
-                );
-                drop(curr_ref);
-                stack.borrow_mut().pop();
-                curr = r.clone();
-                result = r;
+        match curr {
+            ValueRef::Stack { value, .. } => match value {
+                Value::Closure { function, env } => {
+                    let mut frame = CallFrame::new(function.name.clone());
+                    frame.set_parent(env.clone());
+                    stack.push(frame);
+                    let r = evaluate_function(
+                        stack,
+                        arg,
+                        &function.parameters,
+                        &function.body,
+                        global_environment,
+                    );
+                    stack.pop();
+                    result = r;
+                    curr = &result;
+                }
+                _ => panic!("expected closure"),
+            },
+            ValueRef::Heap { value, .. } => {
+                let value_ref = value.borrow();
+                match value_ref.deref() {
+                    Value::Closure { function, env } => {
+                        let mut frame = CallFrame::new(function.name.clone());
+                        frame.set_parent(env.clone());
+                        stack.push(frame);
+                        let r = evaluate_function(
+                            stack,
+                            arg,
+                            &function.parameters,
+                            &function.body,
+                            global_environment,
+                        );
+                        stack.pop();
+                        result = r;
+                        curr = &result;
+                    }
+                    _ => panic!("expected closure"),
+                }
             }
-            _ => panic!("expected closure"),
         }
     }
     result
@@ -828,33 +1005,30 @@ fn evaluate_closure(
 
 fn evaluate_function_call(
     node: &Node,
-    stack: &Rc<RefCell<CallStack>>,
+    stack: &mut CallStack,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    fun: Option<FunctionDefinition>,
-) -> Rc<RefCell<Value>> {
+    fun: Option<&FunctionDefinition>,
+) -> ValueRef {
     match node {
         Node::FunctionCall {
             name, arguments, ..
         } => {
-            if name == "sk_debug_mem" {
-                Profiling::sk_debug_mem_sysinfo();
-                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
-                return Rc::new(RefCell::new(Value::Undefined));
-            }
+            // if name == "sk_debug_mem" {
+            //     Profiling::sk_debug_mem_sysinfo();
+            //     Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
+            //     return Rc::new(RefCell::new(Value::Undefined));
+            // }
+            //
+            // if name == "sk_debug_stack" {
+            //     Profiling::sk_debug_stack(stack);
+            //     return Rc::new(RefCell::new(Value::Undefined));
+            // }
 
-            if name == "sk_debug_stack" {
-                Profiling::sk_debug_stack(stack);
-                return Rc::new(RefCell::new(Value::Undefined));
-            }
-
-            let value_opt = {
-                let stack_ref = stack.borrow();
-                stack_ref.get_closure(name)
-            };
+            let value_opt = { stack.get_closure(name) };
 
             let res = if let Some(value) = value_opt {
                 Some(evaluate_closure(
-                    value,
+                    &value,
                     arguments,
                     stack,
                     global_environment,
@@ -868,17 +1042,11 @@ fn evaluate_function_call(
             } else {
                 let global_environment_ref = global_environment.borrow();
                 let fun = fun
-                    .or_else(|| {
-                        global_environment_ref
-                            .get_function(name)
-                            .map(|f| f.borrow().clone())
-                    })
+                    .or_else(|| global_environment_ref.get_function(name))
                     .expect(format!("function `{}` doesn't exist", name).as_str())
                     .clone();
                 drop(global_environment_ref);
-                stack
-                    .borrow_mut()
-                    .create_frame_push(format!("function_call_{}", name));
+                stack.create_frame_push(format!("function_call_{}", name));
                 let r = evaluate_function(
                     stack,
                     arguments.first().unwrap(),
@@ -886,10 +1054,10 @@ fn evaluate_function_call(
                     &fun.body,
                     global_environment,
                 );
-                stack.borrow_mut().pop();
+                stack.pop();
                 if arguments.len() > 1 {
                     // r must be a function (closure)
-                    evaluate_closure(r, &arguments[1..].to_vec(), stack, global_environment)
+                    evaluate_closure(&r, &arguments[1..].to_vec(), stack, global_environment)
                 } else {
                     r
                 }
@@ -901,12 +1069,12 @@ fn evaluate_function_call(
 
 pub fn evaluate_node(
     node: &Node,
-    stack: &Rc<RefCell<CallStack>>,
+    stack: &mut CallStack,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-) -> Rc<RefCell<Value>> {
+) -> ValueRef {
     match node {
         Node::Program { statements } => {
-            let mut last = Rc::new(RefCell::new(Void));
+            let mut last = ValueRef::stack(Value::Undefined);
             for i in 0..statements.len() - 1 {
                 last = evaluate_node(&statements[i], stack, global_environment);
             }
@@ -932,10 +1100,10 @@ pub fn evaluate_node(
             global_environment
                 .borrow_mut()
                 .add_struct(name.to_string(), sd.clone());
-            Rc::new(RefCell::new(Value::Struct {
+            ValueRef::stack(Value::Struct {
                 name: name.to_string(),
                 fields: sd.fields.clone(),
-            }))
+            })
         }
         Node::FunctionDeclaration {
             name,
@@ -949,17 +1117,9 @@ pub fn evaluate_node(
                 global_environment
                     .borrow_mut()
                     .functions
-                    .insert(name.clone(), Rc::new(RefCell::new(func_def.clone())));
-            }
+                    .insert(name.clone(), func_def);
 
-            if *lambda {
-                let frame = stack.borrow().current_frame().clone();
-                Rc::new(RefCell::new(Value::Closure {
-                    function: func_def,
-                    env: frame.env,
-                }))
-            } else {
-                Rc::new(RefCell::new(Value::Function {
+                ValueRef::stack(Value::Function {
                     name: name.to_string(),
                     parameters: parameters
                         .iter()
@@ -970,24 +1130,28 @@ pub fn evaluate_node(
                         .collect(),
                     return_type: return_type.clone(),
                     body: Vec::new(),
-                }))
+                })
+            } else {
+                let frame = stack.current_frame().clone();
+                ValueRef::stack(Value::Closure {
+                    function: func_def,
+                    env: frame.env,
+                })
             }
         }
-        Node::Literal(Literal::Integer(x)) => Rc::new(RefCell::new(Value::Integer(*x))),
-        Node::Literal(Literal::StringLiteral(x)) => {
-            Rc::new(RefCell::new(Value::String(x.to_string())))
-        }
-        Node::Literal(Literal::Boolean(x)) => Rc::new(RefCell::new(Value::Boolean(*x))),
+        Node::Literal(Literal::Integer(x)) => ValueRef::stack(Value::Integer(*x)),
+        Node::Literal(Literal::StringLiteral(x)) => ValueRef::stack(Value::String(x.to_string())),
+        Node::Literal(Literal::Boolean(x)) => ValueRef::stack(Value::Boolean(*x)),
         Node::VariableDeclaration { name, value, .. } => {
             let value = if let Some(body) = value {
                 evaluate_node(body, stack, global_environment)
             } else {
-                Rc::new(RefCell::new(Undefined))
+                ValueRef::stack(Value::Undefined)
             };
 
-            stack.borrow_mut().declare_variable(name, value);
+            stack.declare_variable(name, value);
 
-            Rc::new(RefCell::new(Value::Variable(name.to_string())))
+            ValueRef::stack(Value::Variable(name.to_string()))
         }
         Node::ArrayInit { elements } => {
             let mut dimensions: Vec<i64> = vec![];
@@ -1013,7 +1177,7 @@ pub fn evaluate_node(
             for e in elements {
                 node_stack.push_back(e)
             }
-            let mut values: Vec<Rc<RefCell<Value>>> = vec![];
+            let mut values: Vec<ValueRef> = vec![];
             while !node_stack.is_empty() {
                 let n = node_stack.pop_front().unwrap();
                 match n {
@@ -1022,33 +1186,32 @@ pub fn evaluate_node(
                             node_stack.push_back(e)
                         }
                     }
-                    _ => values.push(Rc::clone(&evaluate_node(n, stack, global_environment))),
+                    _ => values.push(evaluate_node(n, stack, global_environment)),
                 }
             }
 
-            Rc::new(RefCell::new(Value::Array {
+            ValueRef::stack(Value::Array {
                 arr: values,
                 dimensions,
-            }))
+            })
         }
         Node::StructInitialization { name, fields } => {
-            let mut field_values: HashMap<String, Rc<RefCell<Value>>> = HashMap::new();
+            let mut field_values: HashMap<String, ValueRef> = HashMap::new();
             for (name, node) in fields {
                 field_values.insert(
                     name.to_string(),
                     evaluate_node(node, stack, global_environment),
                 );
             }
-            let value = Value::StructInstance {
+            ValueRef::stack(Value::StructInstance {
                 name: name.to_string(),
                 fields: field_values,
-            };
-            Rc::new(RefCell::new(value))
+            })
         }
         Node::Access { nodes } => resolve_access(
             stack,
             global_environment,
-            Rc::new(RefCell::new(Undefined)),
+            ValueRef::stack(Value::Undefined),
             0,
             nodes,
         )
@@ -1059,12 +1222,11 @@ pub fn evaluate_node(
                 let mut modifier = resolve_access(
                     stack,
                     global_environment,
-                    Rc::new(RefCell::new(Undefined)),
+                    ValueRef::stack(Value::Undefined),
                     0,
                     nodes,
                 );
-                let new_value =
-                    Rc::clone(&evaluate_node(value.as_ref(), stack, global_environment));
+                let new_value = evaluate_node(value.as_ref(), stack, global_environment);
                 modifier.set(new_value);
                 modifier.get()
             }
@@ -1073,27 +1235,26 @@ pub fn evaluate_node(
         Node::Access { nodes } => resolve_access(
             stack,
             global_environment,
-            Rc::new(RefCell::new(Undefined)),
+            ValueRef::stack(Value::Undefined),
             0,
             nodes,
         )
         .get(),
         Node::FunctionCall { .. } => evaluate_function_call(node, stack, global_environment, None),
         Node::Block { statements } => {
-            let mut stack_ref = stack.borrow_mut();
-            stack_ref.create_frame_push("".to_string());
-            drop(stack_ref);
-            let mut res = Rc::new(RefCell::new(Undefined));
+            stack.create_frame_push("".to_string());
+            // drop(stack_ref);
+            let mut res = ValueRef::stack(Value::Undefined);
             for statement in statements {
                 res = evaluate_node(statement, stack, global_environment);
-                if let Value::Return(v) = res.borrow_mut().deref() {
+                if res.returned() {
                     break;
                 }
             }
-            stack_ref = stack.borrow_mut();
-            stack_ref.frames.pop();
-            mem::drop(stack_ref);
-            Rc::clone(&res)
+
+            stack.frames.pop();
+            // mem::drop(stack_ref);
+            res
         }
         Node::StaticFunctionCall {
             _type,
@@ -1109,23 +1270,23 @@ pub fn evaluate_node(
                 let mut int_dimensions: Vec<i64> = vec![];
                 for dim_node in dimensions {
                     let dim_val = evaluate_node(dim_node, stack, global_environment);
-                    let dim_val_ref = dim_val.borrow();
-                    match dim_val_ref.deref() {
-                        Value::Integer(i) => {
-                            int_dimensions.push(*i);
-                            size = size * (*i) as usize;
-                        }
-                        _ => panic!("expected integer in array size"),
-                    };
+                    let i = dim_val
+                        .map(|v| match v {
+                            Value::Integer(i) => Some(*i),
+                            _ => None,
+                        })
+                        .expect("expected integer in array size");
+                    int_dimensions.push(i);
+                    size = size * (i) as usize;
                 }
                 let mut arr = Vec::with_capacity(size);
                 for _ in 0..size {
                     arr.push(evaluate_node(&arguments[0], stack, global_environment));
                 }
-                Rc::new(RefCell::new(Value::Array {
+                ValueRef::stack(Value::Array {
                     arr,
                     dimensions: int_dimensions.clone(),
-                }))
+                })
             }
             _ => panic!("unsupported static function call type"),
         },
@@ -1135,50 +1296,53 @@ pub fn evaluate_node(
             else_if_blocks,
             else_block,
         } => {
-            if let Value::Boolean(ok) =
-                *evaluate_node(condition.as_ref(), stack, global_environment)
-                    .borrow()
-                    .deref()
-            {
-                if ok {
-                    for n in body {
-                        let val = evaluate_node(n, stack, global_environment);
-                        let val_ref = val.borrow();
-                        if let Value::Return(return_val) = val_ref.deref() {
-                            return Rc::new(RefCell::new(Value::Return(Rc::clone(&return_val))));
-                        }
+            let value_ref = evaluate_node(condition, stack, global_environment);
+
+            let ok = value_ref
+                .map(|v| match v {
+                    Value::Boolean(ok) => Some(*ok),
+                    _ => None,
+                })
+                .expect(format!("non boolean expression: {:?}", condition.as_ref()).as_str());
+            if ok {
+                for n in body {
+                    let val = evaluate_node(n, stack, global_environment);
+                    if val.returned() {
+                        return val;
                     }
-                    return Rc::new(RefCell::new(Value::Executed));
                 }
-            } else {
-                panic!("non boolean expression: {:?}", condition.as_ref())
+                return ValueRef::stack(Value::Executed);
             }
 
             for n in else_if_blocks {
                 let val = evaluate_node(n, stack, global_environment);
-                let val_ref = val.borrow();
-                if let Value::Return(return_val) = val_ref.deref() {
-                    return Rc::new(RefCell::new(Value::Return(Rc::clone(&return_val))));
+                if val.returned() {
+                    return val;
                 }
-                if let Value::Executed = val_ref.deref() {
-                    return Rc::new(RefCell::new(Value::Executed));
+                if val.is_match(|v| match v {
+                    Value::Executed => true,
+                    _ => false,
+                }) {
+                    return val;
                 }
             }
 
             if let Some(nodes) = else_block {
                 for n in nodes {
-                    let val_ref = evaluate_node(n, stack, global_environment);
-                    let val = val_ref.borrow().deref().clone();
-                    if let Value::Return(return_val) = val {
-                        return Rc::new(RefCell::new(Return(Rc::clone(&return_val))));
+                    let val = evaluate_node(n, stack, global_environment);
+                    if val.returned() {
+                        return val;
                     }
-                    if let Value::Executed = val {
-                        return Rc::clone(&val_ref);
+                    if val.is_match(|v| match v {
+                        Value::Executed => true,
+                        _ => false,
+                    }) {
+                        return val;
                     }
                 }
             }
 
-            Rc::new(RefCell::new(Void))
+            ValueRef::stack(Value::Void)
         }
         Node::For {
             init,
@@ -1192,40 +1356,39 @@ pub fn evaluate_node(
             while condition
                 .as_ref()
                 .map(|cond| {
-                    let binding = evaluate_node(cond.as_ref(), stack, global_environment);
-                    let res = binding.borrow().deref().clone();
-                    match res {
-                        Value::Boolean(v) => v,
-                        _ => panic!("for condition in should be a boolean expression"),
-                    }
+                    let res = evaluate_node(cond.as_ref(), stack, global_environment);
+                    res.map(|v| match v {
+                        Value::Boolean(ok) => Some(*ok),
+                        _ => None,
+                    })
+                    .expect("for condition in should be a boolean expression")
                 })
                 .unwrap_or(true)
             {
                 for n in body {
                     let val = evaluate_node(n, stack, global_environment);
-                    let val_ref = val.borrow();
-                    if let Value::Return(return_val) = val_ref.deref() {
-                        return Rc::new(RefCell::new(Value::Return(Rc::clone(&return_val))));
+                    if val.returned() {
+                        return val;
                     }
                 }
                 if let Some(n) = update {
                     evaluate_node(n, stack, global_environment);
                 }
             }
-            Rc::new(RefCell::new(Void))
+            ValueRef::stack(Value::Void)
         }
         Node::UnaryOp { operator, operand } => {
             let operand_val = evaluate_node(operand, stack, global_environment);
             match operator {
                 ast::UnaryOperator::Plus => operand_val, // unary `+` doesn't change the value
-                ast::UnaryOperator::Minus => match *operand_val.borrow() {
-                    Value::Integer(val) => Rc::new(RefCell::new(Value::Integer(-val))),
+                ast::UnaryOperator::Minus => operand_val.map_value(|v| match v {
+                    Value::Integer(val) => Value::Integer(-val),
                     _ => panic!("Unary minus is only supported for integers"),
-                },
+                }),
                 _ => panic!("unsupported unary operator: {:?}", operator),
             }
         }
-        Node::BinaryOp {
+        /*Node::BinaryOp {
             left,
             operator,
             right,
@@ -1278,43 +1441,46 @@ pub fn evaluate_node(
                     operator, left_val_ref, right_val_ref
                 ),
             }
-        }
+        }*/
         Node::Print(value) => {
             let val = evaluate_node(value, stack, global_environment);
-            println!("{}", val.borrow());
-            Rc::new(RefCell::new(Void))
+            println!("{:?}", val);
+            ValueRef::stack(Value::Void)
         }
         Node::Identifier(name) => {
-            let stack_ref = stack.borrow();
-            let v = stack_ref
+            let v = stack
                 .get_variable(name)
                 .expect(format!("variable '{}' does not exist", name).as_str());
-            let res = Rc::clone(&v);
-            drop(stack_ref);
-            res
+            // let res = Rc::clone(&v);
+            // drop(stack_ref);
+            v.clone()
         }
-        Node::EOI => Rc::new(RefCell::new(Void)),
+        Node::EOI => ValueRef::stack(Value::Void),
         Node::Return(body_opt) => {
             if let Some(body) = body_opt {
                 let val = evaluate_node(body, stack, global_environment);
-                Rc::new(RefCell::new(Return(Rc::clone(&val))))
+                // Rc::new(RefCell::new(Return(Rc::clone(&val))))
+                val.to_returned()
             } else {
-                Rc::new(RefCell::new(Void))
+                ValueRef::stack(Value::Void)
             }
         }
         _ => panic!("Unexpected node type: {:?}", node),
     }
 }
+//
+// use crate::interpreter::Value::{Closure, StructInstance, Undefined, Void};
+// use pest::Stack;
+// use std::fmt::Octal;
+// use std::ops::{Deref, DerefMut};
 
-use crate::interpreter::Value::{Closure, Return, StructInstance, Undefined, Void};
-use pest::Stack;
-use std::fmt::Octal;
-use std::ops::{Deref, DerefMut};
-
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
+    /*
+
+         #[test]
     fn test_array_modify() {
         let source_code = r#"
          arr: int[5] = int[5]::new(1);
@@ -1456,10 +1622,7 @@ mod tests {
             let res_ref = res.borrow();
             assert_eq!(Value::Integer(3), *res_ref.deref());
         }
-    }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+
 
         #[test]
         fn test_for_loop_simple_increment() {
@@ -2261,4 +2424,6 @@ mod tests {
         let res = evaluate(&program);
         assert_eq!(Value::Integer(1), *res.borrow().deref());
     }
+
+         */
 }

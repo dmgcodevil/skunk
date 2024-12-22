@@ -30,8 +30,8 @@ fn main() -> io::Result<()> {
         };
     }
     let result = interpreter::evaluate(&node);
-    let res_ref = result.borrow();
-    println!("Result:");
-    println!("{}", res_ref);
+    // let res_ref = result.borrow();
+    // println!("Result:");
+    // println!("{}", res_ref);
     Ok(())
 }
