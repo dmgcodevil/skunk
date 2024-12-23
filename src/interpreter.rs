@@ -760,7 +760,7 @@ impl CallStack {
     }
 
     fn declare_variable(&mut self, name: &str, value: ValueRef) {
-        println!("declare variable {}={:?}", name, value);
+        // println!("declare variable {}={:?}", name, value);
         self.current_frame_mut().declare_variable(name, value);
     }
 
@@ -922,11 +922,11 @@ fn resolve_member_access(
             Node::FunctionCall {
                 name, arguments, ..
             } => {
-                println!("resolve member access: function call name={}", name);
+                // println!("resolve member access: function call name={}", name);
                 let global_environment_ref = global_environment.borrow();
                 let struct_def = global_environment_ref.to_struct_def(&current_value);
                 let fun_def = struct_def.functions.get(name).unwrap();
-                println!("func def={:?}", fun_def);
+                // println!("func def={:?}", fun_def);
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
                 stack
@@ -1016,11 +1016,11 @@ fn resolve_access(
 
         res = match access_node {
             Node::MemberAccess { .. } => {
-                println!("resolve_access-{}, current_value={:?}, member={:?}, to_set={:?}",
-                         i,
-                         res,
-                         access_node,
-                         to_set);
+                // println!("resolve_access-{}, current_value={:?}, member={:?}, to_set={:?}",
+                //          i,
+                //          res,
+                //          access_node,
+                //          to_set);
                 resolve_member_access(stack, global_environment, res, access_node, to_set)
             }
 
@@ -1028,7 +1028,7 @@ fn resolve_access(
                 resolve_array_access(stack, global_environment, res, access_node, to_set)
             }
             Node::Identifier(name) => {
-                println!("resolve_access, name={}, node={:?}", name, access_node);
+                // println!("resolve_access, name={}, node={:?}", name, access_node);
                 match to_set {
                     None => stack.borrow().get_variable(name).unwrap(),
                     Some(v) => {
@@ -1061,7 +1061,8 @@ fn evaluate_function(
             let v = evaluate_node(&arguments[i], stack, global_environment);
             stack.borrow_mut().declare_variable(&param.name, v);
     }
-    Profiling::sk_debug_stack(stack.borrow().deref());
+
+    // Profiling::sk_debug_stack(stack.borrow().deref());
     let mut result = ValueRef::stack(Value::Undefined);
     for n in body {
         let v = evaluate_node(&n, stack, global_environment);
@@ -1071,6 +1072,7 @@ fn evaluate_function(
         }
     }
     result
+    // ValueRef::stack(Value::Undefined)
 }
 
 fn create_function_definition(n: &Node) -> FunctionDefinition {
@@ -1165,16 +1167,16 @@ fn evaluate_function_call(
             name, arguments, ..
         } => {
             println!("eval func call={}", name);
-            if name == "sk_debug_mem" {
-                Profiling::sk_debug_mem_sysinfo();
-                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
-                return ValueRef::stack(Value::Undefined);
-            }
-
-            if name == "sk_debug_stack" {
-                Profiling::sk_debug_stack(stack.borrow().deref());
-                return ValueRef::stack(Value::Undefined);
-            }
+            // if name == "sk_debug_mem" {
+            //     Profiling::sk_debug_mem_sysinfo();
+            //     Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
+            //     return ValueRef::stack(Value::Undefined);
+            // }
+            //
+            // if name == "sk_debug_stack" {
+            //     Profiling::sk_debug_stack(stack.borrow().deref());
+            //     return ValueRef::stack(Value::Undefined);
+            // }
 
             let value_opt = { stack.borrow().get_closure(name) };
 
@@ -1207,7 +1209,9 @@ fn evaluate_function_call(
                 );
                 drop(global_environment_ref);
                 stack.borrow_mut().pop();
+
                 if arguments.len() > 1 {
+                    // func chain
                     // r must be a function (closure)
                     evaluate_closure(&r, &arguments[1..].to_vec(), stack, global_environment)
                 } else {
@@ -1269,9 +1273,17 @@ pub fn evaluate_node(
                 global_environment
                     .borrow_mut()
                     .functions
-                    .insert(name.clone(), func_def);
+                    .insert(name.clone(),  func_def.clone());
+            }
 
-                ValueRef::stack(Value::Function {
+            if *lambda {
+                let frame = stack.borrow().current_frame().clone();
+                ValueRef::stack(Value::Closure {
+                    function: func_def,
+                    env: frame.env,
+                })
+            } else {
+                ValueRef::stack((Value::Function {
                     name: name.to_string(),
                     parameters: parameters
                         .iter()
@@ -1282,13 +1294,7 @@ pub fn evaluate_node(
                         .collect(),
                     return_type: return_type.clone(),
                     body: Vec::new(),
-                })
-            } else {
-                let frame = stack.borrow().current_frame().clone();
-                ValueRef::heap(Value::Closure {
-                    function: func_def,
-                    env: frame.env,
-                })
+                }))
             }
         }
         Node::Literal(Literal::Integer(x)) => ValueRef::stack(Value::Integer(*x)),
@@ -1302,8 +1308,9 @@ pub fn evaluate_node(
             };
 
             stack.borrow_mut().declare_variable(name, value);
+            stack.borrow().get_variable(name).unwrap()
 
-            ValueRef::stack(Value::Variable(name.to_string()))
+            // ValueRef::stack(Value::Variable(name.to_string()))
         }
         Node::ArrayInit { elements } => {
             let mut dimensions: Vec<i64> = vec![];
@@ -2295,7 +2302,7 @@ mod tests {
                          }
 
                          p: Point = Point{x: 1, y: 2};
-                         sk_debug_stack();
+                        // sk_debug_stack();
                          p.set_x(3);
                          p.get_x();
                          "#;
@@ -2416,6 +2423,20 @@ mod tests {
                          "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
+        println!("{:?}", res);
+        // match res {
+        //     ValueRef::Stack {value, ..} =>
+        //     match value {
+        //         Value::Closure {function,env} => println!("Closure: {:?}", function, ),
+        //         _ => panic!("expected closure"),
+        //     }
+        //     ValueRef::Heap { value, ..} => {
+        //         let v_ref = value.borrow();
+        //
+        //         println!("Heap: {:?}", v_ref);
+        //     }
+        // }
+        // println!("{:?}", res);
         assert_eq!(Value::Integer(1), res.get_value());
     }
 
@@ -2423,7 +2444,7 @@ mod tests {
     fn test_anonymous_function() {
         let source_code = r#"
                          function f(g: () -> int): int {
-                             sk_debug_stack();
+                             //sk_debug_stack();
                              return 47;
                              //return g();
                          }
@@ -2442,6 +2463,7 @@ mod tests {
     fn test_anonymous_function_with_params() {
         let source_code = r#"
                          function f(g: (int) -> int): int {
+
                              return g(47);
                          }
 
