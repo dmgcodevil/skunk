@@ -199,6 +199,12 @@ impl ValueRef {
             _ => false,
         })
     }
+    fn is_closure(&self) -> bool {
+        self.is_match(|v| match v {
+            Value::Closure { .. } => true,
+            _ => false,
+        })
+    }
 }
 
 // const UNDEFINED_REF:ValueRef = ValueRef::stack(Value::Undefined);
@@ -637,6 +643,7 @@ impl Profiling {
 pub struct CallFrame {
     name: String,
     env: Rc<RefCell<Environment>>,
+    closure_cache: HashMap<String, Option<ValueRef>>
 }
 
 impl CallFrame {
@@ -644,6 +651,7 @@ impl CallFrame {
         CallFrame {
             name: name.to_string(),
             env: Rc::new(RefCell::new(Environment::new())),
+            closure_cache: HashMap::new()
         }
     }
 
@@ -658,6 +666,9 @@ impl CallFrame {
         drop(env)
     }
 
+    fn add_closure(&mut self, name:String, closure: Option<ValueRef>) {
+        self.closure_cache.insert(name, closure);
+    }
     fn has_variable(&self, name: &str) -> bool {
         //println!("CallFrame-{}::has_variable {}", self.name, name);
         let env_ref = self.env.borrow();
@@ -710,6 +721,7 @@ impl CallStack {
         let mut frame = CallFrame {
             name: name.to_string(),
             env: Rc::new(RefCell::new(Environment::new())),
+            closure_cache: HashMap::new()
         };
         if let Some(curr) = self.frames.last() {
             frame.set_parent(curr.env.clone());
@@ -723,18 +735,15 @@ impl CallStack {
     }
 
     fn get_closure(&self, name: &str) -> Option<ValueRef> {
-        // todo optimize, use cache
         for frame in self.frames.iter().rev() {
-            if frame.has_variable(name) {
-                let val = frame
-                    .get_variable(name)
-                    .expect(format!("variable '{}' not found", name).as_str());
-                if val.is_match(|v| match v {
-                    Value::Closure { .. } => true,
-                    _ => false,
-                }) {
-                    return frame.get_variable(name);
-                }
+            match  frame.closure_cache.get(name) {
+                Some(v) => return v.clone(),
+                None => ()
+            }
+            match frame
+                .get_variable(name) {
+                Some(val) => if val.is_closure() { return Some(val); } else { return None },
+                None => {}
             }
         }
         None
@@ -783,6 +792,7 @@ pub fn evaluate(node: &Node) -> ValueRef {
     stack.borrow_mut().push(CallFrame {
         name: "main".to_string(),
         env: Rc::new(RefCell::new(Environment::new())),
+        closure_cache: HashMap::new()
     });
     evaluate_node(node, &stack, &ge)
 }
@@ -1166,7 +1176,7 @@ fn evaluate_function_call(
         Node::FunctionCall {
             name, arguments, ..
         } => {
-            println!("eval func call={}", name);
+            // println!("eval func call={}", name);
             // if name == "sk_debug_mem" {
             //     Profiling::sk_debug_mem_sysinfo();
             //     Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
@@ -1179,7 +1189,7 @@ fn evaluate_function_call(
             // }
 
             let value_opt = { stack.borrow().get_closure(name) };
-
+            stack.borrow_mut().current_frame_mut().add_closure(name.to_string(), value_opt.clone());
             let res = if let Some(value) = value_opt {
                 Some(evaluate_closure(
                     &value,
@@ -1368,7 +1378,7 @@ pub fn evaluate_node(
             })
         }
         Node::Access { nodes } => {
-            println!("resolve access: {:?}", nodes);
+            // println!("resolve access: {:?}", nodes);
             resolve_access(
                 stack,
                 global_environment,
