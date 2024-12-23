@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::ops::Deref;
-
+use std::time::Instant;
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let type_checker_enabled: bool = true;
@@ -29,7 +29,10 @@ fn main() -> io::Result<()> {
             }
         };
     }
+    let now = Instant::now();
     let result = interpreter::evaluate(&node);
+    let elapsed = now.elapsed();
+    println!("Elapsed: {:.2?}", elapsed);
     // let res_ref = result.borrow();
     // println!("Result:");
     // println!("{}", res_ref);

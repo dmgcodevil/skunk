@@ -14,6 +14,7 @@ use std::io::BufRead;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
+use crate::interpreter::Value::{Array, StructInstance};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -56,7 +57,7 @@ pub enum Value {
 // }
 
 #[derive(Debug, PartialEq, Clone)]
-enum ValueRef {
+pub enum ValueRef {
     Stack {
         value: Value,
         returned: bool,
@@ -85,6 +86,13 @@ impl ValueRef {
         match self {
             ValueRef::Stack { returned, .. } => *returned,
             ValueRef::Heap { returned, .. } => *returned,
+        }
+    }
+
+    fn get_value(&self) -> Value {
+        match self {
+            ValueRef::Stack { value, .. } => value.clone(),
+            ValueRef::Heap { value, .. } => value.borrow().clone(),
         }
     }
 
@@ -137,9 +145,9 @@ impl ValueRef {
         }
     }
 
-    fn unwrap<F>(&self, f: F)
+    fn unwrap<F>(&self, mut f: F)
     where
-        F: Fn(&Value),
+        F: FnMut(&Value),
     {
         self.is_match(|a| {
             f(a);
@@ -147,9 +155,9 @@ impl ValueRef {
         });
     }
 
-    fn is_match<F>(&self, f: F) -> bool
+    fn is_match<F>(&self, mut f: F) -> bool
     where
-        F: Fn(&Value) -> bool,
+        F: FnMut(&Value) -> bool,
     {
         match self {
             ValueRef::Stack { value, .. } => f(value),
@@ -282,15 +290,15 @@ impl Environment {
 
     fn has_variable(&self, name: &str) -> bool {
         //println!("Environment::has_variable={}", name);
-        if self.variables.contains_key(name) {
-            return true;
-        }
-        if let Some(parent) = &self.parent {
-            let parent_ref = parent.borrow();
-            let result = parent_ref.has_variable(name);
-            return result;
-        }
-        false
+        // if self.variables.contains_key(name) {
+        //     return true;
+        // }
+        // if let Some(parent) = &self.parent {
+        //     let parent_ref = parent.borrow();
+        //     let result = parent_ref.has_variable(name);
+        //     return result;
+        // }
+        true
     }
 
     fn get_var(&self, name: &str) -> Option<ValueRef> {
@@ -322,8 +330,8 @@ impl Environment {
 }
 
 trait ValueModifier {
-    fn set(&mut self, value: ValueRef);
-    fn get(&self) -> ValueRef;
+    fn set(&mut self, name: String, stack: &mut CallStack, value: ValueRef);
+    fn get(&self, stack: &CallStack) -> ValueRef;
 }
 
 struct StructInstanceModifier {
@@ -331,19 +339,22 @@ struct StructInstanceModifier {
     field: String,
 }
 impl ValueModifier for StructInstanceModifier {
-    fn set(&mut self, new_value: ValueRef) {
-        match &self.instance {
-            ValueRef::Stack { value, .. } => {
-                panic!("struct on stack")
-                // if let Value::StructInstance {
-                //     name,
-                //     ref mut fields,
-                // } = value
-                // {
-                //     fields.insert(self.field.clone(), new_value);
-                // } else {
-                //     panic!("expected a struct instance");
-                // }
+    fn set(&mut self, name: String, stack: &mut CallStack, new_value: ValueRef) {
+        match &mut self.instance {
+            ValueRef::Stack { ref mut value, .. } => {
+                if let Value::StructInstance {
+                    name,
+                    ref mut fields,
+                } = value
+                {
+                    fields.insert(self.field.clone(), new_value);
+                    stack.assign_variable(name, ValueRef::stack(StructInstance {
+                        name: name.to_string(),
+                        fields: mem::take(fields),
+                    }));
+                } else {
+                    panic!("expected a struct instance");
+                }
             }
             ValueRef::Heap { value, .. } => {
                 let mut value_ref = value.borrow_mut();
@@ -360,7 +371,7 @@ impl ValueModifier for StructInstanceModifier {
         }
     }
 
-    fn get(&self) -> ValueRef {
+    fn get(&self, _stack: &CallStack) -> ValueRef {
         match &self.instance {
             ValueRef::Stack { .. } => {
                 panic!("struct on stack")
@@ -387,10 +398,12 @@ struct ArrayModifier {
 }
 
 impl ValueModifier for ArrayModifier {
-    fn set(&mut self, new_value: ValueRef) {
-        match &self.array {
-            ValueRef::Stack { .. } => {
-                panic!("cannot mutate array allocated on stack")
+    fn set(&mut self, name: String, stack: &mut CallStack, new_value: ValueRef) {
+        match &mut self.array {
+            ValueRef::Stack { ref mut value, .. } => {
+                set_array_element(value, new_value, &self.coordinates);
+                stack.assign_variable(name.as_str(), ValueRef::stack(value.clone()));
+                //panic!("cannot mutate array allocated on stack")
             }
             ValueRef::Heap { value, .. } => {
                 let mut value_ref = value.borrow_mut();
@@ -399,7 +412,7 @@ impl ValueModifier for ArrayModifier {
         }
     }
 
-    fn get(&self) -> ValueRef {
+    fn get(&self, _stack:&CallStack) -> ValueRef {
         match &self.array {
             ValueRef::Stack { ref value, .. } => {
                 get_array_element(value, &self.coordinates).clone()
@@ -468,27 +481,26 @@ struct ReadValueModifier {
 }
 
 impl ValueModifier for ReadValueModifier {
-    fn set(&mut self, _value: ValueRef) {
+    fn set(&mut self, name: String, stack: &mut CallStack, value: ValueRef) {
         panic!("attempted to set a read value");
     }
 
-    fn get(&self) -> ValueRef {
+    fn get(&self, _stack: &CallStack) -> ValueRef {
         self.value.clone()
     }
 }
 
-struct StackVariableModifier<'a> {
-    stack: &'a mut CallStack,
+struct StackVariableModifier {
     name: String,
 }
 
-impl ValueModifier for StackVariableModifier<'_> {
-    fn set(&mut self, value: ValueRef) {
-        self.stack.assign_variable(&self.name, value);
+impl ValueModifier for StackVariableModifier {
+    fn set(&mut self, name: String, stack: &mut CallStack, value: ValueRef) {
+        stack.assign_variable(name.as_str(), value);
     }
 
-    fn get(&self) -> ValueRef {
-        self.stack
+    fn get(&self, stack: &CallStack) -> ValueRef {
+        stack
             .get_variable(&self.name)
             .expect(format!("Variable '{}' not found", self.name).as_str())
             .clone()
@@ -689,17 +701,17 @@ impl CallStack {
     }
 
     fn get_closure(&self, name: &str) -> Option<ValueRef> {
-        for frame in self.frames.iter().rev() {
-            if frame.has_variable(name) {
-                let val = frame.get_variable(name).unwrap();
-                if val.is_match(|v| match v {
-                    Value::Closure { .. } => true,
-                    _ => false,
-                }) {
-                    return frame.get_variable(name);
-                }
-            }
-        }
+        // for frame in self.frames.iter().rev() {
+        //     if frame.has_variable(name) {
+        //         let val = frame.get_variable(name).expect(format!("variable '{}' not found", name).as_str());
+        //         if val.is_match(|v| match v {
+        //             Value::Closure { .. } => true,
+        //             _ => false,
+        //         }) {
+        //             return frame.get_variable(name);
+        //         }
+        //     }
+        // }
         None
     }
 
@@ -740,13 +752,13 @@ impl CallStack {
 }
 
 pub fn evaluate(node: &Node) -> ValueRef {
-    let mut stack = CallStack::new();
+    let  stack = Rc::new(RefCell::new(CallStack::new()));
     let ge = Rc::new(RefCell::new(GlobalEnvironment::new()));
-    stack.push(CallFrame {
+    stack.borrow_mut().push(CallFrame {
         name: "main".to_string(),
         env: Rc::new(RefCell::new(Environment::new())),
     });
-    evaluate_node(node, &mut stack, &ge)
+    evaluate_node(node, &stack, &ge)
 }
 
 fn assert_value_is_struct(v: &Value) {
@@ -756,7 +768,7 @@ fn assert_value_is_struct(v: &Value) {
 }
 
 fn resolve_member_access<'a>(
-    stack: &'a mut CallStack,
+    stack: &Rc<RefCell<CallStack>> ,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     current_value: ValueRef,
     node: &Node,
@@ -800,12 +812,12 @@ fn resolve_member_access<'a>(
                 let fun_def = struct_def.functions.get(name).unwrap();
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
-                stack.create_frame_push(format!("{}.{}", struct_def.name, name));
-                stack.declare_variable("self", current_value.clone());
+                stack.borrow_mut().create_frame_push(format!("{}.{}", struct_def.name, name));
+                stack.borrow_mut().declare_variable("self", current_value.clone());
 
                 let res =
                     evaluate_function_call(member_ref, stack, global_environment, Some(fun_def));
-                stack.pop();
+                stack.borrow_mut().pop();
                 drop(global_environment_ref);
                 Box::new(ReadValueModifier { value: res })
             }
@@ -817,7 +829,7 @@ fn resolve_member_access<'a>(
 }
 
 fn resolve_array_access(
-    stack: &mut CallStack,
+    stack: &Rc<RefCell<CallStack>> ,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     current_value: ValueRef,
     node: &Node,
@@ -843,13 +855,12 @@ fn resolve_array_access(
     }
 }
 
-fn resolve_variable_access<'a>(
-    stack: &'a mut CallStack,
+fn resolve_variable_access(
+    // stack: &'a mut CallStack,
     node: &Node,
-) -> Box<dyn ValueModifier + 'a> {
+) -> Box<dyn ValueModifier> {
     if let Node::Identifier(name) = node {
         Box::new(StackVariableModifier {
-            stack,
             name: name.clone(),
         })
     } else {
@@ -858,7 +869,7 @@ fn resolve_variable_access<'a>(
 }
 
 fn resolve_access<'a>(
-    stack: &'a mut CallStack,
+    stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     current_value: ValueRef,
     level: usize,
@@ -869,20 +880,21 @@ fn resolve_access<'a>(
     });
 
     for access_node in access_nodes {
+        // let mut stack_ref = stack.borrow_mut();
         current_modifier = match access_node {
             Node::MemberAccess { .. } => resolve_member_access(
                 stack,
                 global_environment,
-                current_modifier.get(),
+                current_modifier.get(stack.borrow().deref()),
                 access_node,
             ),
             Node::ArrayAccess { .. } => resolve_array_access(
                 stack,
                 global_environment,
-                current_modifier.get(),
+                current_modifier.get(stack.borrow().deref()),
                 access_node,
             ),
-            Node::Identifier(..) => resolve_variable_access(stack, access_node),
+            Node::Identifier(..) => resolve_variable_access(access_node),
             _ => panic!("unexpected access node: {:?}", access_node),
         };
     }
@@ -891,7 +903,7 @@ fn resolve_access<'a>(
 }
 
 fn evaluate_function(
-    stack: &mut CallStack,
+    stack: &Rc<RefCell<CallStack>>,
     arguments: &Vec<Node>,
     parameters: &Vec<Parameter>,
     body: &Vec<Node>,
@@ -909,7 +921,7 @@ fn evaluate_function(
     for arg in arguments {
         let first = arg.0.name.clone();
         let second = arg.1;
-        stack.declare_variable(first.as_str(), second)
+        stack.borrow_mut().declare_variable(first.as_str(), second)
     }
     let mut result = ValueRef::stack(Value::Undefined);
     for n in body {
@@ -952,18 +964,18 @@ fn create_function_definition(n: &Node) -> FunctionDefinition {
 fn evaluate_closure(
     value: &ValueRef,
     arguments: &Vec<Vec<Node>>,
-    stack: &mut CallStack,
+    stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> ValueRef {
     let mut curr = value;
     let mut result = ValueRef::stack(Value::Undefined);
     for arg in arguments {
-        match curr {
+        let new_result = match curr {
             ValueRef::Stack { value, .. } => match value {
                 Value::Closure { function, env } => {
                     let mut frame = CallFrame::new(function.name.clone());
                     frame.set_parent(env.clone());
-                    stack.push(frame);
+                    stack.borrow_mut().push(frame);
                     let r = evaluate_function(
                         stack,
                         arg,
@@ -971,9 +983,8 @@ fn evaluate_closure(
                         &function.body,
                         global_environment,
                     );
-                    stack.pop();
-                    result = r;
-                    curr = &result;
+                    stack.borrow_mut().pop();
+                    r
                 }
                 _ => panic!("expected closure"),
             },
@@ -983,7 +994,7 @@ fn evaluate_closure(
                     Value::Closure { function, env } => {
                         let mut frame = CallFrame::new(function.name.clone());
                         frame.set_parent(env.clone());
-                        stack.push(frame);
+                        stack.borrow_mut().push(frame);
                         let r = evaluate_function(
                             stack,
                             arg,
@@ -991,21 +1002,23 @@ fn evaluate_closure(
                             &function.body,
                             global_environment,
                         );
-                        stack.pop();
-                        result = r;
-                        curr = &result;
+                        stack.borrow_mut().pop();
+                        r
                     }
                     _ => panic!("expected closure"),
                 }
             }
-        }
+        };
+        result = new_result;
+        curr = &result;
     }
     result
 }
 
+
 fn evaluate_function_call(
     node: &Node,
-    stack: &mut CallStack,
+    stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     fun: Option<&FunctionDefinition>,
 ) -> ValueRef {
@@ -1024,7 +1037,7 @@ fn evaluate_function_call(
             //     return Rc::new(RefCell::new(Value::Undefined));
             // }
 
-            let value_opt = { stack.get_closure(name) };
+            let value_opt = { stack.borrow().get_closure(name) };
 
             let res = if let Some(value) = value_opt {
                 Some(evaluate_closure(
@@ -1043,10 +1056,9 @@ fn evaluate_function_call(
                 let global_environment_ref = global_environment.borrow();
                 let fun = fun
                     .or_else(|| global_environment_ref.get_function(name))
-                    .expect(format!("function `{}` doesn't exist", name).as_str())
-                    .clone();
-                drop(global_environment_ref);
-                stack.create_frame_push(format!("function_call_{}", name));
+                    .expect(format!("function `{}` doesn't exist", name).as_str());
+
+                stack.borrow_mut().create_frame_push(format!("function_call_{}", name));
                 let r = evaluate_function(
                     stack,
                     arguments.first().unwrap(),
@@ -1054,7 +1066,8 @@ fn evaluate_function_call(
                     &fun.body,
                     global_environment,
                 );
-                stack.pop();
+                drop(global_environment_ref);
+                stack.borrow_mut().pop();
                 if arguments.len() > 1 {
                     // r must be a function (closure)
                     evaluate_closure(&r, &arguments[1..].to_vec(), stack, global_environment)
@@ -1069,7 +1082,7 @@ fn evaluate_function_call(
 
 pub fn evaluate_node(
     node: &Node,
-    stack: &mut CallStack,
+    stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> ValueRef {
     match node {
@@ -1132,7 +1145,7 @@ pub fn evaluate_node(
                     body: Vec::new(),
                 })
             } else {
-                let frame = stack.current_frame().clone();
+                let frame = stack.borrow().current_frame().clone();
                 ValueRef::stack(Value::Closure {
                     function: func_def,
                     env: frame.env,
@@ -1149,7 +1162,7 @@ pub fn evaluate_node(
                 ValueRef::stack(Value::Undefined)
             };
 
-            stack.declare_variable(name, value);
+            stack.borrow_mut().declare_variable(name, value);
 
             ValueRef::stack(Value::Variable(name.to_string()))
         }
@@ -1215,10 +1228,15 @@ pub fn evaluate_node(
             0,
             nodes,
         )
-        .get()
-        .clone(),
+            .get(stack.borrow().deref())
+            .clone(),
         Node::Assignment { var, value, .. } => match var.as_ref() {
+            // get name from var
             Node::Access { nodes } => {
+              let root = match nodes.first().unwrap() {
+                  Node::Identifier(name) => name.to_string(),
+                  _ => "".to_string(),
+              };
                 let mut modifier = resolve_access(
                     stack,
                     global_environment,
@@ -1227,22 +1245,29 @@ pub fn evaluate_node(
                     nodes,
                 );
                 let new_value = evaluate_node(value.as_ref(), stack, global_environment);
-                modifier.set(new_value);
-                modifier.get()
+                let mut stack_ref =stack.borrow_mut();
+                modifier.set(root.to_string(), &mut stack_ref, new_value);
+                modifier.get(stack_ref.deref())
             }
             _ => panic!("expected access to assignment node"),
         },
-        Node::Access { nodes } => resolve_access(
-            stack,
-            global_environment,
-            ValueRef::stack(Value::Undefined),
-            0,
-            nodes,
-        )
-        .get(),
+        Node::Access { nodes } => {
+            let root = match nodes.first().unwrap() {
+                Node::Identifier(name) => name.to_string(),
+                _ => "".to_string(),
+            };
+            resolve_access(
+                stack,
+                global_environment,
+                ValueRef::stack(Value::Undefined),
+                0,
+                nodes,
+            )
+                .get(&stack.borrow())
+        },
         Node::FunctionCall { .. } => evaluate_function_call(node, stack, global_environment, None),
         Node::Block { statements } => {
-            stack.create_frame_push("".to_string());
+            stack.borrow_mut().create_frame_push("".to_string());
             // drop(stack_ref);
             let mut res = ValueRef::stack(Value::Undefined);
             for statement in statements {
@@ -1252,7 +1277,7 @@ pub fn evaluate_node(
                 }
             }
 
-            stack.frames.pop();
+            stack.borrow_mut().frames.pop();
             // mem::drop(stack_ref);
             res
         }
@@ -1361,7 +1386,7 @@ pub fn evaluate_node(
                         Value::Boolean(ok) => Some(*ok),
                         _ => None,
                     })
-                    .expect("for condition in should be a boolean expression")
+                        .expect("for condition in should be a boolean expression")
                 })
                 .unwrap_or(true)
             {
@@ -1388,60 +1413,80 @@ pub fn evaluate_node(
                 _ => panic!("unsupported unary operator: {:?}", operator),
             }
         }
-        /*Node::BinaryOp {
+        /*
+
+        */
+        Node::BinaryOp {
             left,
             operator,
             right,
         } => {
+            // Evaluate the left and right nodes
             let left_val = evaluate_node(left, stack, global_environment);
             let right_val = evaluate_node(right, stack, global_environment);
-            let left_val_ref = left_val.borrow();
-            let right_val_ref = right_val.borrow();
-            match (left_val_ref.deref(), right_val_ref.deref()) {
-                (Value::Integer(l), Value::Integer(r)) => match operator {
-                    Operator::Add => Rc::new(RefCell::new(Value::Integer(l + r))),
-                    Operator::Subtract => Rc::new(RefCell::new(Value::Integer(l - r))),
-                    Operator::Multiply => Rc::new(RefCell::new(Value::Integer(l * r))),
-                    Operator::Divide => Rc::new(RefCell::new(Value::Integer(l / r))),
-                    Operator::Mod => Rc::new(RefCell::new(Value::Integer(l % r))),
-                    Operator::Equals => Rc::new(RefCell::new(Value::Boolean(l == r))),
-                    Operator::LessThanOrEqual => Rc::new(RefCell::new(Value::Boolean(l <= r))),
-                    Operator::LessThan => Rc::new(RefCell::new(Value::Boolean(l < r))),
-                    Operator::GreaterThanOrEqual => Rc::new(RefCell::new(Value::Boolean(l >= r))),
-                    Operator::GreaterThan => Rc::new(RefCell::new(Value::Boolean(l > r))),
-                    _ => panic!("Unsupported operator"),
-                },
+            let mut res = Value::Undefined;
+            left_val.unwrap(|left_inner| {
+                right_val.unwrap(|right_inner| {
+                    res =  match (left_inner, right_inner) {
+                        (Value::Integer(l), Value::Integer(r)) => match operator {
+                            Operator::Add => Value::Integer(l + r),
+                            Operator::Subtract => Value::Integer(l - r),
+                            Operator::Multiply => Value::Integer(l * r),
+                            Operator::Divide => Value::Integer(l / r),
+                            Operator::Mod => Value::Integer(l % r),
+                            Operator::Equals => Value::Boolean(l == r),
+                            Operator::LessThanOrEqual => Value::Boolean(l <= r),
+                            Operator::LessThan => Value::Boolean(l < r),
+                            Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
+                            Operator::GreaterThan => Value::Boolean(l > r),
+                            _ => panic!("Unsupported operator"),
+                        },
+                        _ => panic!("Unsupported operator"),
+                    }
+                })
+            });
+                ValueRef::stack(res)
+
+
+
+
+            // Match and compute based on the inner values
+
+                /*
                 (Value::Boolean(a), Value::Boolean(b)) => match operator {
-                    Operator::And => Rc::new(RefCell::new(Value::Boolean(*a && *b))),
-                    Operator::Or => Rc::new(RefCell::new(Value::Boolean(*a || *b))),
+                    Operator::And => ValueRef::stack(Value::Boolean(a && b)),
+                    Operator::Or => ValueRef::stack(Value::Boolean(a || b)),
                     _ => panic!("Unsupported operator"),
                 },
                 (Value::String(s1), Value::String(s2)) => match operator {
-                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s1, s2)))),
+                    Operator::Add => ValueRef::stack(Value::String(format!("{}{}", s1, s2))),
                     _ => panic!("Unsupported operator for string concatenation"),
                 },
                 (Value::String(s), Value::Integer(i)) => match operator {
-                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s, i)))),
+                    Operator::Add => ValueRef::stack(Value::String(format!("{}{}", s, i))),
                     _ => panic!("Unsupported operator for string concatenation"),
                 },
                 (Value::Integer(i), Value::String(s)) => match operator {
-                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", i, s)))),
+                    Operator::Add => ValueRef::stack(Value::String(format!("{}{}", i, s))),
                     _ => panic!("Unsupported operator for string concatenation"),
                 },
                 (Value::Boolean(i), Value::String(s)) => match operator {
-                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", i, s)))),
+                    Operator::Add => ValueRef::stack(Value::String(format!("{}{}", i, s))),
                     _ => panic!("Unsupported operator for string concatenation"),
                 },
                 (Value::String(s), Value::Boolean(i)) => match operator {
-                    Operator::Add => Rc::new(RefCell::new(Value::String(format!("{}{}", s, i)))),
+                    Operator::Add => ValueRef::stack(Value::String(format!("{}{}", s, i))),
                     _ => panic!("Unsupported operator for string concatenation"),
                 },
                 _ => panic!(
                     "Unsupported binary operation={:?}, left={:?}, right={:?}",
-                    operator, left_val_ref, right_val_ref
+                    operator, left_val, right_val
                 ),
+
+                 */
             }
-        }*/
+
+
         Node::Print(value) => {
             let val = evaluate_node(value, stack, global_environment);
             println!("{:?}", val);
@@ -1449,6 +1494,7 @@ pub fn evaluate_node(
         }
         Node::Identifier(name) => {
             let v = stack
+                .borrow()
                 .get_variable(name)
                 .expect(format!("variable '{}' does not exist", name).as_str());
             // let res = Rc::clone(&v);
@@ -1478,7 +1524,19 @@ pub fn evaluate_node(
 mod tests {
     use super::*;
 
-    /*
+    #[test]
+    fn test_1() {
+        let source_code = r#"
+         i:int = 0;
+         i = 1;
+         i;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        println!("{:?}", res);
+    }
+
+
 
          #[test]
     fn test_array_modify() {
@@ -1489,10 +1547,11 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(2), *res_ref.deref());
+             println!("{:?}", res);
+        // let res_ref = res.borrow();
+        // assert_eq!(Value::Integer(2), *res_ref.deref());
     }
-
+    /*
     #[test]
     fn test_2d_array_modify() {
         let source_code = r#"
