@@ -502,7 +502,8 @@ impl ValueModifier for StackVariableModifier {
     fn get(&self, stack: &CallStack) -> ValueRef {
         stack
             .get_variable(&self.name)
-            .expect(format!("Variable '{}' not found", self.name).as_str())
+            //.expect(format!("Variable '{}' not found", self.name).as_str())
+            .unwrap()
             .clone()
     }
 }
@@ -1056,9 +1057,9 @@ fn evaluate_function_call(
                 let global_environment_ref = global_environment.borrow();
                 let fun = fun
                     .or_else(|| global_environment_ref.get_function(name))
-                    .expect(format!("function `{}` doesn't exist", name).as_str());
+                    .unwrap();
 
-                stack.borrow_mut().create_frame_push(format!("function_call_{}", name));
+                stack.borrow_mut().create_frame_push("".to_string());
                 let r = evaluate_function(
                     stack,
                     arguments.first().unwrap(),
@@ -1327,8 +1328,9 @@ pub fn evaluate_node(
                 .map(|v| match v {
                     Value::Boolean(ok) => Some(*ok),
                     _ => None,
-                })
-                .expect(format!("non boolean expression: {:?}", condition.as_ref()).as_str());
+                }).unwrap();
+
+            //.expect(format!("non boolean expression: {:?}", condition.as_ref()).as_str());
             if ok {
                 for n in body {
                     let val = evaluate_node(n, stack, global_environment);
@@ -1496,7 +1498,8 @@ pub fn evaluate_node(
             let v = stack
                 .borrow()
                 .get_variable(name)
-                .expect(format!("variable '{}' does not exist", name).as_str());
+                .unwrap();
+            //.expect(format!("variable '{}' does not exist", name).as_str());
             // let res = Rc::clone(&v);
             // drop(stack_ref);
             v.clone()
