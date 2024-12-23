@@ -4,6 +4,7 @@ use sysinfo::{Pid, System};
 
 use crate::ast;
 use crate::interpreter::Value::{Array, StructInstance};
+use crate::parser::Rule::{base_type, for_expr};
 use ast::Literal;
 use ast::Node;
 use ast::Operator;
@@ -15,7 +16,6 @@ use std::io::BufRead;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use crate::parser::Rule::for_expr;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -77,9 +77,9 @@ impl ValueRef {
         }
     }
 
-    fn heap(value: Rc<RefCell<Value>>) -> Self {
+    fn heap(value: Value) -> Self {
         ValueRef::Heap {
-            value,
+            value: Rc::new(RefCell::new(value)),
             returned: false,
         }
     }
@@ -131,9 +131,24 @@ impl ValueRef {
         }
     }
 
-    fn map<T, F>(&self, f: F) -> Option<T>
+    fn map_opt<T, F>(&self, f: F) -> Option<T>
     where
         F: Fn(&Value) -> Option<T>,
+    {
+        match self {
+            ValueRef::Stack { value, .. } => f(value),
+            ValueRef::Heap { value, .. } => {
+                let value_ref = value.borrow();
+                let res = f(value_ref.deref());
+                drop(value_ref);
+                res
+            }
+        }
+    }
+
+    fn map<F>(&self, f: F) -> ValueRef
+    where
+        F: Fn(&Value) -> ValueRef,
     {
         match self {
             ValueRef::Stack { value, .. } => f(value),
@@ -170,7 +185,23 @@ impl ValueRef {
             }
         }
     }
+
+    fn is_struct(&self) -> bool {
+        self.is_match(|v| match v {
+            Value::StructInstance { .. } => true,
+            _ => false,
+        })
+    }
+
+    fn is_array(&self) -> bool {
+        self.is_match(|v| match v {
+            Value::Array { .. } => true,
+            _ => false,
+        })
+    }
 }
+
+// const UNDEFINED_REF:ValueRef = ValueRef::stack(Value::Undefined);
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -265,7 +296,7 @@ impl GlobalEnvironment {
     }
     fn to_struct_def(&self, value_ref: &ValueRef) -> &StructDefinition {
         value_ref
-            .map(|v| match v {
+            .map_opt(|v| match v {
                 Value::StructInstance { name, .. } => Some(self.structs.get(name).unwrap()),
                 _ => panic!("expected struct instance. given: {:?}", v),
             })
@@ -291,15 +322,17 @@ impl Environment {
 
     fn has_variable(&self, name: &str) -> bool {
         //println!("Environment::has_variable={}", name);
-        // if self.variables.contains_key(name) {
-        //     return true;
-        // }
-        // if let Some(parent) = &self.parent {
-        //     let parent_ref = parent.borrow();
-        //     let result = parent_ref.has_variable(name);
-        //     return result;
-        // }
-        true
+        // todo optimize
+        if self.variables.contains_key(name) {
+            return true;
+        }
+        if let Some(parent) = &self.parent {
+            let parent_ref = parent.borrow();
+            let result = parent_ref.has_variable(name);
+            return result;
+        }
+        false
+        //  true
     }
 
     fn get_var(&self, name: &str) -> Option<ValueRef> {
@@ -330,6 +363,7 @@ impl Environment {
     }
 }
 
+/*
 enum ValueModifier {
     StructInstanceModifier {
         instance: ValueRef,
@@ -441,6 +475,8 @@ impl ValueModifier {
         }
     }
 }
+
+ */
 
 fn get_array_element(value: &Value, coordinates: &Vec<i64>) -> ValueRef {
     if let Value::Array {
@@ -687,17 +723,20 @@ impl CallStack {
     }
 
     fn get_closure(&self, name: &str) -> Option<ValueRef> {
-        // for frame in self.frames.iter().rev() {
-        //     if frame.has_variable(name) {
-        //         let val = frame.get_variable(name).expect(format!("variable '{}' not found", name).as_str());
-        //         if val.is_match(|v| match v {
-        //             Value::Closure { .. } => true,
-        //             _ => false,
-        //         }) {
-        //             return frame.get_variable(name);
-        //         }
-        //     }
-        // }
+        // todo optimize, use cache
+        for frame in self.frames.iter().rev() {
+            if frame.has_variable(name) {
+                let val = frame
+                    .get_variable(name)
+                    .expect(format!("variable '{}' not found", name).as_str());
+                if val.is_match(|v| match v {
+                    Value::Closure { .. } => true,
+                    _ => false,
+                }) {
+                    return frame.get_variable(name);
+                }
+            }
+        }
         None
     }
 
@@ -721,6 +760,7 @@ impl CallStack {
     }
 
     fn declare_variable(&mut self, name: &str, value: ValueRef) {
+        println!("declare variable {}={:?}", name, value);
         self.current_frame_mut().declare_variable(name, value);
     }
 
@@ -753,49 +793,140 @@ fn assert_value_is_struct(v: &Value) {
     }
 }
 
-fn resolve_member_access<'a>(
+fn get_struct_field(instance: ValueRef, field: &str) -> ValueRef {
+    match instance {
+        ValueRef::Stack { value, .. } => ValueRef::stack(value.clone()),
+        ValueRef::Heap { value, .. } => {
+            let value_ref = value.borrow();
+            if let Value::StructInstance { name, fields } = value_ref.deref() {
+                fields.get(field).expect("Field not found").clone()
+            } else {
+                panic!("expected a struct instance");
+            }
+        }
+    }
+}
+fn set_struct_field(
+    stack: &Rc<RefCell<CallStack>>,
+    instance: ValueRef,
+    field: &str,
+    new_value: ValueRef,
+) {
+    match instance {
+        ValueRef::Stack { .. } => {
+            panic!("structs cannot be on stack")
+            // if let Value::StructInstance {
+            //     name,
+            //     ref mut fields,
+            // } = value
+            // {
+            //     fields.insert(field.to_string(), new_value);
+            //     stack.borrow_mut().assign_variable(
+            //         name,
+            //         ValueRef::stack(StructInstance {
+            //             name: name.to_string(),
+            //             fields: mem::take(fields),
+            //         }),
+            //     );
+            // } else {
+            //     panic!("expected a struct instance");
+            // }
+        }
+        ValueRef::Heap { value, .. } => {
+            let mut value_ref = value.borrow_mut();
+            if let Value::StructInstance {
+                name,
+                ref mut fields,
+            } = value_ref.deref_mut()
+            {
+                fields.insert(field.to_string(), new_value);
+            } else {
+                panic!("expected a struct instance");
+            }
+        }
+    }
+}
+
+fn get_or_set_struct_field(
+    stack: &Rc<RefCell<CallStack>>,
+    instance: ValueRef,
+    field: &str,
+    new_value: Option<&ValueRef>,
+) -> ValueRef {
+    match new_value {
+        None => get_struct_field(instance, field),
+        Some(v) => {
+            set_struct_field(stack, instance, field, v.clone());
+            ValueRef::stack(Value::Undefined)
+        }
+    }
+}
+
+fn set_array_ref_element(arr_ref: &ValueRef, coordinates: &Vec<i64>, new_value: ValueRef) {
+    match arr_ref {
+        ValueRef::Stack { .. } => {
+            panic!("arrays cannot be allocated on stack")
+            //set_array_element(value, new_value, coordinates);
+            //stack.assign_variable(name.as_str(), ValueRef::stack(value.clone()));
+            //panic!("cannot mutate array allocated on stack")
+        }
+        ValueRef::Heap { value, .. } => {
+            let mut value_ref = value.borrow_mut();
+            set_array_element(value_ref.deref_mut(), new_value, coordinates)
+        }
+    }
+}
+
+fn get_array_ref_element(arr_ref: &ValueRef, coordinates: &Vec<i64>) -> ValueRef {
+    match arr_ref {
+        ValueRef::Stack { .. } => {
+            panic!("arrays cannot be allocated on stack")
+            //set_array_element(value, new_value, coordinates);
+            //stack.assign_variable(name.as_str(), ValueRef::stack(value.clone()));
+            //panic!("cannot mutate array allocated on stack")
+        }
+        ValueRef::Heap { value, .. } => {
+            let mut value_ref = value.borrow();
+            get_array_element(&value_ref, coordinates)
+        }
+    }
+}
+
+fn resolve_member_access(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     current_value: ValueRef,
     node: &Node,
-) -> ValueModifier {
+    new_value: Option<&ValueRef>,
+) -> ValueRef {
     if let Node::MemberAccess { member, .. } = node {
         let member_ref = member.as_ref();
         match member_ref {
             Node::Identifier(name) => {
-                let struct_match = current_value.map(|v| match v {
-                    Value::StructInstance { .. } => Some(ValueModifier::StructInstanceModifier {
-                        instance: current_value.clone(),
-                        field: name.clone(),
-                    }),
-                    _ => None,
-                });
-                if let Some(m) = struct_match {
-                    return m;
-                }
-
-                let array_match = current_value.map(|v| match v {
-                    Value::Array { arr, .. } => Some(match name.as_str() {
-                        "len" => ValueModifier::ReadValueModifier {
-                            value: ValueRef::stack(Value::Integer(arr.len() as i64)),
+                if current_value.is_struct() {
+                    get_or_set_struct_field(stack, current_value, name, new_value)
+                } else if current_value.is_array() {
+                    current_value.map(|v| match v {
+                        Value::Array { arr, .. } => match name.as_str() {
+                            "len" => ValueRef::stack(Value::Integer(arr.len() as i64)),
+                            _ => {
+                                unreachable!("{}", format!("unsupported array member: `{}`", name))
+                            }
                         },
-                        _ => unreachable!("{}", format!("unsupported array member: `{}`", name)),
-                    }),
-                    _ => None,
-                });
-
-                if let Some(m) = array_match {
-                    return m;
+                        _ => panic!("expected an array"),
+                    })
+                } else {
+                    unreachable!("{}", format!("unsupported member: `{}`", name));
                 }
-
-                unreachable!("{}", format!("unsupported array member: `{}`", name));
             }
             Node::FunctionCall {
                 name, arguments, ..
             } => {
+                println!("resolve member access: function call name={}", name);
                 let global_environment_ref = global_environment.borrow();
                 let struct_def = global_environment_ref.to_struct_def(&current_value);
                 let fun_def = struct_def.functions.get(name).unwrap();
+                println!("func def={:?}", fun_def);
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
                 stack
@@ -805,11 +936,13 @@ fn resolve_member_access<'a>(
                     .borrow_mut()
                     .declare_variable("self", current_value.clone());
 
+                Profiling::sk_debug_stack(stack.borrow().deref());
+
                 let res =
                     evaluate_function_call(member_ref, stack, global_environment, Some(fun_def));
                 stack.borrow_mut().pop();
                 drop(global_environment_ref);
-                ValueModifier::ReadValueModifier { value: res }
+                res
             }
             _ => panic!("expected member access, found {:?}", member_ref),
         }
@@ -821,73 +954,94 @@ fn resolve_member_access<'a>(
 fn resolve_array_access(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
-    current_value: ValueRef,
+    arr_ref: ValueRef,
     node: &Node,
-) -> ValueModifier {
+    new_value: Option<&ValueRef>,
+) -> ValueRef {
     if let Node::ArrayAccess { coordinates } = node {
         let _coordinates: Vec<i64> = coordinates
             .iter()
-            .map(|c| {
-                evaluate_node(c, stack, global_environment)
-                    .map(|v| match v {
+            .map(|n| {
+                evaluate_node(n, stack, global_environment)
+                    .map_opt(|v| match v {
                         Value::Integer(dim) => Some(*dim),
                         _ => panic!("expected integer index for array access"),
                     })
                     .unwrap()
             })
             .collect();
-        ValueModifier::ArrayModifier {
-            array: current_value,
-            coordinates: _coordinates,
+
+        match new_value {
+            None => get_array_ref_element(&arr_ref, &_coordinates),
+            Some(v) => {
+                set_array_ref_element(&arr_ref, &_coordinates, v.clone());
+                ValueRef::stack(Value::Undefined)
+            }
         }
     } else {
         panic!("expected array access, found {:?}", node)
     }
 }
 
-fn resolve_variable_access(
-    // stack: &'a mut CallStack,
-    node: &Node,
-) -> ValueModifier {
-    if let Node::Identifier(name) = node {
-        ValueModifier::StackVariableModifier { name: name.clone() }
-    } else {
-        panic!("expected identifier, found {:?}", node)
-    }
-}
+// fn resolve_variable_access(
+//     // stack: &'a mut CallStack,
+//     node: &Node,
+// ) -> ValueModifier {
+//     if let Node::Identifier(name) = node {
+//         ValueModifier::StackVariableModifier { name: name.clone() }
+//     } else {
+//         panic!("expected identifier, found {:?}", node)
+//     }
+// }
 
 fn resolve_access(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
     current_value: ValueRef,
-    level: usize,
     access_nodes: &Vec<Node>,
-) -> ValueModifier {
-    let mut current_modifier = ValueModifier::ReadValueModifier {
-        value: current_value,
-    };
+    new_value: Option<&ValueRef>,
+) -> ValueRef {
+    let mut res = current_value;
 
-    for access_node in access_nodes {
-        // let mut stack_ref = stack.borrow_mut();
-        current_modifier = match access_node {
-            Node::MemberAccess { .. } => resolve_member_access(
-                stack,
-                global_environment,
-                current_modifier.get(stack.borrow().deref()),
-                access_node,
-            ),
-            Node::ArrayAccess { .. } => resolve_array_access(
-                stack,
-                global_environment,
-                current_modifier.get(stack.borrow().deref()),
-                access_node,
-            ),
-            Node::Identifier(..) => resolve_variable_access(access_node),
+    let n = access_nodes.len();
+
+    for i in 0..n {
+        let access_node = &access_nodes[i];
+        let to_set = if i == n - 1 {
+            // last node, we can set
+            new_value.clone()
+        } else {
+            None
+        };
+
+        res = match access_node {
+            Node::MemberAccess { .. } => {
+                println!("resolve_access-{}, current_value={:?}, member={:?}, to_set={:?}",
+                         i,
+                         res,
+                         access_node,
+                         to_set);
+                resolve_member_access(stack, global_environment, res, access_node, to_set)
+            }
+
+            Node::ArrayAccess { .. } => {
+                resolve_array_access(stack, global_environment, res, access_node, to_set)
+            }
+            Node::Identifier(name) => {
+                println!("resolve_access, name={}, node={:?}", name, access_node);
+                match to_set {
+                    None => stack.borrow().get_variable(name).unwrap(),
+                    Some(v) => {
+                        stack.borrow_mut().assign_variable(name, v.clone());
+                        ValueRef::stack(Value::Undefined)
+                    }
+                }
+            }
             _ => panic!("unexpected access node: {:?}", access_node),
         };
     }
 
-    current_modifier
+    res
 }
 
 fn evaluate_function(
@@ -897,14 +1051,17 @@ fn evaluate_function(
     body: &Vec<Node>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> ValueRef {
-    let n = arguments.len();
+    let mut parameters = &parameters[0..];
+    if parameters.len()>0 && parameters[0].sk_type == Type::SkSelf {
+        parameters = &parameters[1..];
+    }
+    let n = parameters.len();
     for i in 0..n {
         let param = &parameters[i];
-        if param.sk_type != Type::SkSelf {
             let v = evaluate_node(&arguments[i], stack, global_environment);
             stack.borrow_mut().declare_variable(&param.name, v);
-        }
     }
+    Profiling::sk_debug_stack(stack.borrow().deref());
     let mut result = ValueRef::stack(Value::Undefined);
     for n in body {
         let v = evaluate_node(&n, stack, global_environment);
@@ -1007,16 +1164,17 @@ fn evaluate_function_call(
         Node::FunctionCall {
             name, arguments, ..
         } => {
-            // if name == "sk_debug_mem" {
-            //     Profiling::sk_debug_mem_sysinfo();
-            //     Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
-            //     return Rc::new(RefCell::new(Value::Undefined));
-            // }
-            //
-            // if name == "sk_debug_stack" {
-            //     Profiling::sk_debug_stack(stack);
-            //     return Rc::new(RefCell::new(Value::Undefined));
-            // }
+            println!("eval func call={}", name);
+            if name == "sk_debug_mem" {
+                Profiling::sk_debug_mem_sysinfo();
+                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
+                return ValueRef::stack(Value::Undefined);
+            }
+
+            if name == "sk_debug_stack" {
+                Profiling::sk_debug_stack(stack.borrow().deref());
+                return ValueRef::stack(Value::Undefined);
+            }
 
             let value_opt = { stack.borrow().get_closure(name) };
 
@@ -1127,7 +1285,7 @@ pub fn evaluate_node(
                 })
             } else {
                 let frame = stack.borrow().current_frame().clone();
-                ValueRef::stack(Value::Closure {
+                ValueRef::heap(Value::Closure {
                     function: func_def,
                     env: frame.env,
                 })
@@ -1184,7 +1342,7 @@ pub fn evaluate_node(
                 }
             }
 
-            ValueRef::stack(Value::Array {
+            ValueRef::heap(Value::Array {
                 arr: values,
                 dimensions,
             })
@@ -1197,38 +1355,40 @@ pub fn evaluate_node(
                     evaluate_node(node, stack, global_environment),
                 );
             }
-            ValueRef::stack(Value::StructInstance {
+            ValueRef::heap(Value::StructInstance {
                 name: name.to_string(),
                 fields: field_values,
             })
         }
-        Node::Access { nodes } => resolve_access(
-            stack,
-            global_environment,
-            ValueRef::stack(Value::Undefined),
-            0,
-            nodes,
-        )
-        .get(stack.borrow().deref())
-        .clone(),
+        Node::Access { nodes } => {
+            println!("resolve access: {:?}", nodes);
+            resolve_access(
+                stack,
+                global_environment,
+                ValueRef::stack(Value::Undefined),
+                nodes,
+                None,
+            )
+        }
         Node::Assignment { var, value, .. } => match var.as_ref() {
             // get name from var
             Node::Access { nodes } => {
-                let root = match nodes.first().unwrap() {
-                    Node::Identifier(name) => name.to_string(),
-                    _ => "".to_string(),
-                };
-                let mut modifier = resolve_access(
+                let new_value = evaluate_node(value.as_ref(), stack, global_environment);
+                // let root = match nodes.first().unwrap() {
+                //     Node::Identifier(name) => name.to_string(),
+                //     _ => "".to_string(),
+                // };
+                resolve_access(
                     stack,
                     global_environment,
                     ValueRef::stack(Value::Undefined),
-                    0,
                     nodes,
-                );
-                let new_value = evaluate_node(value.as_ref(), stack, global_environment);
-                let mut stack_ref = stack.borrow_mut();
-                modifier.set(root.to_string(), &mut stack_ref, new_value);
-                modifier.get(stack_ref.deref())
+                    Some(&new_value),
+                )
+
+                // let mut stack_ref = stack.borrow_mut();
+                // modifier.set(root.to_string(), &mut stack_ref, new_value);
+                // modifier.get(stack_ref.deref())
             }
             _ => panic!("expected access to assignment node"),
         },
@@ -1241,10 +1401,9 @@ pub fn evaluate_node(
                 stack,
                 global_environment,
                 ValueRef::stack(Value::Undefined),
-                0,
                 nodes,
+                None,
             )
-            .get(&stack.borrow())
         }
         Node::FunctionCall { .. } => evaluate_function_call(node, stack, global_environment, None),
         Node::Block { statements } => {
@@ -1277,7 +1436,7 @@ pub fn evaluate_node(
                 for dim_node in dimensions {
                     let dim_val = evaluate_node(dim_node, stack, global_environment);
                     let i = dim_val
-                        .map(|v| match v {
+                        .map_opt(|v| match v {
                             Value::Integer(i) => Some(*i),
                             _ => None,
                         })
@@ -1289,7 +1448,7 @@ pub fn evaluate_node(
                 for _ in 0..size {
                     arr.push(evaluate_node(&arguments[0], stack, global_environment));
                 }
-                ValueRef::stack(Value::Array {
+                ValueRef::heap(Value::Array {
                     arr,
                     dimensions: int_dimensions.clone(),
                 })
@@ -1305,7 +1464,7 @@ pub fn evaluate_node(
             let value_ref = evaluate_node(condition, stack, global_environment);
 
             let ok = value_ref
-                .map(|v| match v {
+                .map_opt(|v| match v {
                     Value::Boolean(ok) => Some(*ok),
                     _ => None,
                 })
@@ -1365,7 +1524,7 @@ pub fn evaluate_node(
                 .as_ref()
                 .map(|cond| {
                     let res = evaluate_node(cond.as_ref(), stack, global_environment);
-                    res.map(|v| match v {
+                    res.map_opt(|v| match v {
                         Value::Boolean(ok) => Some(*ok),
                         _ => None,
                     })
@@ -1502,18 +1661,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_1() {
-        let source_code = r#"
-         i:int = 0;
-         i = 1;
-         i;
-        "#;
-        let program = ast::parse(source_code);
-        let res = evaluate(&program);
-        println!("{:?}", res);
-    }
-
-    #[test]
     fn test_array_modify() {
         let source_code = r#"
          arr: int[5] = int[5]::new(1);
@@ -1522,11 +1669,9 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        println!("{:?}", res);
-        // let res_ref = res.borrow();
-        // assert_eq!(Value::Integer(2), *res_ref.deref());
+        assert_eq!(Value::Integer(2), res.get_value());
     }
-    /*
+
     #[test]
     fn test_2d_array_modify() {
         let source_code = r#"
@@ -1536,8 +1681,7 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(2), *res_ref.deref());
+        assert_eq!(Value::Integer(2), res.get_value());
     }
 
     #[test]
@@ -1554,68 +1698,67 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
+        println!("{:?}", res);
         assert_eq!(
             Value::StructInstance {
                 name: "Point".to_string(),
                 fields: HashMap::from([
-                    ("x".to_string(), Rc::new(RefCell::new(Value::Integer(3)))),
-                    ("y".to_string(), Rc::new(RefCell::new(Value::Integer(4))))
+                    ("x".to_string(), ValueRef::stack(Value::Integer(3))),
+                    ("y".to_string(), ValueRef::stack(Value::Integer(4)))
                 ])
             },
-            *res_ref.deref()
+            res.get_value()
         )
     }
 
     #[test]
     fn test_struct_arr_field_modify() {
         let source_code = r#"
-            struct Point {
-                c: int[2];
-            }
-            p: Point = Point{ c: int[2]::new(0) };
-            p.c[0] = 1;
-            p.c[1] = 2;
-            p;
-        "#;
+                struct Point {
+                    c: int[2];
+                }
+                p: Point = Point{ c: int[2]::new(0) };
+                p.c[0] = 1;
+                p.c[1] = 2;
+                p;
+            "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
+        // println!("{:?}", res);
         assert_eq!(
             StructInstance {
                 name: "Point".to_string(),
                 fields: HashMap::from([(
                     "c".to_string(),
-                    Rc::new(RefCell::new(Value::Array {
+                    ValueRef::heap(Value::Array {
                         arr: [
-                            Rc::new(RefCell::new(Value::Integer(1))),
-                            Rc::new(RefCell::new(Value::Integer(2)))
+                            ValueRef::stack(Value::Integer(1)),
+                            ValueRef::stack(Value::Integer(2))
                         ]
                         .to_vec(),
                         dimensions: [2].to_vec()
-                    }))
+                    })
                 )])
             },
-            *res_ref
+            res.get_value()
         )
     }
 
     #[test]
     fn test_if() {
         let source_code = r#"
-            function max(a:int, b:int):int {
-                if (a > b) {
-                    return a;
-                } else {
-                    return b;
-                }
-            }
-            max(2, 3);
-        "#;
+                  function max(a:int, b:int):int {
+                      if (a > b) {
+                          return a;
+                      } else {
+                          return b;
+                      }
+                  }
+                  max(2, 3);
+              "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(3), *res_ref.deref());
+        assert_eq!(Value::Integer(3), res.get_value());
     }
 
     #[test]
@@ -1632,221 +1775,209 @@ mod tests {
         for p in &parameters {
             let source_code = format!(
                 r#"
-             function max(a:int, b:int, c:int):int {{
-                if (a > b) {{
-                    if (a > c) {{
-                        return a;
-                    }} else {{
-                        return c;
-                    }}
-                }} else {{
-                    if (b > c) {{
-                        return b;
-                    }} else {{
-                        return c;
-                    }}
-                }}
-            }}
-            max({}, {}, {});
-            "#,
+                   function max(a:int, b:int, c:int):int {{
+                      if (a > b) {{
+                          if (a > c) {{
+                              return a;
+                          }} else {{
+                              return c;
+                          }}
+                      }} else {{
+                          if (b > c) {{
+                              return b;
+                          }} else {{
+                              return c;
+                          }}
+                      }}
+                  }}
+                  max({}, {}, {});
+                  "#,
                 p.0, p.1, p.2
             );
             let program = ast::parse(source_code.as_str());
             let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(3), *res_ref.deref());
+            assert_eq!(Value::Integer(3), res.get_value());
         }
+    }
 
+    #[test]
+    fn test_for_loop_simple_increment() {
+        let source_code = r#"
+                             a:int = 0;
+                             for (i:int = 0; i < 5; i = i + 1) {
+                                 a = a + 1;
+                             }
+                             a;
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(5), res.get_value());
+    }
 
-        #[test]
-        fn test_for_loop_simple_increment() {
-            let source_code = r#"
-            a:int = 0;
-            for (i:int = 0; i < 5; i = i + 1) {
-                a = a + 1;
-            }
-            a;
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(5), *res_ref.deref());
-        }
+    #[test]
+    fn test_for_loop_with_array_modification() {
+        let source_code = r#"
+                             arr: int[5] = int[5]::new(0);
+                             for (i:int = 0; i < 5; i = i + 1) {
+                                 arr[i] = i * 2;
+                             }
+                             arr[4];
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(8), res.get_value());
+    }
 
-        #[test]
-        fn test_for_loop_with_array_modification() {
-            let source_code = r#"
-            arr: int[5] = int[5]::new(0);
-            for (i:int = 0; i < 5; i = i + 1) {
-                arr[i] = i * 2;
-            }
-            arr[4];
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(8), *res_ref.deref());
-        }
+    #[test]
+    fn test_nested_for_loops_2d_array() {
+        let source_code = r#"
+                             arr: int[2][2] = int[2][2]::new(0);
+                             for (i:int = 0; i < 2; i = i + 1) {
+                                 for (j:int = 0; j < 2; j = j + 1) {
+                                     arr[i][j] = i + j;
+                                 }
+                             }
+                             arr[1][1];
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(2), res.get_value());
+    }
 
-        #[test]
-        fn test_nested_for_loops_2d_array() {
-            let source_code = r#"
-            arr: int[2][2] = int[2][2]::new(0);
-            for (i:int = 0; i < 2; i = i + 1) {
-                for (j:int = 0; j < 2; j = j + 1) {
-                    arr[i][j] = i + j;
-                }
-            }
-            arr[1][1];
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(2), *res_ref.deref());
-        }
+    #[test]
+    fn test_struct_with_array_field() {
+        let source_code = r#"
+                             struct Container {
+                                 values: int[3];
+                             }
+                             c: Container = Container{ values: int[3]::new(1) };
+                             c.values[1] = 2;
+                             c.values[2] = 3;
+                             c.values[1];
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(2), res.get_value());
+    }
 
-        #[test]
-        fn test_struct_with_array_field() {
-            let source_code = r#"
-            struct Container {
-                values: int[3];
-            }
-            c: Container = Container{ values: int[3]::new(1) };
-            c.values[1] = 2;
-            c.values[2] = 3;
-            c.values[1];
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(2), *res_ref.deref());
-        }
+    #[test]
+    fn test_array_return_value_from_function() {
+        let source_code = r#"
+                             function createArray(): int[3] {
+                                 arr: int[3] = int[3]::new(1);
+                                 return arr;
+                             }
+                             arr:int[] = createArray();
+                             arr[2];
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(1), res.get_value());
+    }
 
-        #[test]
-        fn test_array_return_value_from_function() {
-            let source_code = r#"
-            function createArray(): int[3] {
-                arr: int[3] = int[3]::new(1);
-                return arr;
-            }
-            arr:int[] = createArray();
-            arr[2];
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(1), *res_ref.deref());
-        }
+    #[test]
+    fn test_struct_instance_with_nested_structs() {
+        let source_code = r#"
+                             struct Inner {
+                                 value: int;
+                             }
+                             struct Outer {
+                                 inner: Inner;
+                             }
+                             outer: Outer = Outer{ inner: Inner{ value: 10 } };
+                             outer.inner.value;
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(10), res.get_value());
+    }
 
-        #[test]
-        fn test_struct_instance_with_nested_structs() {
-            let source_code = r#"
-            struct Inner {
-                value: int;
-            }
-            struct Outer {
-                inner: Inner;
-            }
-            outer: Outer = Outer{ inner: Inner{ value: 10 } };
-            outer.inner.value;
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(10), *res_ref.deref());
-        }
+    #[test]
+    fn test_function_returning_struct_instance() {
+        let source_code = r#"
+                             struct Point {
+                                 x: int;
+                                 y: int;
+                             }
+                             function createPoint(): Point {
+                                 return Point{ x: 10, y: 20 };
+                             }
+                             p: Point = createPoint();
+                             p.y;
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(20), res.get_value());
+    }
 
-        #[test]
-        fn test_function_returning_struct_instance() {
-            let source_code = r#"
-            struct Point {
-                x: int;
-                y: int;
-            }
-            function createPoint(): Point {
-                return Point{ x: 10, y: 20 };
-            }
-            p: Point = createPoint();
-            p.y;
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(20), *res_ref.deref());
-        }
+    #[test]
+    fn test_array_out_of_bounds_error() {
+        let source_code = r#"
+                             arr: int[3] = int[3]::new(1);
+                             arr[3] = 10;
+                             "#;
+        let program = ast::parse(source_code);
+        let result = std::panic::catch_unwind(|| {
+            evaluate(&program);
+        });
+        assert!(result.is_err());
+    }
 
-        #[test]
-        fn test_array_out_of_bounds_error() {
-            let source_code = r#"
-            arr: int[3] = int[3]::new(1);
-            arr[3] = 10;
-            "#;
-            let program = ast::parse(source_code);
-            let result = std::panic::catch_unwind(|| {
-                evaluate(&program);
-            });
-            assert!(result.is_err());
-        }
+    #[test]
+    fn test_array_len() {
+        let source_code = r#"
+                             arr: int[3] = int[3]::new(1);
+                             arr.len;
+                             "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(3), res.get_value());
+    }
 
-        #[test]
-        fn test_array_len() {
-            let source_code = r#"
-            arr: int[3] = int[3]::new(1);
-            arr.len;
-            "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(3), *res_ref.deref());
-        }
+    #[test]
+    fn test_modify_struct_array_field_through_for_loop() {
+        let source_code = r#"
+                             struct Container {
+                                 values: int[3];
+                             }
+                             c: Container = Container{ values: int[3]::new(0) };
+                             for (i:int = 0; i < 3; i = i + 1) {
+                                 c.values[i] = i * 2;
+                             }
+                             c.values[2];
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(4), res.get_value());
+    }
 
-        #[test]
-        fn test_modify_struct_array_field_through_for_loop() {
-            let source_code = r#"
-            struct Container {
-                values: int[3];
-            }
-            c: Container = Container{ values: int[3]::new(0) };
-            for (i:int = 0; i < 3; i = i + 1) {
-                c.values[i] = i * 2;
-            }
-            c.values[2];
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(4), *res_ref.deref());
-        }
-
-        #[test]
-        fn test_return_void_function_call_in_expression() {
-            let source_code = r#"
-            function setValues(a:int[3]):void {
-                a[0] = 10;
-            }
-            arr: int[3] = int[3]::new(1);
-            setValues(arr);
-            arr[0];
-        "#;
-            let program = ast::parse(source_code);
-            let res = evaluate(&program);
-            let res_ref = res.borrow();
-            assert_eq!(Value::Integer(10), *res_ref.deref());
-        }
+    #[test]
+    fn test_return_void_function_call_in_expression() {
+        let source_code = r#"
+                             function setValues(a:int[3]):void {
+                                 a[0] = 10;
+                             }
+                             arr: int[3] = int[3]::new(1);
+                             setValues(arr);
+                             arr[0];
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(10), res.get_value());
     }
 
     #[test]
     fn test_mod() {
         let source_code = r#"
-            function isEven(i: int):boolean {
-                if (i % 2 == 0) {
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            isEven(3);
-        "#;
+                             function isEven(i: int):boolean {
+                                 if (i % 2 == 0) {
+                                     return true;
+                                 } else {
+                                     return false;
+                                 }
+                             }
+                             isEven(3);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         println!("{:?}", res);
@@ -1855,296 +1986,288 @@ mod tests {
     #[test]
     fn test_return_from_for_loop() {
         let source_code = r#"
-            function findFirstEven(limit: int): int {
-                for (i:int = 0; i < limit; i = i + 1) {
-                    if (i % 2 == 0) {
-                        return i;
-                    }
-                }
-                return -1;
-            }
-            findFirstEven(5);
-        "#;
+                             function findFirstEven(limit: int): int {
+                                 for (i:int = 0; i < limit; i = i + 1) {
+                                     if (i % 2 == 0) {
+                                         return i;
+                                     }
+                                 }
+                                 return -1;
+                             }
+                             findFirstEven(5);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(0), *res_ref.deref());
+        assert_eq!(Value::Integer(0), res.get_value());
     }
 
     #[test]
     fn test_return_from_nested_for_loop() {
         let source_code = r#"
-            function findFirstMatch(): int {
-                for (i:int = 0; i < 3; i = i + 1) {
-                    for (j:int = 0; j < 3; j = j + 1) {
-                        if (i + j == 2) {
-                            return i * 10 + j;
-                        }
-                    }
-                }
-                return -1;
-            }
-            findFirstMatch();
-        "#;
+                             function findFirstMatch(): int {
+                                 for (i:int = 0; i < 3; i = i + 1) {
+                                     for (j:int = 0; j < 3; j = j + 1) {
+                                         if (i + j == 2) {
+                                             return i * 10 + j;
+                                         }
+                                     }
+                                 }
+                                 return -1;
+                             }
+                             findFirstMatch();
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(2), *res_ref.deref());
+        assert_eq!(Value::Integer(2), res.get_value());
     }
 
     #[test]
     fn test_for_with_nested_if() {
         let source_code = r#"
-            function countEvenOdds(limit: int): int {
-                even_count: int = 0;
-                odd_count: int = 0;
-                for (i:int = 0; i < limit; i = i + 1) {
-                    if (i % 2 == 0) {
-                        even_count = even_count + 1;
-                    } else {
-                        odd_count = odd_count + 1;
-                    }
-                }
-                return even_count * 10 + odd_count;
-            }
-            countEvenOdds(5);
-        "#;
+                             function countEvenOdds(limit: int): int {
+                                 even_count: int = 0;
+                                 odd_count: int = 0;
+                                 for (i:int = 0; i < limit; i = i + 1) {
+                                     if (i % 2 == 0) {
+                                         even_count = even_count + 1;
+                                     } else {
+                                         odd_count = odd_count + 1;
+                                     }
+                                 }
+                                 return even_count * 10 + odd_count;
+                             }
+                             countEvenOdds(5);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(30 + 2), *res_ref.deref());
+        assert_eq!(Value::Integer(30 + 2), res.get_value());
     }
 
     #[test]
     fn test_for_inside_if() {
         let source_code = r#"
-            function conditionalLoop(cond: bool): int {
-                sum: int = 0;
-                if (cond) {
-                    for (i:int = 1; i <= 3; i = i + 1) {
-                        sum = sum + i;
-                    }
-                } else {
-                    sum = -1;
-                }
-                return sum;
-            }
-            conditionalLoop(true);
-        "#;
+                             function conditionalLoop(cond: bool): int {
+                                 sum: int = 0;
+                                 if (cond) {
+                                     for (i:int = 1; i <= 3; i = i + 1) {
+                                         sum = sum + i;
+                                     }
+                                 } else {
+                                     sum = -1;
+                                 }
+                                 return sum;
+                             }
+                             conditionalLoop(true);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(6), *res_ref.deref());
+        assert_eq!(Value::Integer(6), res.get_value());
     }
 
     #[test]
     fn test_nested_for_with_early_return_in_if() {
         let source_code = r#"
-            function complexLoop(): int {
-                for (i:int = 0; i < 4; i = i + 1) {
-                    for (j:int = 0; j < 4; j = j + 1) {
-                        if (i * j == 6) {
-                            return i * 10 + j;
-                        }
-                    }
-                }
-                return -1;
-            }
-            complexLoop();
-        "#;
+                             function complexLoop(): int {
+                                 for (i:int = 0; i < 4; i = i + 1) {
+                                     for (j:int = 0; j < 4; j = j + 1) {
+                                         if (i * j == 6) {
+                                             return i * 10 + j;
+                                         }
+                                     }
+                                 }
+                                 return -1;
+                             }
+                             complexLoop();
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(23), *res_ref.deref()); // i=2, j=3 gives 6
+        assert_eq!(Value::Integer(23), res.get_value()); // i=2, j=3 gives 6
     }
 
     #[test]
     fn test_for_loop_with_if_break_condition() {
         let source_code = r#"
-            function sumUntilLimit(limit: int): int {
-                sum: int = 0;
-                for (i:int = 1; i < 10; i = i + 1) {
-                    if (sum + i > limit) {
-                        return sum;
-                    }
-                    sum = sum + i;
-                }
-                return sum;
-            }
-            sumUntilLimit(10);
-        "#;
+                             function sumUntilLimit(limit: int): int {
+                                 sum: int = 0;
+                                 for (i:int = 1; i < 10; i = i + 1) {
+                                     if (sum + i > limit) {
+                                         return sum;
+                                     }
+                                     sum = sum + i;
+                                 }
+                                 return sum;
+                             }
+                             sumUntilLimit(10);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(10), *res_ref.deref());
+        assert_eq!(Value::Integer(10), res.get_value());
     }
 
     #[test]
     fn test_for_with_nested_for_and_if_with_else() {
         let source_code = r#"
-            function complexLoopWithElse(): int {
-                sum: int = 0;
-                for (i:int = 1; i <= 3; i = i + 1) {
-                    for (j:int = 1; j <= 3; j = j + 1) {
-                        if (i == j) {
-                            sum = sum + 10 * i;
-                        } else {
-                            sum = sum + j;
-                        }
-                    }
-                }
-                return sum;
-            }
-            complexLoopWithElse();
-        "#;
+                             function complexLoopWithElse(): int {
+                                 sum: int = 0;
+                                 for (i:int = 1; i <= 3; i = i + 1) {
+                                     for (j:int = 1; j <= 3; j = j + 1) {
+                                         if (i == j) {
+                                             sum = sum + 10 * i;
+                                         } else {
+                                             sum = sum + j;
+                                         }
+                                     }
+                                 }
+                                 return sum;
+                             }
+                             complexLoopWithElse();
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(72), *res_ref.deref());
+        assert_eq!(Value::Integer(72), res.get_value());
     }
 
     #[test]
     fn test_return_in_for_inside_if_with_fallback() {
         let source_code = r#"
-            function loopInsideIfWithFallback(cond: bool): int {
-                if (cond) {
-                    for (i:int = 1; i <= 5; i = i + 1) {
-                        if (i == 3) {
-                            return i * 10;
-                        }
-                    }
-                }
-                return -1;
-            }
-            loopInsideIfWithFallback(true);
-        "#;
+                             function loopInsideIfWithFallback(cond: bool): int {
+                                 if (cond) {
+                                     for (i:int = 1; i <= 5; i = i + 1) {
+                                         if (i == 3) {
+                                             return i * 10;
+                                         }
+                                     }
+                                 }
+                                 return -1;
+                             }
+                             loopInsideIfWithFallback(true);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(30), *res_ref.deref());
+        assert_eq!(Value::Integer(30), res.get_value());
     }
 
     #[test]
     fn test_for_with_multiple_if_conditions() {
         let source_code = r#"
-            function classifyNumbers(limit: int): int {
-                even_sum: int = 0;
-                odd_sum: int = 0;
-                for (i:int = 1; i <= limit; i = i + 1) {
-                    if (i % 2 == 0) {
-                        even_sum = even_sum + i;
-                    } else if (i % 3 == 0) {
-                        odd_sum = odd_sum + i * 2;
-                    } else {
-                        odd_sum = odd_sum + i;
-                    }
-                }
-                return even_sum * 100 + odd_sum;
-            }
-            classifyNumbers(6);
-        "#;
+                             function classifyNumbers(limit: int): int {
+                                 even_sum: int = 0;
+                                 odd_sum: int = 0;
+                                 for (i:int = 1; i <= limit; i = i + 1) {
+                                     if (i % 2 == 0) {
+                                         even_sum = even_sum + i;
+                                     } else if (i % 3 == 0) {
+                                         odd_sum = odd_sum + i * 2;
+                                     } else {
+                                         odd_sum = odd_sum + i;
+                                     }
+                                 }
+                                 return even_sum * 100 + odd_sum;
+                             }
+                             classifyNumbers(6);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        assert_eq!(Value::Integer(1212), *res_ref.deref());
+
+        assert_eq!(Value::Integer(1212), res.get_value());
     }
 
     #[test]
     fn test_resolve_access_struct_field() {
         let source_code = r#"
-        struct Point {
-            x: int;
-            y: int;
-        }
+                         struct Point {
+                             x: int;
+                             y: int;
+                         }
 
-        p: Point = Point { x: 10, y: 20 };
-        p.x;
-        "#;
+                         p: Point = Point { x: 10, y: 20 };
+                         p.x;
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(10), *res.borrow().deref());
+        assert_eq!(Value::Integer(10), res.get_value());
     }
 
     #[test]
     fn test_resolve_access_nested_struct() {
         let source_code = r#"
-        struct Inner {
-            value: int;
-        }
+                         struct Inner {
+                             value: int;
+                         }
 
-        struct Outer {
-            inner: Inner;
-        }
+                         struct Outer {
+                             inner: Inner;
+                         }
 
-        o: Outer = Outer { inner: Inner { value: 42 } };
-        o.inner.value;
-        "#;
+                         o: Outer = Outer { inner: Inner { value: 42 } };
+                         o.inner.value;
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(42), *res.borrow().deref());
+        assert_eq!(Value::Integer(42), res.get_value());
     }
 
     #[test]
     fn test_resolve_access_mixed() {
         let source_code = r#"
-        struct Point {
-            x: int;
-        }
+                         struct Point {
+                             x: int;
+                         }
 
-        arr: Point[2] = [Point { x: 10 }, Point { x: 20 }];
-        arr[1].x;
-        "#;
+                         arr: Point[2] = [Point { x: 10 }, Point { x: 20 }];
+                         arr[1].x;
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(20), *res.borrow().deref());
+        assert_eq!(Value::Integer(20), res.get_value());
     }
 
     #[test]
     fn test_2d_array_init_inline() {
         let source_code = r#"
-            arr: int[2][2] = [[1,2], [2,4]];
-            arr;
-            arr[1][1] = 5;
-            arr[1][1];
-        "#;
+                             arr: int[2][2] = [[1,2], [2,4]];
+                             arr;
+                             arr[1][1] = 5;
+                             arr[1][1];
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(5), *res.borrow().deref());
+        assert_eq!(Value::Integer(5), res.get_value());
     }
 
     #[test]
     fn test_3d_array_init_inline_modify_flatten() {
         let source_code = r#"
-            arr: int[3][2][1]= [[[1],[2]], [[3],[4]], [[5],[6]]];
-            for(i:int = 0; i < 3; i = i + 1) {
-                for(j:int = 0; j < 2; j = j + 1) {
-                    for(k:int = 0; k < 1; k = k + 1) {
-                        arr[i][j][k] = arr[i][j][k] + 10;
-                    }
-                }
-            }
-            n:int = 0;
-            res: int[6] = int[6]::new(0);
-            for(i:int = 0; i < 3; i = i + 1) {
-                for(j:int = 0; j < 2; j = j + 1) {
-                    for(k:int = 0; k < 1; k = k + 1) {
-                        res[n] = arr[i][j][k];
-                        n = n + 1;
-                    }
-                }
-            }
-            res;
-        "#;
+                             arr: int[3][2][1]= [[[1],[2]], [[3],[4]], [[5],[6]]];
+                             for(i:int = 0; i < 3; i = i + 1) {
+                                 for(j:int = 0; j < 2; j = j + 1) {
+                                     for(k:int = 0; k < 1; k = k + 1) {
+                                         arr[i][j][k] = arr[i][j][k] + 10;
+                                     }
+                                 }
+                             }
+                             n:int = 0;
+                             res: int[6] = int[6]::new(0);
+                             for(i:int = 0; i < 3; i = i + 1) {
+                                 for(j:int = 0; j < 2; j = j + 1) {
+                                     for(k:int = 0; k < 1; k = k + 1) {
+                                         res[n] = arr[i][j][k];
+                                         n = n + 1;
+                                     }
+                                 }
+                             }
+                             res;
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        let res_ref = res.borrow();
-        match res_ref.deref() {
+
+        match res.get_value() {
             Value::Array { arr, .. } => {
                 let mut n = 1;
                 for e in arr.iter() {
-                    let e_ref = e.borrow();
-                    if let Value::Integer(i) = e_ref.deref() {
-                        assert_eq!(n + 10, *i);
+                    let e_ref = e.get_value();
+                    if let Value::Integer(i) = e_ref {
+                        assert_eq!(n + 10, i);
                         n += 1;
                     } else {
                         panic!("expected integer");
@@ -2158,306 +2281,307 @@ mod tests {
     #[test]
     fn test_instance_self() {
         let source_code = r#"
-        struct Point {
-            x: int;
-            y: int;
+                         struct Point {
+                             x: int;
+                             y: int;
 
-            function set_x(self, x:int) {
-                self.x = x;
-            }
+                             function set_x(self, x:int) {
+                                 self.x = x;
+                             }
 
-            function get_x(self){
-                return self.x;
-            }
-        }
+                             function get_x(self){
+                                 return self.x;
+                             }
+                         }
 
-        p: Point = Point{x: 1, y: 2};
-        p.set_x(3);
-        p.get_x();
-        "#;
+                         p: Point = Point{x: 1, y: 2};
+                         sk_debug_stack();
+                         p.set_x(3);
+                         p.get_x();
+                         "#;
         let program = ast::parse(source_code);
         println!("{:#?}", program);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(3), *res.borrow().deref());
+        assert_eq!(Value::Integer(3), res.get_value());
     }
 
     #[test]
     fn test_set_field_from_function() {
         let source_code = r#"
-        struct Point {
-            x: int;
-            y: int;
+                         struct Point {
+                             x: int;
+                             y: int;
 
-            function set_x(self, x:int) {
-                self.x = x;
-            }
+                             function set_x(self, x:int) {
+                                 self.x = x;
+                             }
 
-            function get_x(self){
-                return self.x;
-            }
-        }
+                             function get_x(self){
+                                 return self.x;
+                             }
+                         }
 
-        struct Line {
-            start: Point;
-            end: Point;
+                         struct Line {
+                             start: Point;
+                             end: Point;
 
-            function get_start(self):Point {
-                return self.start;
-            }
-        }
+                             function get_start(self):Point {
+                                 return self.start;
+                             }
+                         }
 
-        line: Line = Line {start: Point { x: 0, y: 0 }, end: Point { x: 5, y: 5 }};
-        line.get_start().set_x(1);
-        line.get_start().get_x();
-        "#;
+                         line: Line = Line {start: Point { x: 0, y: 0 }, end: Point { x: 5, y: 5 }};
+                         line.get_start().set_x(1);
+                         line.get_start().get_x();
+                         "#;
 
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(1), *res.borrow().deref());
+        assert_eq!(Value::Integer(1), res.get_value());
     }
 
     #[test]
     fn test_nested_block_shadowing() {
         let source_code = r#"
-            function f(): int {
-                i: int = 1;
-                {
-                    i:int = 2;
-                    print(i);
-                }
-                return i;
-            }
-            f();
-        "#;
+                             function f(): int {
+                                 i: int = 1;
+                                 {
+                                     i:int = 2;
+                                     print(i);
+                                 }
+                                 return i;
+                             }
+                             f();
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(1), *res.borrow().deref());
+        assert_eq!(Value::Integer(1), res.get_value());
     }
 
     #[test]
     fn test_list() {
         let source_code = r#"
-            struct List {
-                size:int;
-                capacity:int;
+                             struct List {
+                                 size:int;
+                                 capacity:int;
 
-                function has_space(self):boolean {
-                    return self.size > self.capacity;
-                }
+                                 function has_space(self):boolean {
+                                     return self.size > self.capacity;
+                                 }
 
-                function grow(self) {
-                    if(self.size > self.capacity) {
-                        print("increase capacity");
-                        self.capacity = 4; //self.capacity * 2;
-                    }
-                }
+                                 function grow(self) {
+                                     if(self.size > self.capacity) {
+                                         print("increase capacity");
+                                         self.capacity = 4; //self.capacity * 2;
+                                     }
+                                 }
 
-            }
-            list:List = List{size: 3, capacity: 2};
-            list.grow();
-            list.capacity;
-        "#;
+                             }
+                             list:List = List{size: 3, capacity: 2};
+                             list.grow();
+                             list.capacity;
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(4), *res.borrow().deref());
+        assert_eq!(Value::Integer(4), res.get_value());
     }
 
     #[test]
     fn test_lambda_recursive() {
         let source_code = r#"
-        factorial: (int) -> int = function(n: int): int {
-            if (n == 0) {
-                return 1;
-            } else {
-                return n * factorial(n - 1);
-            }
-        }
-        factorial(3);
-        "#;
+                         factorial: (int) -> int = function(n: int): int {
+                             if (n == 0) {
+                                 return 1;
+                             } else {
+                                 return n * factorial(n - 1);
+                             }
+                         }
+                         factorial(3);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(6), *res.borrow().deref());
+        assert_eq!(Value::Integer(6), res.get_value());
     }
 
     #[test]
     fn test_lambda_pass_as_arg() {
         let source_code = r#"
-            function f(g: () -> int):int {
-                return g();
-            }
-            g: () -> int = function(): int {
-                return 1;
-            }
-            f(g);
-        "#;
+                             function f(g: () -> int):int {
+                                 return g();
+                             }
+                             g: () -> int = function(): int {
+                                 return 1;
+                             }
+                             f(g);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(1), *res.borrow().deref());
+        assert_eq!(Value::Integer(1), res.get_value());
     }
 
     #[test]
     fn test_anonymous_function() {
         let source_code = r#"
-        function f(g: () -> int): int {
-            return g();
-        }
+                         function f(g: () -> int): int {
+                             sk_debug_stack();
+                             return 47;
+                             //return g();
+                         }
 
-        f(function ():int {
-            return 47;
-        });
-        "#;
+                         f(function ():int {
+                             return 47;
+                         });
+                         "#;
 
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(47), *res.borrow().deref());
+        assert_eq!(Value::Integer(47), res.get_value());
     }
 
     #[test]
     fn test_anonymous_function_with_params() {
         let source_code = r#"
-        function f(g: (int) -> int): int {
-            return g(47);
-        }
+                         function f(g: (int) -> int): int {
+                             return g(47);
+                         }
 
-        f(function (i:int):int {
-            return i;
-        });
-        "#;
+                         f(function (i:int):int {
+                             return i;
+                         });
+                         "#;
 
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(47), *res.borrow().deref());
+        assert_eq!(Value::Integer(47), res.get_value());
     }
 
     #[test]
     fn test_function_return_function() {
         let source_code = r#"
-        function f(): (int) -> int {
-            return function (a:int): int {
-                return a;
-            };
-        }
+                         function f(): (int) -> int {
+                             return function (a:int): int {
+                                 return a;
+                             };
+                         }
 
-        f()(47);
-        "#;
+                         f()(47);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(47), *res.borrow().deref());
+        assert_eq!(Value::Integer(47), res.get_value());
     }
 
     #[test]
     fn test_closure() {
         let source_code = r#"
-        function f(): () -> int {
-            c: int = 0;
-            return function (): int {
-                c = c + 1;
-                return c;
-            };
-        }
+                         function f(): () -> int {
+                             c: int = 0;
+                             return function (): int {
+                                 c = c + 1;
+                                 return c;
+                             };
+                         }
 
-        counter: () -> int = f();
-        counter();
-        counter();
-        "#;
+                         counter: () -> int = f();
+                         counter();
+                         counter();
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(2), *res.borrow().deref());
+        assert_eq!(Value::Integer(2), res.get_value());
     }
 
     #[test]
     fn test_closure_capture_outer() {
         let source_code = r#"
-            count: int = 0;
-            task: () -> int = function(): int {
-                if(count == 3) {
-                    return 3;
-                }
-                count = count + 1;
-                return task();
-            }
-            task();
-        "#;
+                             count: int = 0;
+                             task: () -> int = function(): int {
+                                 if(count == 3) {
+                                     return 3;
+                                 }
+                                 count = count + 1;
+                                 return task();
+                             }
+                             task();
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(3), *res.borrow().deref());
+        assert_eq!(Value::Integer(3), res.get_value());
     }
 
     #[test]
     fn test_closure_outer() {
         let source_code = r#"
-        function f(times:int): () -> int {
-            count: int = 0;
-            g: () -> int = function(): int {
-                count = count + 1;
-                if (count == times) {
-                    return count;
-                } else {
-                    return g();
-                }
-            }
-            return g;
-        }
+                         function f(times:int): () -> int {
+                             count: int = 0;
+                             g: () -> int = function(): int {
+                                 count = count + 1;
+                                 if (count == times) {
+                                     return count;
+                                 } else {
+                                     return g();
+                                 }
+                             }
+                             return g;
+                         }
 
-         f(3)();
-        "#;
+                          f(3)();
+                         "#;
 
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(3), *res.borrow().deref());
+        assert_eq!(Value::Integer(3), res.get_value());
     }
 
     #[test]
     fn test_nested_closures() {
         let source_code = r#"
-        i: int = 0;
+                         i: int = 0;
 
-        a: () -> () -> int = function(): () -> int {
-            i = i + 1;
-            j: int = 0;
+                         a: () -> () -> int = function(): () -> int {
+                             i = i + 1;
+                             j: int = 0;
 
-            b: () -> () -> int = function(): () -> int {
-                i = i + 1;
-                j = j + 1;
-                k: int = 0;
+                             b: () -> () -> int = function(): () -> int {
+                                 i = i + 1;
+                                 j = j + 1;
+                                 k: int = 0;
 
-                c: () -> int = function(): int {
-                    i = i + 1;
-                    j = j + 1;
-                    k = k + 1;
-                    return i + j + k;
-                }
+                                 c: () -> int = function(): int {
+                                     i = i + 1;
+                                     j = j + 1;
+                                     k = k + 1;
+                                     return i + j + k;
+                                 }
 
-                return c;
-            }
+                                 return c;
+                             }
 
-            return b();
-        }
-        a()();
-        "#;
+                             return b();
+                         }
+                         a()();
+                         "#;
 
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(6), *res.borrow().deref());
+        assert_eq!(Value::Integer(6), res.get_value());
     }
 
     #[test]
     fn test_struct_lambda() {
         let source_code = r#"
-        struct Foo {
-            function f(self): (int) -> int {
-                return function(i:int): int {
-                    return i;
-                };
-            }
-        }
-        foo:Foo = Foo{};
-        foo.f()(1);
-        "#;
+                         struct Foo {
+                             function f(self): (int) -> int {
+                                 return function(i:int): int {
+                                     return i;
+                                 };
+                             }
+                         }
+                         foo:Foo = Foo{};
+                         foo.f()(1);
+                         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        assert_eq!(Value::Integer(1), *res.borrow().deref());
+        assert_eq!(Value::Integer(1), res.get_value());
     }
-
-         */
 }
