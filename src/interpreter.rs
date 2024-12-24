@@ -1,20 +1,17 @@
-use std::any::Any;
-use std::collections::{ LinkedList};
 use rustc_hash::FxHashMap;
+use std::any::Any;
+use std::collections::LinkedList;
 use sysinfo::{Pid, System};
 
 use crate::ast;
-use crate::interpreter::Value::{Array, StructInstance};
-use crate::parser::Rule::{base_type, for_expr};
+use crate::interpreter::Value::StructInstance;
 use ast::Literal;
 use ast::Node;
 use ast::Operator;
 use ast::Type;
 use std::cell::RefCell;
-use std::f32::consts::E;
 use std::fmt;
 use std::io::BufRead;
-use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -46,7 +43,7 @@ pub enum Value {
         function: FunctionDefinition,
         env: Rc<RefCell<Environment>>,
     },
-    Executed, // indicates that a branch has been executed
+    Executed, // indicates that a code path has been executed
     Void,
     Undefined,
 }
@@ -68,11 +65,9 @@ impl fmt::Debug for Value {
                 "StructInstance {{ name: {}, fields: {:?} }}",
                 name, fields
             ),
-            Value::Struct { name, fields } => write!(
-                f,
-                "Struct {{ name: {}, fields: {:?} }}",
-                name, fields
-            ),
+            Value::Struct { name, fields } => {
+                write!(f, "Struct {{ name: {}, fields: {:?} }}", name, fields)
+            }
             Value::Function {
                 name,
                 parameters,
@@ -84,15 +79,7 @@ impl fmt::Debug for Value {
                 name, parameters, return_type, body
             ),
             Value::Closure { function, env } => {
-                let env_ref = env.borrow();
-
-                write!(
-                    f,
-                    "Closure {{  captured_env_id: {:?}, parent_env_id: {:?} }}",
-                    //function,
-                    env_ref.id,
-                    env_ref.get_parent_id()
-                )
+                write!(f, "Closure {{{:?}}}", function)
             }
             Value::Executed => write!(f, "Executed"),
             Value::Void => write!(f, "Void"),
@@ -175,7 +162,7 @@ impl ValueRef {
         }
     }
 
-    fn map_opt<T, F>(&self, f: F) -> Option<T>
+    fn map_match<T, F>(&self, f: F) -> Option<T>
     where
         F: Fn(&Value) -> Option<T>,
     {
@@ -344,7 +331,7 @@ impl GlobalEnvironment {
     }
     fn to_struct_def(&self, value_ref: &ValueRef) -> &StructDefinition {
         value_ref
-            .map_opt(|v| match v {
+            .map_match(|v| match v {
                 Value::StructInstance { name, .. } => Some(self.structs.get(name).unwrap()),
                 _ => panic!("expected struct instance. given: {:?}", v),
             })
@@ -352,12 +339,122 @@ impl GlobalEnvironment {
     }
 }
 
+const SMALL_VAR_STORAGE_MAX_SIZE: usize = 10;
+
+#[derive(Debug, Clone, PartialEq)]
+enum VariableStorage {
+    Small(Vec<(String, ValueRef)>),
+    Large(FxHashMap<String, ValueRef>),
+}
+
+impl VariableStorage {
+    fn small() -> VariableStorage {
+        VariableStorage::Small(Vec::with_capacity(SMALL_VAR_STORAGE_MAX_SIZE))
+    }
+    fn large() -> VariableStorage {
+        VariableStorage::Large(FxHashMap::default())
+    }
+
+    fn get(&self, name: &str) -> Option<&ValueRef> {
+        match self {
+            VariableStorage::Small(vars) => {
+                for v in vars.iter() {
+                    if v.0 == name {
+                        return Some(&v.1);
+                    }
+                }
+                None
+            }
+            VariableStorage::Large(vars) => vars.get(name),
+        }
+    }
+    fn set_or_add(&mut self, name: &str, value: ValueRef) {
+        // println!("VariableStorage set {}={:?}", name, value);
+        match self {
+            VariableStorage::Small(vars) => {
+                for index in 0..vars.len() {
+                    if vars[index].0 == name {
+                        vars[index].1 = value;
+                        return;
+                    }
+                }
+                vars.push((name.to_string(), value));
+            }
+            VariableStorage::Large(vars) => {
+                vars.insert(name.to_string(), value);
+            }
+        }
+    }
+    fn exists(&self, name: &str) -> bool {
+        match self {
+            VariableStorage::Small(vars) => {
+                for v in vars.iter() {
+                    if v.0 == name {
+                        return true;
+                    }
+                }
+                false
+            }
+            VariableStorage::Large(vars) => vars.contains_key(name),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            VariableStorage::Small(vars) => vars.len(),
+            VariableStorage::Large(vars) => vars.len(),
+        }
+    }
+
+    fn is_small(&self) -> bool {
+        match self {
+            VariableStorage::Small(_) => true,
+            VariableStorage::Large(_) => false,
+        }
+    }
+}
+
+pub struct VariableStorageIter<'a> {
+    small_iter: Option<std::slice::Iter<'a, (String, ValueRef)>>,
+    large_iter: Option<std::collections::hash_map::Iter<'a, String, ValueRef>>,
+}
+
+impl<'a> Iterator for VariableStorageIter<'a> {
+    type Item = (&'a String, &'a ValueRef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(iter) = &mut self.small_iter {
+            if let Some((name, value)) = iter.next() {
+                return Some((name, value));
+            }
+        }
+        if let Some(iter) = &mut self.large_iter {
+            return iter.next();
+        }
+        None
+    }
+}
+
+impl VariableStorage {
+    fn iter(&self) -> VariableStorageIter {
+        match self {
+            VariableStorage::Small(vec) => VariableStorageIter {
+                small_iter: Some(vec.iter()),
+                large_iter: None,
+            },
+            VariableStorage::Large(map) => VariableStorageIter {
+                small_iter: None,
+                large_iter: Some(map.iter()),
+            },
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 struct Environment {
     id: String,
     parent: Option<Rc<RefCell<Environment>>>,
-    variables: FxHashMap<String, ValueRef>,
-    // closures: FxHashMap<String, Option<ValueRef>>,
+    variables: VariableStorage,
 }
 
 impl Environment {
@@ -365,9 +462,7 @@ impl Environment {
         Environment {
             id: "".to_string(), //uuid::Uuid::new_v4().to_string(), // uncomment for debugging
             parent: None,
-            variables: FxHashMap::default(),
-            // closures: FxHashMap::default(),
-
+            variables: VariableStorage::small(),
         }
     }
 
@@ -378,25 +473,13 @@ impl Environment {
         }
     }
 
-    fn has_variable(&self, name: &str) -> bool {
-        //println!("Environment::has_variable={}", name);
-        // todo optimize
-        if self.variables.contains_key(name) {
-            return true;
-        }
-        if let Some(parent) = &self.parent {
-            let parent_ref = parent.borrow();
-            let result = parent_ref.has_variable(name);
-            return result;
-        }
-        false
-    }
-
     fn get_var(&self, name: &str) -> Option<ValueRef> {
-        //println!("Environment::get_var={}", name);
-        if self.variables.contains_key(name) {
-            self.variables.get(name).cloned()
-        } else if let Some(parent) = &self.parent {
+        match self.variables.get(name) {
+            Some(v) => return Some(v.clone()),
+            None => {}
+        }
+
+        if let Some(parent) = &self.parent {
             let parent_ref = parent.borrow();
             parent_ref.get_var(name)
         } else {
@@ -404,161 +487,37 @@ impl Environment {
         }
     }
 
-    // fn get_closure(&mut self, name: &str) -> Option<ValueRef> {
-    //     // if self.closures.contains_key(name) {
-    //     //     return self.closures.get(name).unwrap().clone()
-    //     // }
-    //
-    //     let var_opt = self.get_var(name);
-    //     match var_opt {
-    //         Some(var) => {
-    //             if var.is_closure() {
-    //                 self.closures.insert(name.to_string(), Some(var.clone()));
-    //                 Some(var)
-    //             } else {
-    //                 self.closures.insert(name.to_string(), None);
-    //                 None
-    //             }
-    //         },
-    //         None => {
-    //             self.closures.insert(name.to_string(), None);
-    //             None
-    //         }
-    //     }
-    // }
-
-
-
-    fn assign_variable(&mut self, name: &str, value: ValueRef) {
-        //println!("Environment::assign_variable={}", name);
-        if self.variables.contains_key(name) {
-            self.variables.insert(name.to_string(), value);
-        } else if let Some(parent) = self.parent.clone() {
+    fn assign_variable(&mut self, name: &str, value: ValueRef) -> bool {
+        if self.variables.exists(name) {
+            // println!("assign_variable env id={} assign var {} = {:?}", self.id, name, value);
+            self.variables.set_or_add(name, value);
+            true
+        } else if let Some(parent) = &self.parent {
             let mut parent_ref = parent.borrow_mut();
-            parent_ref.assign_variable(name, value);
+            parent_ref.assign_variable(name, value)
+        } else {
+            false
         }
     }
 
     fn declare_variable(&mut self, name: &str, value: ValueRef) {
-        //println!("Environment::declare_variable={}", name);
-        self.variables.insert(name.to_string(), value);
-    }
-}
-
-/*
-enum ValueModifier {
-    StructInstanceModifier {
-        instance: ValueRef,
-        field: String,
-    },
-    ArrayModifier {
-        array: ValueRef,
-        coordinates: Vec<i64>,
-    },
-    ReadValueModifier {
-        value: ValueRef,
-    },
-    StackVariableModifier {
-        name: String,
-    },
-}
-
-impl ValueModifier {
-    fn set(&mut self, name: String, stack: &mut CallStack, new_value: ValueRef) {
-        match self {
-            ValueModifier::StructInstanceModifier { instance, field } => match instance {
-                ValueRef::Stack { ref mut value, .. } => {
-                    if let Value::StructInstance {
-                        name,
-                        ref mut fields,
-                    } = value
-                    {
-                        fields.insert(field.clone(), new_value);
-                        stack.assign_variable(
-                            name,
-                            ValueRef::stack(StructInstance {
-                                name: name.to_string(),
-                                fields: mem::take(fields),
-                            }),
-                        );
-                    } else {
-                        panic!("expected a struct instance");
+        // println!("declare_variable env id={} assign var {} = {:?}", self.id, name, value);
+        self.variables.set_or_add(name, value);
+        if self.variables.is_small() && self.variables.size() > SMALL_VAR_STORAGE_MAX_SIZE {
+            let mut variables = VariableStorage::large();
+            match &mut self.variables {
+                VariableStorage::Small(ref mut vars) => {
+                    while let Some(var) = vars.pop() {
+                        let name = var.0.to_string();
+                        variables.set_or_add(&name, var.1)
                     }
                 }
-                ValueRef::Heap { value, .. } => {
-                    let mut value_ref = value.borrow_mut();
-                    if let Value::StructInstance {
-                        name,
-                        ref mut fields,
-                    } = value_ref.deref_mut()
-                    {
-                        fields.insert(field.clone(), new_value);
-                    } else {
-                        panic!("expected a struct instance");
-                    }
-                }
-            },
-            ValueModifier::ArrayModifier { array, coordinates } => {
-                match array {
-                    ValueRef::Stack { ref mut value, .. } => {
-                        set_array_element(value, new_value, coordinates);
-                        stack.assign_variable(name.as_str(), ValueRef::stack(value.clone()));
-                        //panic!("cannot mutate array allocated on stack")
-                    }
-                    ValueRef::Heap { value, .. } => {
-                        let mut value_ref = value.borrow_mut();
-                        set_array_element(value_ref.deref_mut(), new_value, coordinates)
-                    }
-                }
+                _ => unreachable!(),
             }
-            ValueModifier::ReadValueModifier { value } => {
-                panic!("expected a read value modifier");
-            }
-            ValueModifier::StackVariableModifier { name } => {
-                stack.assign_variable(name.as_str(), new_value);
-            }
-        }
-    }
-    fn get(&self, stack: &CallStack) -> ValueRef {
-        match self {
-            ValueModifier::StructInstanceModifier { instance, field } => match instance {
-                ValueRef::Stack { .. } => {
-                    panic!("struct on stack")
-                }
-                ValueRef::Heap { value, .. } => {
-                    let mut value_ref = value.borrow_mut();
-                    if let Value::StructInstance {
-                        name,
-                        ref mut fields,
-                    } = value_ref.deref_mut()
-                    {
-                        fields.get(field).expect("Field not found").clone()
-                    } else {
-                        panic!("expected a struct instance");
-                    }
-                }
-            },
-
-            ValueModifier::ArrayModifier { array, coordinates } => match array {
-                ValueRef::Stack { ref value, .. } => get_array_element(value, coordinates).clone(),
-                ValueRef::Heap { ref value, .. } => {
-                    let value_ref = value.borrow();
-                    get_array_element(value_ref.deref(), coordinates).clone()
-                }
-            },
-            ValueModifier::ReadValueModifier { value } => value.clone(),
-            ValueModifier::StackVariableModifier { name } => {
-                stack
-                    .get_variable(name)
-                    //.expect(format!("Variable '{}' not found", self.name).as_str())
-                    .unwrap()
-                    .clone()
-            }
+            self.variables = variables;
         }
     }
 }
-
- */
 
 fn get_array_element(value: &Value, coordinates: &Vec<i64>) -> ValueRef {
     if let Value::Array {
@@ -619,10 +578,22 @@ impl Profiling {
         for (i, frame) in stack.frames.iter().enumerate() {
             println!("Frame {}: {}", i, frame.name);
             let env = frame.env.borrow();
-            println!("  Environment id: '{}', parent={}", &env.id, &env.get_parent_id());
-            for (var_name, var_value) in &env.variables {
-                // let var_value_ref = var_value.borrow();
-                println!("      Variable '{}' -> {:?}", var_name, var_value);
+            println!(
+                "  Environment id: '{}', parent={}",
+                &env.id,
+                &env.get_parent_id()
+            );
+            match &env.variables {
+                VariableStorage::Small(vars) => {
+                    for (var_name, var_value) in vars {
+                        println!("      Variable '{}' -> {:?}", var_name, var_value);
+                    }
+                }
+                VariableStorage::Large(vars) => {
+                    for (var_name, var_value) in vars {
+                        println!("      Variable '{}' -> {:?}", var_name, var_value);
+                    }
+                }
             }
 
             println!("----------------------------");
@@ -700,8 +671,8 @@ impl Profiling {
                 .env
                 .borrow()
                 .variables
-                .values()
-                .map(|val| Profiling::estimate_value_ref_size(val))
+                .iter()
+                .map(|val| Profiling::estimate_value_ref_size(val.1))
                 .sum();
             println!("    Memory Used: {} bytes", frame_mem);
         }
@@ -712,8 +683,7 @@ impl Profiling {
 pub struct CallFrame {
     name: String,
     env: Rc<RefCell<Environment>>,
-    closure_cache: FxHashMap<String, Option<ValueRef>>
-
+    closure_cache: Vec<(String, Option<ValueRef>)>,
 }
 
 impl CallFrame {
@@ -721,7 +691,7 @@ impl CallFrame {
         CallFrame {
             name: name.to_string(),
             env: Rc::new(RefCell::new(Environment::new())),
-            closure_cache: FxHashMap::default()
+            closure_cache: Vec::new(),
         }
     }
 
@@ -730,46 +700,37 @@ impl CallFrame {
         let mut env = self.env.borrow_mut();
         if let Some(old_parent) = &env.parent {
             let old_parent = old_parent.borrow();
-            assert_ne!(*old_parent.deref(), *parent.borrow().deref());
+            // assert_ne!(*old_parent.deref(), *parent.borrow().deref());
         }
         env.parent = Some(parent);
         drop(env)
     }
 
-
-    fn has_variable(&self, name: &str) -> bool {
-        //println!("CallFrame-{}::has_variable {}", self.name, name);
-        let env_ref = self.env.borrow();
-        env_ref.has_variable(name)
-    }
-
-    fn assign_variable(&mut self, name: &str, value: ValueRef) {
-        //println!("CallFrame-{}::has_variable {}", self.name, name);
+    fn assign_variable(&mut self, name: &str, value: ValueRef) -> bool {
+        // println!("CallFrame-{}::has_variable {}", self.name, name);
         let mut env_ref = self.env.borrow_mut();
-        env_ref.assign_variable(name, value);
-        drop(env_ref);
+        env_ref.assign_variable(name, value)
     }
 
     fn declare_variable(&mut self, name: &str, value: ValueRef) {
         // println!("CallFrame-{}::declare_variable {}", self.name, name);
-        let mut env_ref = self.env.borrow_mut();
-        env_ref.declare_variable(name, value);
-        drop(env_ref);
+        self.env.borrow_mut().declare_variable(name, value);
     }
 
     fn get_variable(&self, name: &str) -> Option<ValueRef> {
-        //println!("CallFrame-{}::get_variable {}", self.name, name);
         let env_ref = self.env.borrow();
-        let res = env_ref.get_var(name);
-        drop(env_ref);
-        res
+        let v = env_ref.get_var(name);
+        // println!("CallFrame-{}::get_variable {} = {:?}", self.name, name, v);
+        v
     }
 
     fn get_closure_mem(&mut self, name: &str) -> Option<ValueRef> {
-        match self.closure_cache.get(name) {
-            Some(value) => return value.clone(),
-            None => {}
+        for v in self.closure_cache.iter() {
+            if v.0 == name {
+                return v.1.clone();
+            }
         }
+
         let var_opt = self.env.borrow().get_var(name);
         let c = match var_opt {
             Some(var) => {
@@ -779,14 +740,10 @@ impl CallFrame {
                     None
                 }
             }
-            None => None
+            None => None,
         };
-        self.closure_cache.insert(name.to_string(), c.clone());
+        self.closure_cache.push((name.to_string(), c.clone()));
         c
-    }
-
-    fn add_closure(&mut self, name: &str, value: Option<ValueRef>) {
-        self.closure_cache.insert(name.to_string(), value);
     }
 }
 
@@ -797,7 +754,7 @@ pub struct CallStack {
 
 impl CallStack {
     pub fn new() -> Self {
-        CallStack { frames: Vec::with_capacity(100000) }
+        CallStack { frames: Vec::new() }
     }
 
     fn push(&mut self, frame: CallFrame) {
@@ -810,11 +767,7 @@ impl CallStack {
 
     /// create frame and sets its env.parent = current_frame.env
     fn create_frame(&self, name: String) -> CallFrame {
-        let mut frame = CallFrame {
-            name: name.to_string(),
-            env: Rc::new(RefCell::new(Environment::new())),
-            closure_cache: FxHashMap::default()
-        };
+        let mut frame = CallFrame::new(name.to_string());
         if let Some(curr) = self.frames.last() {
             frame.set_parent(curr.env.clone());
         }
@@ -828,8 +781,10 @@ impl CallStack {
     }
 
     fn get_closure(&mut self, name: &str) -> Option<ValueRef> {
-        if let Some(c) = self.current_frame().closure_cache.get(name) {
-            return c.clone();
+        for x in self.current_frame().closure_cache.iter() {
+            if x.0 == name {
+                return x.1.clone();
+            }
         }
 
         let mut c = None;
@@ -840,27 +795,25 @@ impl CallStack {
                 break;
             }
         }
-        self.current_frame_mut().closure_cache.insert(name.to_string(), c.clone());
+        self.current_frame_mut()
+            .closure_cache
+            .push((name.to_string(), c.clone()));
         c
     }
 
     fn get_variable(&self, name: &str) -> Option<ValueRef> {
         for frame in self.frames.iter().rev() {
-            if frame.has_variable(name) {
-                return frame.get_variable(name);
+            if let Some(v) = frame.get_variable(name) {
+                return Some(v);
             }
         }
         None
     }
 
-    fn assign_variable(&mut self, name: &str, value: ValueRef) -> bool {
-        for frame in self.frames.iter_mut().rev() {
-            if frame.has_variable(name) {
-                frame.assign_variable(name, value);
-                return true;
-            }
-        }
-        unreachable!("var {} doesn't exist", name);
+    fn assign_variable(&mut self, name: &str, value: ValueRef) {
+        // println!("assign_variable {}", name);
+        let ok = self.current_frame_mut().assign_variable(name, value);
+        assert_eq!(ok, true);
     }
 
     fn declare_variable(&mut self, name: &str, value: ValueRef) {
@@ -869,27 +822,19 @@ impl CallStack {
     }
 
     fn current_frame(&self) -> &CallFrame {
-        self.frames
-            .last()
-            .unwrap()
-            //.expect("call stack underflow: no active frames")
+        self.frames.last().unwrap()
+        //.expect("call stack underflow: no active frames")
     }
 
     fn current_frame_mut(&mut self) -> &mut CallFrame {
-        self.frames
-            .last_mut()
-            .unwrap()
-            //.expect("call stack underflow: no active frames")
+        self.frames.last_mut().unwrap()
+        //.expect("call stack underflow: no active frames")
     }
 }
 
 pub fn evaluate(node: &Node) -> ValueRef {
     let stack = Rc::new(RefCell::new(CallStack::new()));
     let ge = Rc::new(RefCell::new(GlobalEnvironment::new()));
-    // stack.borrow_mut().push(CallFrame {
-    //     name: "main".to_string(),
-    //     env: Rc::new(RefCell::new(Environment::new())),
-    // });
     stack.borrow_mut().create_frame_push("main".to_string());
     evaluate_node(node, &stack, &ge)
 }
@@ -1029,11 +974,9 @@ fn resolve_member_access(
             Node::FunctionCall {
                 name, arguments, ..
             } => {
-                // println!("resolve member access: function call name={}", name);
                 let global_environment_ref = global_environment.borrow();
                 let struct_def = global_environment_ref.to_struct_def(&current_value);
                 let fun_def = struct_def.functions.get(name).unwrap();
-                // println!("func def={:?}", fun_def);
                 assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
 
                 stack
@@ -1070,7 +1013,7 @@ fn resolve_array_access(
             .iter()
             .map(|n| {
                 evaluate_node(n, stack, global_environment)
-                    .map_opt(|v| match v {
+                    .map_match(|v| match v {
                         Value::Integer(dim) => Some(*dim),
                         _ => panic!("expected integer index for array access"),
                     })
@@ -1090,17 +1033,6 @@ fn resolve_array_access(
     }
 }
 
-// fn resolve_variable_access(
-//     // stack: &'a mut CallStack,
-//     node: &Node,
-// ) -> ValueModifier {
-//     if let Node::Identifier(name) = node {
-//         ValueModifier::StackVariableModifier { name: name.clone() }
-//     } else {
-//         panic!("expected identifier, found {:?}", node)
-//     }
-// }
-
 fn resolve_access(
     stack: &Rc<RefCell<CallStack>>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
@@ -1115,7 +1047,7 @@ fn resolve_access(
     for i in 0..n {
         let access_node = &access_nodes[i];
         let to_set = if i == n - 1 {
-            // last node, we can set
+            // last node, we can modify it
             new_value.clone()
         } else {
             None
@@ -1134,16 +1066,13 @@ fn resolve_access(
             Node::ArrayAccess { .. } => {
                 resolve_array_access(stack, global_environment, res, access_node, to_set)
             }
-            Node::Identifier(name) => {
-                // println!("resolve_access, name={}, node={:?}", name, access_node);
-                match to_set {
-                    None => stack.borrow().get_variable(name).unwrap(),
-                    Some(v) => {
-                        stack.borrow_mut().assign_variable(name, v.clone());
-                        ValueRef::stack(Value::Undefined)
-                    }
+            Node::Identifier(name) => match to_set {
+                None => stack.borrow().get_variable(name).unwrap().clone(),
+                Some(v) => {
+                    stack.borrow_mut().assign_variable(name, v.clone());
+                    ValueRef::stack(Value::Undefined)
                 }
-            }
+            },
             _ => panic!("unexpected access node: {:?}", access_node),
         };
     }
@@ -1159,17 +1088,16 @@ fn evaluate_function(
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> ValueRef {
     let mut parameters = &parameters[0..];
-    if parameters.len()>0 && parameters[0].sk_type == Type::SkSelf {
+    if parameters.len() > 0 && parameters[0].sk_type == Type::SkSelf {
         parameters = &parameters[1..];
     }
     let n = parameters.len();
     for i in 0..n {
         let param = &parameters[i];
-            let v = evaluate_node(&arguments[i], stack, global_environment);
-            stack.borrow_mut().declare_variable(&param.name, v);
+        let v = evaluate_node(&arguments[i], stack, global_environment);
+        stack.borrow_mut().declare_variable(&param.name, v);
     }
 
-    // Profiling::sk_debug_stack(stack.borrow().deref());
     let mut result = ValueRef::stack(Value::Undefined);
     for n in body {
         let v = evaluate_node(&n, stack, global_environment);
@@ -1179,7 +1107,6 @@ fn evaluate_function(
         }
     }
     result
-    // ValueRef::stack(Value::Undefined)
 }
 
 fn create_function_definition(n: &Node) -> FunctionDefinition {
@@ -1380,7 +1307,7 @@ pub fn evaluate_node(
                 global_environment
                     .borrow_mut()
                     .functions
-                    .insert(name.clone(),  func_def.clone());
+                    .insert(name.clone(), func_def.clone());
             }
 
             if *lambda {
@@ -1389,18 +1316,20 @@ pub fn evaluate_node(
                     env: stack.borrow().current_frame().env.clone(),
                 })
             } else {
-                ValueRef::stack((Value::Function {
-                    name: name.to_string(),
-                    parameters: parameters
-                        .iter()
-                        .map(|p| Parameter {
-                            name: p.0.clone(),
-                            sk_type: p.1.clone(),
-                        })
-                        .collect(),
-                    return_type: return_type.clone(),
-                    body: Vec::new(),
-                }))
+                ValueRef::stack(
+                    (Value::Function {
+                        name: name.to_string(),
+                        parameters: parameters
+                            .iter()
+                            .map(|p| Parameter {
+                                name: p.0.clone(),
+                                sk_type: p.1.clone(),
+                            })
+                            .collect(),
+                        return_type: return_type.clone(),
+                        body: Vec::new(),
+                    }),
+                )
             }
         }
         Node::Literal(Literal::Integer(x)) => ValueRef::stack(Value::Integer(*x)),
@@ -1414,9 +1343,7 @@ pub fn evaluate_node(
             };
 
             stack.borrow_mut().declare_variable(name, value);
-            stack.borrow().get_variable(name).unwrap()
-
-            // ValueRef::stack(Value::Variable(name.to_string()))
+            ValueRef::stack(Value::Variable(name.to_string()))
         }
         Node::ArrayInit { elements } => {
             let mut dimensions: Vec<i64> = vec![];
@@ -1484,13 +1411,8 @@ pub fn evaluate_node(
             )
         }
         Node::Assignment { var, value, .. } => match var.as_ref() {
-            // get name from var
             Node::Access { nodes } => {
                 let new_value = evaluate_node(value.as_ref(), stack, global_environment);
-                // let root = match nodes.first().unwrap() {
-                //     Node::Identifier(name) => name.to_string(),
-                //     _ => "".to_string(),
-                // };
                 resolve_access(
                     stack,
                     global_environment,
@@ -1498,30 +1420,19 @@ pub fn evaluate_node(
                     nodes,
                     Some(&new_value),
                 )
-
-                // let mut stack_ref = stack.borrow_mut();
-                // modifier.set(root.to_string(), &mut stack_ref, new_value);
-                // modifier.get(stack_ref.deref())
             }
             _ => panic!("expected access to assignment node"),
         },
-        Node::Access { nodes } => {
-            let root = match nodes.first().unwrap() {
-                Node::Identifier(name) => name.to_string(),
-                _ => "".to_string(),
-            };
-            resolve_access(
-                stack,
-                global_environment,
-                ValueRef::stack(Value::Undefined),
-                nodes,
-                None,
-            )
-        }
+        Node::Access { nodes } => resolve_access(
+            stack,
+            global_environment,
+            ValueRef::stack(Value::Undefined),
+            nodes,
+            None,
+        ),
         Node::FunctionCall { .. } => evaluate_function_call(node, stack, global_environment, None),
         Node::Block { statements } => {
             stack.borrow_mut().create_frame_push("".to_string());
-            // drop(stack_ref);
             let mut res = ValueRef::stack(Value::Undefined);
             for statement in statements {
                 res = evaluate_node(statement, stack, global_environment);
@@ -1531,7 +1442,6 @@ pub fn evaluate_node(
             }
 
             stack.borrow_mut().frames.pop();
-            // mem::drop(stack_ref);
             res
         }
         Node::StaticFunctionCall {
@@ -1549,7 +1459,7 @@ pub fn evaluate_node(
                 for dim_node in dimensions {
                     let dim_val = evaluate_node(dim_node, stack, global_environment);
                     let i = dim_val
-                        .map_opt(|v| match v {
+                        .map_match(|v| match v {
                             Value::Integer(i) => Some(*i),
                             _ => None,
                         })
@@ -1577,13 +1487,11 @@ pub fn evaluate_node(
             let value_ref = evaluate_node(condition, stack, global_environment);
 
             let ok = value_ref
-                .map_opt(|v| match v {
+                .map_match(|v| match v {
                     Value::Boolean(ok) => Some(*ok),
                     _ => None,
                 })
                 .unwrap();
-
-            //.expect(format!("non boolean expression: {:?}", condition.as_ref()).as_str());
             if ok {
                 for n in body {
                     let val = evaluate_node(n, stack, global_environment);
@@ -1637,7 +1545,7 @@ pub fn evaluate_node(
                 .as_ref()
                 .map(|cond| {
                     let res = evaluate_node(cond.as_ref(), stack, global_environment);
-                    res.map_opt(|v| match v {
+                    res.map_match(|v| match v {
                         Value::Boolean(ok) => Some(*ok),
                         _ => None,
                     })
@@ -1668,15 +1576,11 @@ pub fn evaluate_node(
                 _ => panic!("unsupported unary operator: {:?}", operator),
             }
         }
-        /*
-
-        */
         Node::BinaryOp {
             left,
             operator,
             right,
         } => {
-            // Evaluate the left and right nodes
             let left_val = evaluate_node(left, stack, global_environment);
             let right_val = evaluate_node(right, stack, global_environment);
             let mut res = Value::Undefined;
@@ -1696,46 +1600,40 @@ pub fn evaluate_node(
                             Operator::GreaterThan => Value::Boolean(l > r),
                             _ => panic!("Unsupported operator"),
                         },
+                        (Value::Boolean(a), Value::Boolean(b)) => match operator {
+                            Operator::And => Value::Boolean(*a && *b),
+                            Operator::Or => Value::Boolean(*a || *b),
+                            _ => panic!("Unsupported operator"),
+                        },
+                        (Value::String(s1), Value::String(s2)) => match operator {
+                            Operator::Add => Value::String(format!("{}{}", s1, s2)),
+                            _ => panic!("Unsupported operator for string concatenation"),
+                        },
+                        (Value::String(s), Value::Integer(i)) => match operator {
+                            Operator::Add => Value::String(format!("{}{}", s, i)),
+                            _ => panic!("Unsupported operator for string concatenation"),
+                        },
+                        (Value::Integer(i), Value::String(s)) => match operator {
+                            Operator::Add => Value::String(format!("{}{}", i, s)),
+                            _ => panic!("Unsupported operator for string concatenation"),
+                        },
+                        (Value::Boolean(i), Value::String(s)) => match operator {
+                            Operator::Add => Value::String(format!("{}{}", i, s)),
+                            _ => panic!("Unsupported operator for string concatenation"),
+                        },
+                        (Value::String(s), Value::Boolean(i)) => match operator {
+                            Operator::Add => Value::String(format!("{}{}", s, i)),
+                            _ => panic!("Unsupported operator for string concatenation"),
+                        },
+                        _ => panic!(
+                            "Unsupported binary operation={:?}, left={:?}, right={:?}",
+                            operator, left_val, right_val
+                        ),
                         _ => panic!("Unsupported operator"),
                     }
                 })
             });
             ValueRef::stack(res)
-
-            // Match and compute based on the inner values
-
-            /*
-            (Value::Boolean(a), Value::Boolean(b)) => match operator {
-                Operator::And => ValueRef::stack(Value::Boolean(a && b)),
-                Operator::Or => ValueRef::stack(Value::Boolean(a || b)),
-                _ => panic!("Unsupported operator"),
-            },
-            (Value::String(s1), Value::String(s2)) => match operator {
-                Operator::Add => ValueRef::stack(Value::String(format!("{}{}", s1, s2))),
-                _ => panic!("Unsupported operator for string concatenation"),
-            },
-            (Value::String(s), Value::Integer(i)) => match operator {
-                Operator::Add => ValueRef::stack(Value::String(format!("{}{}", s, i))),
-                _ => panic!("Unsupported operator for string concatenation"),
-            },
-            (Value::Integer(i), Value::String(s)) => match operator {
-                Operator::Add => ValueRef::stack(Value::String(format!("{}{}", i, s))),
-                _ => panic!("Unsupported operator for string concatenation"),
-            },
-            (Value::Boolean(i), Value::String(s)) => match operator {
-                Operator::Add => ValueRef::stack(Value::String(format!("{}{}", i, s))),
-                _ => panic!("Unsupported operator for string concatenation"),
-            },
-            (Value::String(s), Value::Boolean(i)) => match operator {
-                Operator::Add => ValueRef::stack(Value::String(format!("{}{}", s, i))),
-                _ => panic!("Unsupported operator for string concatenation"),
-            },
-            _ => panic!(
-                "Unsupported binary operation={:?}, left={:?}, right={:?}",
-                operator, left_val, right_val
-            ),
-
-             */
         }
 
         Node::Print(value) => {
@@ -1743,19 +1641,11 @@ pub fn evaluate_node(
             println!("{:?}", val);
             ValueRef::stack(Value::Void)
         }
-        Node::Identifier(name) => {
-            let v = stack.borrow().get_variable(name).unwrap();
-            //.expect(format!("variable '{}' does not exist", name).as_str());
-            // let res = Rc::clone(&v);
-            // drop(stack_ref);
-            v.clone()
-        }
+        Node::Identifier(name) => stack.borrow().get_variable(name).unwrap().clone(),
         Node::EOI => ValueRef::stack(Value::Void),
         Node::Return(body_opt) => {
             if let Some(body) = body_opt {
-                let val = evaluate_node(body, stack, global_environment);
-                // Rc::new(RefCell::new(Return(Rc::clone(&val))))
-                val.to_returned()
+                evaluate_node(body, stack, global_environment).to_returned()
             } else {
                 ValueRef::stack(Value::Void)
             }
@@ -1763,11 +1653,6 @@ pub fn evaluate_node(
         _ => panic!("Unexpected node type: {:?}", node),
     }
 }
-//
-// use crate::interpreter::Value::{Closure, StructInstance, Undefined, Void};
-// use pest::Stack;
-// use std::fmt::Octal;
-// use std::ops::{Deref, DerefMut};
 
 #[cfg(test)]
 mod tests {
@@ -1797,65 +1682,64 @@ mod tests {
         assert_eq!(Value::Integer(2), res.get_value());
     }
 
-    // #[test]
-    // fn test_struct_int_field_modify() {
-    //     let source_code = r#"
-    //         struct Point {
-    //             x:int;
-    //             y:int;
-    //         }
-    //         p: Point = Point{x:1, y:2};
-    //         p.x = 3;
-    //         p.y = 4;
-    //         p;
-    //     "#;
-    //     let program = ast::parse(source_code);
-    //     let res = evaluate(&program);
-    //     println!("{:?}", res);
-    //     assert_eq!(
-    //         Value::StructInstance {
-    //             name: "Point".to_string(),
-    //             fields: FxHashMap::from([
-    //                 ("x".to_string(), ValueRef::stack(Value::Integer(3))),
-    //                 ("y".to_string(), ValueRef::stack(Value::Integer(4)))
-    //             ])
-    //         },
-    //         res.get_value()
-    //     )
-    // }
+    #[test]
+    fn test_struct_int_field_modify() {
+        let source_code = r#"
+            struct Point {
+                x:int;
+                y:int;
+            }
+            p: Point = Point{x:1, y:2};
+            p.x = 3;
+            p.y = 4;
+            p;
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        println!("{:?}", res);
+        assert_eq!(
+            Value::StructInstance {
+                name: "Point".to_string(),
+                fields: FxHashMap::from_iter([
+                    ("x".to_string(), ValueRef::stack(Value::Integer(3))),
+                    ("y".to_string(), ValueRef::stack(Value::Integer(4)))
+                ])
+            },
+            res.get_value()
+        )
+    }
 
-    // #[test]
-    // fn test_struct_arr_field_modify() {
-    //     let source_code = r#"
-    //             struct Point {
-    //                 c: int[2];
-    //             }
-    //             p: Point = Point{ c: int[2]::new(0) };
-    //             p.c[0] = 1;
-    //             p.c[1] = 2;
-    //             p;
-    //         "#;
-    //     let program = ast::parse(source_code);
-    //     let res = evaluate(&program);
-    //     // println!("{:?}", res);
-    //     assert_eq!(
-    //         StructInstance {
-    //             name: "Point".to_string(),
-    //             fields: FxHashMap::from([(
-    //                 "c".to_string(),
-    //                 ValueRef::heap(Value::Array {
-    //                     arr: [
-    //                         ValueRef::stack(Value::Integer(1)),
-    //                         ValueRef::stack(Value::Integer(2))
-    //                     ]
-    //                     .to_vec(),
-    //                     dimensions: [2].to_vec()
-    //                 })
-    //             )])
-    //         },
-    //         res.get_value()
-    //     )
-    // }
+    #[test]
+    fn test_struct_arr_field_modify() {
+        let source_code = r#"
+                struct Point {
+                    c: int[2];
+                }
+                p: Point = Point{ c: int[2]::new(0) };
+                p.c[0] = 1;
+                p.c[1] = 2;
+                p;
+            "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(
+            StructInstance {
+                name: "Point".to_string(),
+                fields: FxHashMap::from_iter([(
+                    "c".to_string(),
+                    ValueRef::heap(Value::Array {
+                        arr: [
+                            ValueRef::stack(Value::Integer(1)),
+                            ValueRef::stack(Value::Integer(2))
+                        ]
+                        .to_vec(),
+                        dimensions: [2].to_vec()
+                    })
+                )])
+            },
+            res.get_value()
+        )
+    }
 
     #[test]
     fn test_if() {
@@ -1946,7 +1830,9 @@ mod tests {
         let source_code = r#"
                              arr: int[2][2] = int[2][2]::new(0);
                              for (i:int = 0; i < 2; i = i + 1) {
+                             sk_debug_stack();
                                  for (j:int = 0; j < 2; j = j + 1) {
+                                    sk_debug_stack();
                                      arr[i][j] = i + j;
                                  }
                              }
@@ -2093,7 +1979,7 @@ mod tests {
                          "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        println!("{:?}", res);
+        assert_eq!(Value::Boolean(false), res.get_value());
     }
 
     #[test]
@@ -2281,7 +2167,6 @@ mod tests {
                          "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-
         assert_eq!(Value::Integer(1212), res.get_value());
     }
 
@@ -2529,20 +2414,6 @@ mod tests {
                          "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        println!("{:?}", res);
-        // match res {
-        //     ValueRef::Stack {value, ..} =>
-        //     match value {
-        //         Value::Closure {function,env} => println!("Closure: {:?}", function, ),
-        //         _ => panic!("expected closure"),
-        //     }
-        //     ValueRef::Heap { value, ..} => {
-        //         let v_ref = value.borrow();
-        //
-        //         println!("Heap: {:?}", v_ref);
-        //     }
-        // }
-        // println!("{:?}", res);
         assert_eq!(Value::Integer(1), res.get_value());
     }
 
@@ -2604,23 +2475,18 @@ mod tests {
         let source_code = r#"
                          function f(): () -> int {
                              counter: int = 0;
-                             sk_debug_stack();
                              return function (): int {
-                                 sk_debug_stack();
                                  counter = counter + 1;
                                  return counter;
                              };
                          }
-                         sk_debug_stack();
                          counter: () -> int = f();
-                         sk_debug_stack();
                          counter();
-                         // sk_debug_stack();
-                         //counter();
+                         counter();
                          "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);
-        // assert_eq!(Value::Integer(2), res.get_value());
+        assert_eq!(Value::Integer(2), res.get_value());
     }
 
     #[test]
