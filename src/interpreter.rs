@@ -1200,20 +1200,18 @@ fn evaluate_function_call(
         Node::FunctionCall {
             name, arguments, ..
         } => {
-            // println!("eval func call={}", name);
-            // if name == "sk_debug_mem" {
-            //     Profiling::sk_debug_mem_sysinfo();
-            //     Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
-            //     return ValueRef::stack(Value::Undefined);
-            // }
-            //
+            if name == "sk_debug_mem" {
+                Profiling::sk_debug_mem_sysinfo();
+                Profiling::sk_debug_mem_programmatic(stack.borrow().deref());
+                return ValueRef::stack(Value::Undefined);
+            }
+
             if name == "sk_debug_stack" {
                 Profiling::sk_debug_stack(stack.borrow().deref());
                 return ValueRef::stack(Value::Undefined);
             }
 
             let value_opt = { stack.borrow_mut().get_closure(name) };
-            // stack.borrow_mut().current_frame_mut().add_closure(name.to_string(), value_opt.clone());
             let res = if let Some(value) = value_opt {
                 Some(evaluate_closure(
                     &value,
