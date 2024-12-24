@@ -1309,7 +1309,7 @@ pub fn evaluate_node(
             }
 
             if *lambda {
-                ValueRef::stack(Value::Closure {
+                ValueRef::heap(Value::Closure {
                     function: func_def,
                     env: stack.borrow().current_frame().env.clone(),
                 })
