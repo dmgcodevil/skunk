@@ -6,8 +6,12 @@ BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" } // Block-style comments
 // Tokens
 IDENTIFIER =     @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 INTEGER         = @{ ASCII_DIGIT+ }
+LONG_LITERAL    = @{ ASCII_DIGIT+ ~ ("L" | "l") }
+DOUBLE_LITERAL  = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+FLOAT_LITERAL   = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ ("F" | "f") }
 STRING_LITERAL  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
 BOOLEAN_LITERAL = { "true" | "false" }
+CHAR_LITERAL    = @{ "'" ~ ( "\\n" | "\\r" | "\\t" | "\\0" | "\\'" | "\\\\" | (!"'" ~ ANY) ) ~ "'" }
 
 // Operations
 operation = _{ add | subtract | multiply | divide | modulus | power | and | or | lte | lt | gte | gt | eq | not_eq }
@@ -32,7 +36,7 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
 
 // Types
 size = { INTEGER }
-base_type       = { "int" | "string" | "boolean" | IDENTIFIER }
+base_type       = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | IDENTIFIER }
 array_dim       = { "[" ~ expression ~ "]" }
 array_type      = { base_type ~ array_dim+ } // todo in array type dims cannot be expressions, they should be literals: integers
 slice_type      = { base_type ~ ("[" ~ "]")+ }
@@ -110,11 +114,10 @@ unary_op        = { (unary_plus | unary_minus | negate) ~ primary }
 expression      = { primary ~ (operation ~ primary)* }
 primary         = { lambda_expr | unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
 
-literal         = { INTEGER | STRING_LITERAL | BOOLEAN_LITERAL }
+literal         = { FLOAT_LITERAL | DOUBLE_LITERAL | LONG_LITERAL | INTEGER | STRING_LITERAL | BOOLEAN_LITERAL | CHAR_LITERAL }
 arg_list        = { (expression ~ ("," ~ expression)*)? }
 func_call       = { IDENTIFIER ~ ("(" ~ arg_list ~ ")")+ }
 
 member_access = { "." ~ (func_call | IDENTIFIER) }
 chained_access = {  ( func_call | IDENTIFIER ) ~ (array_access | member_access)+ }
 access = { chained_access | IDENTIFIER }
-

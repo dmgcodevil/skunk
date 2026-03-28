@@ -7,7 +7,13 @@ use std::process::Command;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LlvmType {
+    I8,
+    I16,
+    I32,
     I64,
+    F32,
+    F64,
+    Char16,
     I1,
     PtrI8,
     Void,
@@ -16,7 +22,13 @@ enum LlvmType {
 impl LlvmType {
     fn ir(&self) -> &'static str {
         match self {
+            LlvmType::I8 => "i8",
+            LlvmType::I16 => "i16",
+            LlvmType::I32 => "i32",
             LlvmType::I64 => "i64",
+            LlvmType::F32 => "float",
+            LlvmType::F64 => "double",
+            LlvmType::Char16 => "i16",
             LlvmType::I1 => "i1",
             LlvmType::PtrI8 => "ptr",
             LlvmType::Void => "void",
@@ -74,14 +86,49 @@ fn escape_llvm_bytes(bytes: &[u8]) -> String {
 
 fn llvm_type(sk_type: &Type) -> Result<LlvmType, String> {
     match sk_type {
-        Type::Int => Ok(LlvmType::I64),
+        Type::Byte => Ok(LlvmType::I8),
+        Type::Short => Ok(LlvmType::I16),
+        Type::Int => Ok(LlvmType::I32),
+        Type::Long => Ok(LlvmType::I64),
+        Type::Float => Ok(LlvmType::F32),
+        Type::Double => Ok(LlvmType::F64),
         Type::Boolean => Ok(LlvmType::I1),
         Type::String => Ok(LlvmType::PtrI8),
+        Type::Char => Ok(LlvmType::Char16),
         Type::Void => Ok(LlvmType::Void),
         other => Err(format!(
             "LLVM backend does not support type `{}` yet",
             ast::type_to_string(other)
         )),
+    }
+}
+
+fn is_integer_llvm_type(llvm_type: &LlvmType) -> bool {
+    matches!(
+        llvm_type,
+        LlvmType::I8 | LlvmType::I16 | LlvmType::I32 | LlvmType::I64 | LlvmType::Char16
+    )
+}
+
+fn is_numeric_llvm_type(llvm_type: &LlvmType) -> bool {
+    is_integer_llvm_type(llvm_type) || matches!(llvm_type, LlvmType::F32 | LlvmType::F64)
+}
+
+fn promoted_numeric_llvm_type(left: &LlvmType, right: &LlvmType) -> Option<LlvmType> {
+    match (left, right) {
+        (LlvmType::F64, _) | (_, LlvmType::F64) => Some(LlvmType::F64),
+        (LlvmType::F32, _) | (_, LlvmType::F32) => Some(LlvmType::F32),
+        (LlvmType::I64, _) | (_, LlvmType::I64) => Some(LlvmType::I64),
+        (LlvmType::I8, LlvmType::I8)
+        | (LlvmType::I8, LlvmType::I16)
+        | (LlvmType::I16, LlvmType::I8)
+        | (LlvmType::I16, LlvmType::I16)
+        | (LlvmType::I8, LlvmType::I32)
+        | (LlvmType::I32, LlvmType::I8)
+        | (LlvmType::I16, LlvmType::I32)
+        | (LlvmType::I32, LlvmType::I16)
+        | (LlvmType::I32, LlvmType::I32) => Some(LlvmType::I32),
+        _ => None,
     }
 }
 
@@ -177,7 +224,7 @@ impl<'a> FunctionCompiler<'a> {
                     Some(value) => self.compile_expr(value)?,
                     None => self.default_value(&llvm_type),
                 };
-                self.ensure_type(&init, &llvm_type, "variable declaration")?;
+                let init = self.coerce_expr(init, &llvm_type, "variable declaration")?;
                 self.emit_store(&ptr, &init);
                 self.declare_local(name.clone(), ptr, llvm_type);
                 Ok(())
@@ -185,7 +232,7 @@ impl<'a> FunctionCompiler<'a> {
             Node::Assignment { var, value, .. } => {
                 let expr = self.compile_expr(value)?;
                 let local = self.resolve_local_from_access(var)?;
-                self.ensure_type(&expr, &local.llvm_type, "assignment")?;
+                let expr = self.coerce_expr(expr, &local.llvm_type, "assignment")?;
                 self.emit_store(&local.ptr, &expr);
                 Ok(())
             }
@@ -211,7 +258,8 @@ impl<'a> FunctionCompiler<'a> {
                 match value {
                     Some(value) => {
                         let expr = self.compile_expr(value)?;
-                        self.ensure_type(&expr, &self.return_type, "return")?;
+                        let return_type = self.return_type.clone();
+                        let expr = self.coerce_expr(expr, &return_type, "return")?;
                         self.emit_line(format!("ret {} {}", expr.llvm_type.ir(), expr.value));
                     }
                     None => {
@@ -252,7 +300,9 @@ impl<'a> FunctionCompiler<'a> {
         let else_entry = self.next_label("if_else");
         let then_label = self.next_label("if_then");
         let cond = self.compile_expr(condition)?;
-        self.ensure_type(&cond, &LlvmType::I1, "if condition")?;
+        if cond.llvm_type != LlvmType::I1 {
+            return Err("if condition must be boolean in LLVM backend".to_string());
+        }
         self.emit_line(format!(
             "br i1 {}, label %{}, label %{}",
             cond.value, then_label, else_entry
@@ -312,7 +362,9 @@ impl<'a> FunctionCompiler<'a> {
         self.emit_label(&cond_label);
         if let Some(condition) = condition {
             let cond = self.compile_expr(condition)?;
-            self.ensure_type(&cond, &LlvmType::I1, "for condition")?;
+            if cond.llvm_type != LlvmType::I1 {
+                return Err("for condition must be boolean in LLVM backend".to_string());
+            }
             self.emit_line(format!(
                 "br i1 {}, label %{}, label %{}",
                 cond.value, body_label, end_label
@@ -343,7 +395,17 @@ impl<'a> FunctionCompiler<'a> {
 
     fn compile_print(&mut self, value: &Node) -> Result<(), String> {
         let expr = self.compile_expr(value)?;
-        match expr.llvm_type {
+        match expr.llvm_type.clone() {
+            LlvmType::I8 | LlvmType::I16 | LlvmType::I32 => {
+                let fmt = self.global_c_string("fmt_i32", "%d\n");
+                let fmt_ptr = self.string_ptr(&fmt);
+                let printed = self.coerce_expr(expr, &LlvmType::I32, "print")?;
+                self.emit_line(format!(
+                    "call i32 (ptr, ...) @printf(ptr {}, i32 {})",
+                    fmt_ptr, printed.value
+                ));
+                Ok(())
+            }
             LlvmType::I64 => {
                 let fmt = self.global_c_string("fmt_int", "%lld\n");
                 let fmt_ptr = self.string_ptr(&fmt);
@@ -371,6 +433,35 @@ impl<'a> FunctionCompiler<'a> {
                 ));
                 Ok(())
             }
+            LlvmType::F32 => {
+                let fmt = self.global_c_string("fmt_float", "%f\n");
+                let fmt_ptr = self.string_ptr(&fmt);
+                let printed = self.coerce_expr(expr, &LlvmType::F64, "print")?;
+                self.emit_line(format!(
+                    "call i32 (ptr, ...) @printf(ptr {}, double {})",
+                    fmt_ptr, printed.value
+                ));
+                Ok(())
+            }
+            LlvmType::F64 => {
+                let fmt = self.global_c_string("fmt_float", "%f\n");
+                let fmt_ptr = self.string_ptr(&fmt);
+                self.emit_line(format!(
+                    "call i32 (ptr, ...) @printf(ptr {}, double {})",
+                    fmt_ptr, expr.value
+                ));
+                Ok(())
+            }
+            LlvmType::Char16 => {
+                let fmt = self.global_c_string("fmt_char", "%lc\n");
+                let fmt_ptr = self.string_ptr(&fmt);
+                let printed = self.coerce_expr(expr, &LlvmType::I32, "print")?;
+                self.emit_line(format!(
+                    "call i32 (ptr, ...) @printf(ptr {}, i32 {})",
+                    fmt_ptr, printed.value
+                ));
+                Ok(())
+            }
             LlvmType::PtrI8 => {
                 let fmt = self.global_c_string("fmt_str", "%s\n");
                 let fmt_ptr = self.string_ptr(&fmt);
@@ -387,12 +478,28 @@ impl<'a> FunctionCompiler<'a> {
     fn compile_expr(&mut self, node: &Node) -> Result<ExprValue, String> {
         match node {
             Node::Literal(Literal::Integer(value)) => Ok(ExprValue {
+                llvm_type: LlvmType::I32,
+                value: value.to_string(),
+            }),
+            Node::Literal(Literal::Long(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::I64,
+                value: value.to_string(),
+            }),
+            Node::Literal(Literal::Float(value)) => Ok(ExprValue {
+                llvm_type: LlvmType::F32,
+                value: value.to_string(),
+            }),
+            Node::Literal(Literal::Double(value)) => Ok(ExprValue {
+                llvm_type: LlvmType::F64,
                 value: value.to_string(),
             }),
             Node::Literal(Literal::Boolean(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::I1,
                 value: if *value { "1" } else { "0" }.to_string(),
+            }),
+            Node::Literal(Literal::Char(value)) => Ok(ExprValue {
+                llvm_type: LlvmType::Char16,
+                value: (*value as u32 as u16).to_string(),
             }),
             Node::Literal(Literal::StringLiteral(value)) => {
                 let global = self.global_c_string("str", value);
@@ -419,16 +526,43 @@ impl<'a> FunctionCompiler<'a> {
                 match operator {
                     UnaryOperator::Plus => Ok(value),
                     UnaryOperator::Minus => {
-                        self.ensure_type(&value, &LlvmType::I64, "unary `-`")?;
+                        if !is_numeric_llvm_type(&value.llvm_type) || value.llvm_type == LlvmType::Char16 {
+                            return Err("unary `-` requires a numeric operand".to_string());
+                        }
+                        let target = if matches!(value.llvm_type, LlvmType::I8 | LlvmType::I16) {
+                            LlvmType::I32
+                        } else {
+                            value.llvm_type.clone()
+                        };
+                        let value = self.coerce_expr(value, &target, "unary `-`")?;
                         let temp = self.next_temp();
-                        self.emit_line(format!("{} = sub i64 0, {}", temp, value.value));
+                        let op = if matches!(target, LlvmType::F32 | LlvmType::F64) {
+                            "fsub"
+                        } else {
+                            "sub"
+                        };
+                        let zero = if matches!(target, LlvmType::F32 | LlvmType::F64) {
+                            if target == LlvmType::F32 { "0.0" } else { "0.0" }
+                        } else {
+                            "0"
+                        };
+                        self.emit_line(format!(
+                            "{} = {} {} {}, {}",
+                            temp,
+                            op,
+                            target.ir(),
+                            zero,
+                            value.value
+                        ));
                         Ok(ExprValue {
-                            llvm_type: LlvmType::I64,
+                            llvm_type: target,
                             value: temp,
                         })
                     }
                     UnaryOperator::Negate => {
-                        self.ensure_type(&value, &LlvmType::I1, "unary `!`")?;
+                        if value.llvm_type != LlvmType::I1 {
+                            return Err("unary `!` requires a boolean operand".to_string());
+                        }
                         let temp = self.next_temp();
                         self.emit_line(format!("{} = xor i1 {}, true", temp, value.value));
                         Ok(ExprValue {
@@ -484,7 +618,7 @@ impl<'a> FunctionCompiler<'a> {
         let mut arg_parts = Vec::with_capacity(provided_args.len());
         for (arg_node, expected_type) in provided_args.iter().zip(signature.parameters.iter()) {
             let arg = self.compile_expr(arg_node)?;
-            self.ensure_type(&arg, expected_type, "function argument")?;
+            let arg = self.coerce_expr(arg, expected_type, "function argument")?;
             arg_parts.push(format!("{} {}", arg.llvm_type.ir(), arg.value));
         }
 
@@ -523,55 +657,102 @@ impl<'a> FunctionCompiler<'a> {
         let left = self.compile_expr(left)?;
         let right = self.compile_expr(right)?;
 
-        match (&left.llvm_type, operator, &right.llvm_type) {
-            (LlvmType::I64, Operator::Add, LlvmType::I64)
-            | (LlvmType::I64, Operator::Subtract, LlvmType::I64)
-            | (LlvmType::I64, Operator::Multiply, LlvmType::I64)
-            | (LlvmType::I64, Operator::Divide, LlvmType::I64)
-            | (LlvmType::I64, Operator::Mod, LlvmType::I64) => {
+        if let Some(promoted) = promoted_numeric_llvm_type(&left.llvm_type, &right.llvm_type) {
+            let left = self.coerce_expr(left, &promoted, "binary operand")?;
+            let right = self.coerce_expr(right, &promoted, "binary operand")?;
+            let temp = self.next_temp();
+
+            if matches!(promoted, LlvmType::F32 | LlvmType::F64) {
                 let op = match operator {
-                    Operator::Add => "add",
-                    Operator::Subtract => "sub",
-                    Operator::Multiply => "mul",
-                    Operator::Divide => "sdiv",
-                    Operator::Mod => "srem",
-                    _ => unreachable!(),
+                    Operator::Add => "fadd",
+                    Operator::Subtract => "fsub",
+                    Operator::Multiply => "fmul",
+                    Operator::Divide => "fdiv",
+                    Operator::Equals => "fcmp oeq",
+                    Operator::NotEquals => "fcmp one",
+                    Operator::LessThan => "fcmp olt",
+                    Operator::LessThanOrEqual => "fcmp ole",
+                    Operator::GreaterThan => "fcmp ogt",
+                    Operator::GreaterThanOrEqual => "fcmp oge",
+                    _ => {
+                        return Err(format!(
+                            "LLVM backend does not support `{:?}` for floating-point values",
+                            operator
+                        ))
+                    }
                 };
-                let temp = self.next_temp();
                 self.emit_line(format!(
-                    "{} = {} i64 {}, {}",
-                    temp, op, left.value, right.value
+                    "{} = {} {} {}, {}",
+                    temp,
+                    op,
+                    promoted.ir(),
+                    left.value,
+                    right.value
                 ));
-                Ok(ExprValue {
-                    llvm_type: LlvmType::I64,
+                return Ok(ExprValue {
+                    llvm_type: if matches!(
+                        operator,
+                        Operator::Equals
+                            | Operator::NotEquals
+                            | Operator::LessThan
+                            | Operator::LessThanOrEqual
+                            | Operator::GreaterThan
+                            | Operator::GreaterThanOrEqual
+                    ) {
+                        LlvmType::I1
+                    } else {
+                        promoted
+                    },
                     value: temp,
-                })
+                });
             }
-            (LlvmType::I64, Operator::Equals, LlvmType::I64)
-            | (LlvmType::I64, Operator::NotEquals, LlvmType::I64)
-            | (LlvmType::I64, Operator::LessThan, LlvmType::I64)
-            | (LlvmType::I64, Operator::LessThanOrEqual, LlvmType::I64)
-            | (LlvmType::I64, Operator::GreaterThan, LlvmType::I64)
-            | (LlvmType::I64, Operator::GreaterThanOrEqual, LlvmType::I64) => {
-                let pred = match operator {
-                    Operator::Equals => "eq",
-                    Operator::NotEquals => "ne",
-                    Operator::LessThan => "slt",
-                    Operator::LessThanOrEqual => "sle",
-                    Operator::GreaterThan => "sgt",
-                    Operator::GreaterThanOrEqual => "sge",
-                    _ => unreachable!(),
-                };
-                let temp = self.next_temp();
-                self.emit_line(format!(
-                    "{} = icmp {} i64 {}, {}",
-                    temp, pred, left.value, right.value
-                ));
-                Ok(ExprValue {
-                    llvm_type: LlvmType::I1,
-                    value: temp,
-                })
-            }
+
+            let op = match operator {
+                Operator::Add => "add",
+                Operator::Subtract => "sub",
+                Operator::Multiply => "mul",
+                Operator::Divide => "sdiv",
+                Operator::Mod => "srem",
+                Operator::Equals => "icmp eq",
+                Operator::NotEquals => "icmp ne",
+                Operator::LessThan => "icmp slt",
+                Operator::LessThanOrEqual => "icmp sle",
+                Operator::GreaterThan => "icmp sgt",
+                Operator::GreaterThanOrEqual => "icmp sge",
+                _ => {
+                    return Err(format!(
+                        "LLVM backend does not support `{:?}` for numeric values",
+                        operator
+                    ))
+                }
+            };
+            self.emit_line(format!(
+                "{} = {} {} {}, {}",
+                temp,
+                op,
+                promoted.ir(),
+                left.value,
+                right.value
+            ));
+            return Ok(ExprValue {
+                llvm_type: if matches!(
+                    operator,
+                    Operator::Equals
+                        | Operator::NotEquals
+                        | Operator::LessThan
+                        | Operator::LessThanOrEqual
+                        | Operator::GreaterThan
+                        | Operator::GreaterThanOrEqual
+                ) {
+                    LlvmType::I1
+                } else {
+                    promoted
+                },
+                value: temp,
+            });
+        }
+
+        match (&left.llvm_type, operator, &right.llvm_type) {
             (LlvmType::I1, Operator::And, LlvmType::I1)
             | (LlvmType::I1, Operator::Or, LlvmType::I1) => {
                 let op = match operator {
@@ -599,6 +780,31 @@ impl<'a> FunctionCompiler<'a> {
                 let temp = self.next_temp();
                 self.emit_line(format!(
                     "{} = icmp {} i1 {}, {}",
+                    temp, pred, left.value, right.value
+                ));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::I1,
+                    value: temp,
+                })
+            }
+            (LlvmType::Char16, Operator::Equals, LlvmType::Char16)
+            | (LlvmType::Char16, Operator::NotEquals, LlvmType::Char16)
+            | (LlvmType::Char16, Operator::LessThan, LlvmType::Char16)
+            | (LlvmType::Char16, Operator::LessThanOrEqual, LlvmType::Char16)
+            | (LlvmType::Char16, Operator::GreaterThan, LlvmType::Char16)
+            | (LlvmType::Char16, Operator::GreaterThanOrEqual, LlvmType::Char16) => {
+                let pred = match operator {
+                    Operator::Equals => "eq",
+                    Operator::NotEquals => "ne",
+                    Operator::LessThan => "ult",
+                    Operator::LessThanOrEqual => "ule",
+                    Operator::GreaterThan => "ugt",
+                    Operator::GreaterThanOrEqual => "uge",
+                    _ => unreachable!(),
+                };
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = icmp {} i16 {}, {}",
                     temp, pred, left.value, right.value
                 ));
                 Ok(ExprValue {
@@ -668,8 +874,32 @@ impl<'a> FunctionCompiler<'a> {
 
     fn default_value(&self, llvm_type: &LlvmType) -> ExprValue {
         match llvm_type {
+            LlvmType::I8 => ExprValue {
+                llvm_type: LlvmType::I8,
+                value: "0".to_string(),
+            },
+            LlvmType::I16 => ExprValue {
+                llvm_type: LlvmType::I16,
+                value: "0".to_string(),
+            },
+            LlvmType::I32 => ExprValue {
+                llvm_type: LlvmType::I32,
+                value: "0".to_string(),
+            },
             LlvmType::I64 => ExprValue {
                 llvm_type: LlvmType::I64,
+                value: "0".to_string(),
+            },
+            LlvmType::F32 => ExprValue {
+                llvm_type: LlvmType::F32,
+                value: "0.0".to_string(),
+            },
+            LlvmType::F64 => ExprValue {
+                llvm_type: LlvmType::F64,
+                value: "0.0".to_string(),
+            },
+            LlvmType::Char16 => ExprValue {
+                llvm_type: LlvmType::Char16,
                 value: "0".to_string(),
             },
             LlvmType::I1 => ExprValue {
@@ -687,22 +917,55 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
-    fn ensure_type(
-        &self,
-        value: &ExprValue,
+    fn coerce_expr(
+        &mut self,
+        value: ExprValue,
         expected: &LlvmType,
         context: &str,
-    ) -> Result<(), String> {
+    ) -> Result<ExprValue, String> {
         if &value.llvm_type == expected {
-            Ok(())
-        } else {
-            Err(format!(
-                "type mismatch in {}: expected `{}`, got `{}`",
-                context,
-                expected.ir(),
-                value.llvm_type.ir()
-            ))
+            return Ok(value);
         }
+
+        let temp = self.next_temp();
+        let line = match (&value.llvm_type, expected) {
+            (LlvmType::I8, LlvmType::I16) => format!("{} = sext i8 {} to i16", temp, value.value),
+            (LlvmType::I8, LlvmType::I32) => format!("{} = sext i8 {} to i32", temp, value.value),
+            (LlvmType::I8, LlvmType::I64) => format!("{} = sext i8 {} to i64", temp, value.value),
+            (LlvmType::I16, LlvmType::I32) => format!("{} = sext i16 {} to i32", temp, value.value),
+            (LlvmType::I16, LlvmType::I64) => format!("{} = sext i16 {} to i64", temp, value.value),
+            (LlvmType::I32, LlvmType::I64) => format!("{} = sext i32 {} to i64", temp, value.value),
+            (LlvmType::Char16, LlvmType::I32) => format!("{} = zext i16 {} to i32", temp, value.value),
+            (LlvmType::I32, LlvmType::I16) => format!("{} = trunc i32 {} to i16", temp, value.value),
+            (LlvmType::I32, LlvmType::I8) => format!("{} = trunc i32 {} to i8", temp, value.value),
+            (LlvmType::I64, LlvmType::I32) => format!("{} = trunc i64 {} to i32", temp, value.value),
+            (LlvmType::I64, LlvmType::I16) => format!("{} = trunc i64 {} to i16", temp, value.value),
+            (LlvmType::I64, LlvmType::I8) => format!("{} = trunc i64 {} to i8", temp, value.value),
+            (LlvmType::I8, LlvmType::F32) => format!("{} = sitofp i8 {} to float", temp, value.value),
+            (LlvmType::I8, LlvmType::F64) => format!("{} = sitofp i8 {} to double", temp, value.value),
+            (LlvmType::I16, LlvmType::F32) => format!("{} = sitofp i16 {} to float", temp, value.value),
+            (LlvmType::I16, LlvmType::F64) => format!("{} = sitofp i16 {} to double", temp, value.value),
+            (LlvmType::I32, LlvmType::F32) => format!("{} = sitofp i32 {} to float", temp, value.value),
+            (LlvmType::I32, LlvmType::F64) => format!("{} = sitofp i32 {} to double", temp, value.value),
+            (LlvmType::I64, LlvmType::F32) => format!("{} = sitofp i64 {} to float", temp, value.value),
+            (LlvmType::I64, LlvmType::F64) => format!("{} = sitofp i64 {} to double", temp, value.value),
+            (LlvmType::F32, LlvmType::F64) => format!("{} = fpext float {} to double", temp, value.value),
+            (LlvmType::F64, LlvmType::F32) => format!("{} = fptrunc double {} to float", temp, value.value),
+            _ => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
+        };
+
+        self.emit_line(line);
+        Ok(ExprValue {
+            llvm_type: expected.clone(),
+            value: temp,
+        })
     }
 
     fn global_c_string(&mut self, prefix: &str, value: &str) -> String {
@@ -783,8 +1046,10 @@ impl<'a> FunctionCompiler<'a> {
 
     fn align_of(llvm_type: &LlvmType) -> usize {
         match llvm_type {
-            LlvmType::I64 | LlvmType::PtrI8 => 8,
-            LlvmType::I1 => 1,
+            LlvmType::I8 | LlvmType::I1 => 1,
+            LlvmType::I16 | LlvmType::Char16 => 2,
+            LlvmType::I32 | LlvmType::F32 => 4,
+            LlvmType::I64 | LlvmType::F64 | LlvmType::PtrI8 => 8,
             LlvmType::Void => 1,
         }
     }
@@ -940,7 +1205,23 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     }
 
     let c_main_body = match main_signature.return_type {
+        LlvmType::I8 => {
+            "  %result = call i8 @skunk_main()\n  %exit_code = sext i8 %result to i32\n  ret i32 %exit_code\n"
+        }
+        LlvmType::I16 => {
+            "  %result = call i16 @skunk_main()\n  %exit_code = sext i16 %result to i32\n  ret i32 %exit_code\n"
+        }
+        LlvmType::I32 => "  %result = call i32 @skunk_main()\n  ret i32 %result\n",
         LlvmType::I64 => "  %result = call i64 @skunk_main()\n  %exit_code = trunc i64 %result to i32\n  ret i32 %exit_code\n",
+        LlvmType::F32 => {
+            "  %result = call float @skunk_main()\n  %exit_code = fptosi float %result to i32\n  ret i32 %exit_code\n"
+        }
+        LlvmType::F64 => {
+            "  %result = call double @skunk_main()\n  %exit_code = fptosi double %result to i32\n  ret i32 %exit_code\n"
+        }
+        LlvmType::Char16 => {
+            "  %result = call i16 @skunk_main()\n  %exit_code = zext i16 %result to i32\n  ret i32 %exit_code\n"
+        }
         LlvmType::I1 => "  %result = call i1 @skunk_main()\n  %exit_code = zext i1 %result to i32\n  ret i32 %exit_code\n",
         LlvmType::Void => "  call void @skunk_main()\n  ret i32 0\n",
         LlvmType::PtrI8 => {
@@ -987,7 +1268,7 @@ mod tests {
         );
 
         let ir = compile_to_llvm_ir(&program).unwrap();
-        assert!(ir.contains("define i64 @skunk_add(i64 %arg0, i64 %arg1)"));
+        assert!(ir.contains("define i32 @skunk_add(i32 %arg0, i32 %arg1)"));
         assert!(ir.contains("define void @skunk_main()"));
         assert!(ir.contains("call i32 (ptr, ...) @printf"));
     }
@@ -1006,5 +1287,27 @@ mod tests {
 
         let err = compile_to_llvm_ir(&program).unwrap_err();
         assert!(err.contains("does not support structs yet"));
+    }
+
+    #[test]
+    fn compiles_new_primitives_to_ir() {
+        let program = ast::parse(
+            r#"
+            function main(): double {
+                b: byte = 10;
+                s: short = 20;
+                l: long = 30L;
+                f: float = 1.5f;
+                c: char = 'A';
+                print(c);
+                return l + f;
+            }
+            "#,
+        );
+
+        let ir = compile_to_llvm_ir(&program).unwrap();
+        assert!(ir.contains("define double @skunk_main()"));
+        assert!(ir.contains("sitofp i64"));
+        assert!(ir.contains("fadd float"));
     }
 }

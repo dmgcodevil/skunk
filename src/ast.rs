@@ -104,8 +104,12 @@ pub enum Node {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Literal {
     Integer(i64),
+    Long(i64),
+    Float(f32),
+    Double(f64),
     StringLiteral(String),
     Boolean(bool),
+    Char(char),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -137,9 +141,15 @@ pub enum UnaryOperator {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Type {
     Void,
+    Byte,
+    Short,
     Int,
+    Long,
+    Float,
+    Double,
     String,
     Boolean,
+    Char,
     Array {
         elem_type: Box<Type>,
         dimensions: Vec<Node>,
@@ -351,11 +361,27 @@ impl PestImpl {
             Rule::STRING_LITERAL => {
                 Node::Literal(Literal::StringLiteral(literal.as_str().to_string()))
             }
+            Rule::LONG_LITERAL => Node::Literal(Literal::Long(
+                literal.as_str()[..literal.as_str().len() - 1]
+                    .parse::<i64>()
+                    .unwrap(),
+            )),
+            Rule::FLOAT_LITERAL => Node::Literal(Literal::Float(
+                literal.as_str()[..literal.as_str().len() - 1]
+                    .parse::<f32>()
+                    .unwrap(),
+            )),
+            Rule::DOUBLE_LITERAL => {
+                Node::Literal(Literal::Double(literal.as_str().parse::<f64>().unwrap()))
+            }
             Rule::INTEGER => {
                 Node::Literal(Literal::Integer(literal.as_str().parse::<i64>().unwrap()))
             }
             Rule::BOOLEAN_LITERAL => {
                 Node::Literal(Literal::Boolean(literal.as_str().parse::<bool>().unwrap()))
+            }
+            Rule::CHAR_LITERAL => {
+                Node::Literal(Literal::Char(parse_char_literal(literal.as_str()).unwrap()))
             }
             _ => panic!("unsupported rule {:?}", literal),
         }
@@ -844,9 +870,15 @@ pub fn parse(input: &str) -> Node {
 pub fn type_to_string(t: &Type) -> String {
     match t {
         Type::Void => "void".to_string(),
+        Type::Byte => "byte".to_string(),
+        Type::Short => "short".to_string(),
         Type::Int => "int".to_string(),
+        Type::Long => "long".to_string(),
+        Type::Float => "float".to_string(),
+        Type::Double => "double".to_string(),
         Type::String => "string".to_string(),
         Type::Boolean => "boolean".to_string(),
+        Type::Char => "char".to_string(),
         Type::Custom(v) => v.to_string(),
         _ => panic!("unsupported type {:?}", t),
     }
@@ -866,12 +898,117 @@ pub fn extract_struct_field(field: &Node) -> (String, Type) {
 
 fn create_base_type_from_str(s: &str) -> Type {
     match s {
+        "byte" => Type::Byte,
+        "short" => Type::Short,
         "int" => Type::Int,
+        "long" => Type::Long,
+        "float" => Type::Float,
+        "double" => Type::Double,
         "string" => Type::String,
-        "boolean" => Type::Boolean,
+        "boolean" | "bool" => Type::Boolean,
+        "char" => Type::Char,
         "void" => Type::Void,
         _ => Type::Custom(s.to_string()),
     }
+}
+
+pub fn is_integral_type(t: &Type) -> bool {
+    matches!(t, Type::Byte | Type::Short | Type::Int | Type::Long)
+}
+
+pub fn is_floating_type(t: &Type) -> bool {
+    matches!(t, Type::Float | Type::Double)
+}
+
+pub fn is_numeric_type(t: &Type) -> bool {
+    is_integral_type(t) || is_floating_type(t)
+}
+
+pub fn is_scalar_type(t: &Type) -> bool {
+    is_numeric_type(t) || matches!(t, Type::Boolean | Type::Char | Type::String)
+}
+
+pub fn numeric_rank(t: &Type) -> Option<u8> {
+    match t {
+        Type::Byte => Some(0),
+        Type::Short => Some(1),
+        Type::Int => Some(2),
+        Type::Long => Some(3),
+        Type::Float => Some(4),
+        Type::Double => Some(5),
+        _ => None,
+    }
+}
+
+pub fn is_numeric_assignable(expected: &Type, actual: &Type) -> bool {
+    match (numeric_rank(expected), numeric_rank(actual)) {
+        (Some(expected_rank), Some(actual_rank)) => actual_rank <= expected_rank,
+        _ => false,
+    }
+}
+
+pub fn promoted_numeric_type(left: &Type, right: &Type) -> Option<Type> {
+    if !is_numeric_type(left) || !is_numeric_type(right) {
+        return None;
+    }
+
+    if matches!(left, Type::Double) || matches!(right, Type::Double) {
+        Some(Type::Double)
+    } else if matches!(left, Type::Float) || matches!(right, Type::Float) {
+        Some(Type::Float)
+    } else if matches!(left, Type::Long) || matches!(right, Type::Long) {
+        Some(Type::Long)
+    } else {
+        Some(Type::Int)
+    }
+}
+
+pub fn fits_integer_type(value: i64, target: &Type) -> bool {
+    match target {
+        Type::Byte => i8::try_from(value).is_ok(),
+        Type::Short => i16::try_from(value).is_ok(),
+        Type::Int => i32::try_from(value).is_ok(),
+        Type::Long => true,
+        _ => false,
+    }
+}
+
+fn parse_char_literal(literal: &str) -> Result<char, String> {
+    let inner = literal
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .ok_or_else(|| format!("invalid char literal `{}`", literal))?;
+
+    let ch = match inner {
+        "\\n" => '\n',
+        "\\r" => '\r',
+        "\\t" => '\t',
+        "\\0" => '\0',
+        "\\'" => '\'',
+        "\\\\" => '\\',
+        _ => {
+            let mut chars = inner.chars();
+            let ch = chars
+                .next()
+                .ok_or_else(|| format!("invalid char literal `{}`", literal))?;
+            if chars.next().is_some() {
+                return Err(format!(
+                    "char literal must contain exactly one character: `{}`",
+                    literal
+                ));
+            }
+            ch
+        }
+    };
+
+    if (ch as u32) > u16::MAX as u32 {
+        return Err(format!(
+            "char literal `{}` is outside the supported 16-bit range",
+            literal
+        ));
+    }
+
+    Ok(ch)
 }
 
 mod tests {
@@ -2871,6 +3008,70 @@ mod tests {
                             ]
                         ],
                         metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_new_builtin_type_literals() {
+        let source_code = r#"
+            b: byte = 1;
+            s: short = 2;
+            l: long = 3L;
+            f: float = 1.5f;
+            d: double = 2.5;
+            c: char = 'A';
+            ok: bool = true;
+        "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        name: "b".to_string(),
+                        var_type: Type::Byte,
+                        value: Some(Box::new(Node::Literal(Literal::Integer(1)))),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::VariableDeclaration {
+                        name: "s".to_string(),
+                        var_type: Type::Short,
+                        value: Some(Box::new(Node::Literal(Literal::Integer(2)))),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::VariableDeclaration {
+                        name: "l".to_string(),
+                        var_type: Type::Long,
+                        value: Some(Box::new(Node::Literal(Literal::Long(3)))),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::VariableDeclaration {
+                        name: "f".to_string(),
+                        var_type: Type::Float,
+                        value: Some(Box::new(Node::Literal(Literal::Float(1.5)))),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::VariableDeclaration {
+                        name: "d".to_string(),
+                        var_type: Type::Double,
+                        value: Some(Box::new(Node::Literal(Literal::Double(2.5)))),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::VariableDeclaration {
+                        name: "c".to_string(),
+                        var_type: Type::Char,
+                        value: Some(Box::new(Node::Literal(Literal::Char('A')))),
+                        metadata: Metadata::EMPTY,
+                    },
+                    Node::VariableDeclaration {
+                        name: "ok".to_string(),
+                        var_type: Type::Boolean,
+                        value: Some(Box::new(Node::Literal(Literal::Boolean(true)))),
+                        metadata: Metadata::EMPTY,
                     },
                     Node::EOI
                 ])

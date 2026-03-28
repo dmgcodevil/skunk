@@ -5,6 +5,7 @@ use sysinfo::{Pid, System};
 
 use crate::ast;
 use crate::interpreter::Value::StructInstance;
+use ast::{fits_integer_type, is_integral_type, promoted_numeric_type};
 use ast::Literal;
 use ast::Node;
 use ast::Operator;
@@ -17,9 +18,15 @@ use std::rc::Rc;
 
 #[derive(PartialEq, Clone)]
 pub enum Value {
-    Integer(i64),
+    Byte(i8),
+    Short(i16),
+    Integer(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
     String(String),
     Boolean(bool),
+    Char(char),
     Variable(String),
     Array {
         arr: Vec<ValueRef>,
@@ -51,9 +58,15 @@ pub enum Value {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Byte(val) => write!(f, "Byte({})", val),
+            Value::Short(val) => write!(f, "Short({})", val),
             Value::Integer(val) => write!(f, "Integer({})", val),
+            Value::Long(val) => write!(f, "Long({})", val),
+            Value::Float(val) => write!(f, "Float({})", val),
+            Value::Double(val) => write!(f, "Double({})", val),
             Value::String(val) => write!(f, "String(\"{}\")", val),
             Value::Boolean(val) => write!(f, "Boolean({})", val),
+            Value::Char(val) => write!(f, "Char({:?})", val),
             Value::Variable(name) => write!(f, "Variable(\"{}\")", name),
             Value::Array { arr, dimensions } => write!(
                 f,
@@ -238,14 +251,319 @@ impl ValueRef {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NumericValue {
+    Byte(i8),
+    Short(i16),
+    Integer(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+}
+
+impl NumericValue {
+    fn sk_type(&self) -> Type {
+        match self {
+            NumericValue::Byte(_) => Type::Byte,
+            NumericValue::Short(_) => Type::Short,
+            NumericValue::Integer(_) => Type::Int,
+            NumericValue::Long(_) => Type::Long,
+            NumericValue::Float(_) => Type::Float,
+            NumericValue::Double(_) => Type::Double,
+        }
+    }
+}
+
+fn value_to_type(value: &Value) -> Option<Type> {
+    match value {
+        Value::Byte(_) => Some(Type::Byte),
+        Value::Short(_) => Some(Type::Short),
+        Value::Integer(_) => Some(Type::Int),
+        Value::Long(_) => Some(Type::Long),
+        Value::Float(_) => Some(Type::Float),
+        Value::Double(_) => Some(Type::Double),
+        Value::String(_) => Some(Type::String),
+        Value::Boolean(_) => Some(Type::Boolean),
+        Value::Char(_) => Some(Type::Char),
+        _ => None,
+    }
+}
+
+fn value_to_numeric(value: &Value) -> Option<NumericValue> {
+    match value {
+        Value::Byte(v) => Some(NumericValue::Byte(*v)),
+        Value::Short(v) => Some(NumericValue::Short(*v)),
+        Value::Integer(v) => Some(NumericValue::Integer(*v)),
+        Value::Long(v) => Some(NumericValue::Long(*v)),
+        Value::Float(v) => Some(NumericValue::Float(*v)),
+        Value::Double(v) => Some(NumericValue::Double(*v)),
+        _ => None,
+    }
+}
+
+fn numeric_to_value(number: NumericValue) -> Value {
+    match number {
+        NumericValue::Byte(v) => Value::Byte(v),
+        NumericValue::Short(v) => Value::Short(v),
+        NumericValue::Integer(v) => Value::Integer(v),
+        NumericValue::Long(v) => Value::Long(v),
+        NumericValue::Float(v) => Value::Float(v),
+        NumericValue::Double(v) => Value::Double(v),
+    }
+}
+
+fn value_as_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Byte(v) => Some(*v as i64),
+        Value::Short(v) => Some(*v as i64),
+        Value::Integer(v) => Some(*v as i64),
+        Value::Long(v) => Some(*v),
+        _ => None,
+    }
+}
+
+fn coerce_numeric_to_type(number: NumericValue, target: &Type) -> Value {
+    match target {
+        Type::Byte => {
+            let value = numeric_to_f64(number);
+            let integer = numeric_to_i64(number);
+            if !value.fract().eq(&0.0) || !fits_integer_type(integer, target) {
+                panic!("value {:?} is out of range for byte", number);
+            }
+            Value::Byte(integer as i8)
+        }
+        Type::Short => {
+            let value = numeric_to_f64(number);
+            let integer = numeric_to_i64(number);
+            if !value.fract().eq(&0.0) || !fits_integer_type(integer, target) {
+                panic!("value {:?} is out of range for short", number);
+            }
+            Value::Short(integer as i16)
+        }
+        Type::Int => {
+            let value = numeric_to_f64(number);
+            let integer = numeric_to_i64(number);
+            if !value.fract().eq(&0.0) || !fits_integer_type(integer, target) {
+                panic!("value {:?} is out of range for int", number);
+            }
+            Value::Integer(integer as i32)
+        }
+        Type::Long => {
+            let value = numeric_to_f64(number);
+            let integer = numeric_to_i64(number);
+            if !value.fract().eq(&0.0) {
+                panic!("value {:?} cannot be represented as long", number);
+            }
+            Value::Long(integer)
+        }
+        Type::Float => Value::Float(numeric_to_f64(number) as f32),
+        Type::Double => Value::Double(numeric_to_f64(number)),
+        _ => panic!("cannot coerce numeric value {:?} to {:?}", number, target),
+    }
+}
+
+fn numeric_to_i64(number: NumericValue) -> i64 {
+    match number {
+        NumericValue::Byte(v) => v as i64,
+        NumericValue::Short(v) => v as i64,
+        NumericValue::Integer(v) => v as i64,
+        NumericValue::Long(v) => v,
+        NumericValue::Float(v) => v as i64,
+        NumericValue::Double(v) => v as i64,
+    }
+}
+
+fn numeric_to_f64(number: NumericValue) -> f64 {
+    match number {
+        NumericValue::Byte(v) => v as f64,
+        NumericValue::Short(v) => v as f64,
+        NumericValue::Integer(v) => v as f64,
+        NumericValue::Long(v) => v as f64,
+        NumericValue::Float(v) => v as f64,
+        NumericValue::Double(v) => v,
+    }
+}
+
+fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
+    match target {
+        Type::Byte | Type::Short | Type::Int | Type::Long | Type::Float | Type::Double => {
+            let returned = value_ref.returned();
+            let numeric = value_ref
+                .map_match(value_to_numeric)
+                .unwrap_or_else(|| panic!("cannot coerce {:?} to {:?}", value_ref, target));
+            let converted = coerce_numeric_to_type(numeric, target);
+            if returned {
+                ValueRef::stack(converted).to_returned()
+            } else {
+                ValueRef::stack(converted)
+            }
+        }
+        Type::String => {
+            if value_ref.is_match(|v| matches!(v, Value::String(_)) || matches!(v, Value::Undefined)) {
+                value_ref
+            } else {
+                panic!("cannot coerce {:?} to string", value_ref);
+            }
+        }
+        Type::Boolean => {
+            if value_ref.is_match(|v| matches!(v, Value::Boolean(_)) || matches!(v, Value::Undefined)) {
+                value_ref
+            } else {
+                panic!("cannot coerce {:?} to boolean", value_ref);
+            }
+        }
+        Type::Char => {
+            if value_ref.is_match(|v| matches!(v, Value::Char(_)) || matches!(v, Value::Undefined)) {
+                value_ref
+            } else {
+                panic!("cannot coerce {:?} to char", value_ref);
+            }
+        }
+        Type::Array { elem_type, .. } | Type::Slice { elem_type } => {
+            match value_ref.get_value() {
+                Value::Array { arr, dimensions } => {
+                    let needs_coercion = arr.iter().any(|elem| {
+                        value_to_type(&elem.get_value())
+                            .map(|elem_type_value| elem_type_value != *elem_type.deref())
+                            .unwrap_or(false)
+                    });
+                    if !needs_coercion {
+                        value_ref
+                    } else {
+                        let returned = value_ref.returned();
+                        let converted = Value::Array {
+                            arr: arr
+                                .into_iter()
+                                .map(|elem| coerce_value_to_type(elem, elem_type.deref()))
+                                .collect(),
+                            dimensions,
+                        };
+                        let value_ref = ValueRef::heap(converted);
+                        if returned {
+                            value_ref.to_returned()
+                        } else {
+                            value_ref
+                        }
+                    }
+                }
+                Value::Undefined => value_ref,
+                other => panic!("cannot coerce {:?} to {:?}", other, target),
+            }
+        }
+        Type::Custom(expected_name) => {
+            if value_ref.is_match(|v| match v {
+                Value::StructInstance { name, .. } => name == expected_name,
+                Value::Undefined => true,
+                _ => false,
+            }) {
+                value_ref
+            } else {
+                panic!("cannot coerce {:?} to {:?}", value_ref, target);
+            }
+        }
+        Type::Function { .. } => {
+            if value_ref.is_match(|v| matches!(v, Value::Function { .. } | Value::Closure { .. } | Value::Undefined)) {
+                value_ref
+            } else {
+                panic!("cannot coerce {:?} to {:?}", value_ref, target);
+            }
+        }
+        Type::Void | Type::SkSelf => value_ref,
+    }
+}
+
+fn promoted_numeric_value_type(left: &NumericValue, right: &NumericValue) -> Type {
+    promoted_numeric_type(&left.sk_type(), &right.sk_type()).unwrap()
+}
+
+fn promote_numeric_value(number: NumericValue, target: &Type) -> NumericValue {
+    match target {
+        Type::Int => NumericValue::Integer(numeric_to_i64(number) as i32),
+        Type::Long => NumericValue::Long(numeric_to_i64(number)),
+        Type::Float => NumericValue::Float(numeric_to_f64(number) as f32),
+        Type::Double => NumericValue::Double(numeric_to_f64(number)),
+        _ => panic!("invalid numeric promotion target {:?}", target),
+    }
+}
+
+fn eval_numeric_binary_op(left: NumericValue, right: NumericValue, operator: &Operator) -> Value {
+    let target = promoted_numeric_value_type(&left, &right);
+    let left = promote_numeric_value(left, &target);
+    let right = promote_numeric_value(right, &target);
+
+    match (left, right) {
+        (NumericValue::Integer(l), NumericValue::Integer(r)) => match operator {
+            Operator::Add => Value::Integer(l + r),
+            Operator::Subtract => Value::Integer(l - r),
+            Operator::Multiply => Value::Integer(l * r),
+            Operator::Divide => Value::Integer(l / r),
+            Operator::Mod => Value::Integer(l % r),
+            Operator::Equals => Value::Boolean(l == r),
+            Operator::NotEquals => Value::Boolean(l != r),
+            Operator::LessThanOrEqual => Value::Boolean(l <= r),
+            Operator::LessThan => Value::Boolean(l < r),
+            Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
+            Operator::GreaterThan => Value::Boolean(l > r),
+            _ => panic!("unsupported operator {:?}", operator),
+        },
+        (NumericValue::Long(l), NumericValue::Long(r)) => match operator {
+            Operator::Add => Value::Long(l + r),
+            Operator::Subtract => Value::Long(l - r),
+            Operator::Multiply => Value::Long(l * r),
+            Operator::Divide => Value::Long(l / r),
+            Operator::Mod => Value::Long(l % r),
+            Operator::Equals => Value::Boolean(l == r),
+            Operator::NotEquals => Value::Boolean(l != r),
+            Operator::LessThanOrEqual => Value::Boolean(l <= r),
+            Operator::LessThan => Value::Boolean(l < r),
+            Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
+            Operator::GreaterThan => Value::Boolean(l > r),
+            _ => panic!("unsupported operator {:?}", operator),
+        },
+        (NumericValue::Float(l), NumericValue::Float(r)) => match operator {
+            Operator::Add => Value::Float(l + r),
+            Operator::Subtract => Value::Float(l - r),
+            Operator::Multiply => Value::Float(l * r),
+            Operator::Divide => Value::Float(l / r),
+            Operator::Equals => Value::Boolean(l == r),
+            Operator::NotEquals => Value::Boolean(l != r),
+            Operator::LessThanOrEqual => Value::Boolean(l <= r),
+            Operator::LessThan => Value::Boolean(l < r),
+            Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
+            Operator::GreaterThan => Value::Boolean(l > r),
+            _ => panic!("unsupported operator {:?}", operator),
+        },
+        (NumericValue::Double(l), NumericValue::Double(r)) => match operator {
+            Operator::Add => Value::Double(l + r),
+            Operator::Subtract => Value::Double(l - r),
+            Operator::Multiply => Value::Double(l * r),
+            Operator::Divide => Value::Double(l / r),
+            Operator::Equals => Value::Boolean(l == r),
+            Operator::NotEquals => Value::Boolean(l != r),
+            Operator::LessThanOrEqual => Value::Boolean(l <= r),
+            Operator::LessThan => Value::Boolean(l < r),
+            Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
+            Operator::GreaterThan => Value::Boolean(l > r),
+            _ => panic!("unsupported operator {:?}", operator),
+        },
+        _ => unreachable!("unexpected promoted numeric values"),
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Value::Executed => write!(f, "executed"),
             Value::Variable(v) => write!(f, "{}", v), // todo unwrap
+            Value::Byte(v) => write!(f, "{}", v),
+            Value::Short(v) => write!(f, "{}", v),
             Value::Integer(v) => write!(f, "{}", v),
+            Value::Long(v) => write!(f, "{}", v),
+            Value::Float(v) => write!(f, "{}", v),
+            Value::Double(v) => write!(f, "{}", v),
             Value::String(v) => write!(f, "{}", v),
             Value::Boolean(v) => write!(f, "{}", v),
+            Value::Char(v) => write!(f, "{}", v),
             Value::Function {
                 name,
                 parameters,
@@ -620,8 +938,15 @@ impl Profiling {
 
     fn estimate_value_size(value: &Value) -> usize {
         match value {
-            Value::Integer(_) => std::mem::size_of::<i64>(),
+            Value::Byte(_) => std::mem::size_of::<i8>(),
+            Value::Short(_) => std::mem::size_of::<i16>(),
+            Value::Integer(_) => std::mem::size_of::<i32>(),
+            Value::Long(_) => std::mem::size_of::<i64>(),
+            Value::Float(_) => std::mem::size_of::<f32>(),
+            Value::Double(_) => std::mem::size_of::<f64>(),
             Value::String(s) => std::mem::size_of::<String>() + s.capacity(),
+            Value::Boolean(_) => std::mem::size_of::<bool>(),
+            Value::Char(_) => std::mem::size_of::<char>(),
             Value::Array { arr, .. } => {
                 arr.iter()
                     .map(|elem| Profiling::estimate_value_ref_size(elem))
@@ -891,7 +1216,16 @@ fn set_struct_field(
                 ref mut fields,
             } = value_ref.deref_mut()
             {
-                fields.insert(field.to_string(), new_value);
+                let coerced = if let Some(existing) = fields.get(field) {
+                    if let Some(target_type) = value_to_type(&existing.get_value()) {
+                        coerce_value_to_type(new_value, &target_type)
+                    } else {
+                        new_value
+                    }
+                } else {
+                    new_value
+                };
+                fields.insert(field.to_string(), coerced);
             } else {
                 panic!("expected a struct instance");
             }
@@ -924,6 +1258,13 @@ fn set_array_ref_element(arr_ref: &ValueRef, coordinates: &Vec<i64>, new_value: 
         }
         ValueRef::Heap { value, .. } => {
             let mut value_ref = value.borrow_mut();
+            let coerced = get_array_element(value_ref.deref(), coordinates)
+                .get_value();
+            let new_value = if let Some(target_type) = value_to_type(&coerced) {
+                coerce_value_to_type(new_value, &target_type)
+            } else {
+                new_value
+            };
             set_array_element(value_ref.deref_mut(), new_value, coordinates)
         }
     }
@@ -960,7 +1301,7 @@ fn resolve_member_access(
                 } else if current_value.is_array() {
                     current_value.map(|v| match v {
                         Value::Array { arr, .. } => match name.as_str() {
-                            "len" => ValueRef::stack(Value::Integer(arr.len() as i64)),
+                            "len" => ValueRef::stack(Value::Integer(arr.len() as i32)),
                             _ => {
                                 unreachable!("{}", format!("unsupported array member: `{}`", name))
                             }
@@ -1013,11 +1354,8 @@ fn resolve_array_access(
             .iter()
             .map(|n| {
                 evaluate_node(n, stack, global_environment)
-                    .map_match(|v| match v {
-                        Value::Integer(dim) => Some(*dim),
-                        _ => panic!("expected integer index for array access"),
-                    })
-                    .unwrap()
+                    .map_match(value_as_i64)
+                    .expect("expected integer index for array access")
             })
             .collect();
 
@@ -1069,7 +1407,17 @@ fn resolve_access(
             Node::Identifier(name) => match to_set {
                 None => stack.borrow().get_variable(name).unwrap().clone(),
                 Some(v) => {
-                    stack.borrow_mut().assign_variable(name, v.clone());
+                    let coerced = match stack.borrow().get_variable(name) {
+                        Some(current) => {
+                            if let Some(target_type) = value_to_type(&current.get_value()) {
+                                coerce_value_to_type(v.clone(), &target_type)
+                            } else {
+                                v.clone()
+                            }
+                        }
+                        None => v.clone(),
+                    };
+                    stack.borrow_mut().assign_variable(name, coerced);
                     ValueRef::stack(Value::Undefined)
                 }
             },
@@ -1084,6 +1432,7 @@ fn evaluate_function(
     stack: &Rc<RefCell<CallStack>>,
     arguments: &Vec<Node>,
     parameters: &Vec<Parameter>,
+    return_type: &Type,
     body: &Vec<Node>,
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> ValueRef {
@@ -1095,6 +1444,7 @@ fn evaluate_function(
     for i in 0..n {
         let param = &parameters[i];
         let v = evaluate_node(&arguments[i], stack, global_environment);
+        let v = coerce_value_to_type(v, &param.sk_type);
         stack.borrow_mut().declare_variable(&param.name, v);
     }
 
@@ -1102,7 +1452,11 @@ fn evaluate_function(
     for n in body {
         let v = evaluate_node(&n, stack, global_environment);
         if v.returned() {
-            result = v;
+            result = if *return_type == Type::Void {
+                v
+            } else {
+                coerce_value_to_type(v, return_type)
+            };
             break;
         }
     }
@@ -1155,6 +1509,7 @@ fn evaluate_closure(
                         stack,
                         arg,
                         &function.parameters,
+                        &function.return_type,
                         &function.body,
                         global_environment,
                     );
@@ -1174,6 +1529,7 @@ fn evaluate_closure(
                             stack,
                             arg,
                             &function.parameters,
+                            &function.return_type,
                             &function.body,
                             global_environment,
                         );
@@ -1236,6 +1592,7 @@ fn evaluate_function_call(
                     stack,
                     arguments.first().unwrap(),
                     &fun.parameters,
+                    &fun.return_type,
                     &fun.body,
                     global_environment,
                 );
@@ -1330,12 +1687,21 @@ pub fn evaluate_node(
                 )
             }
         }
-        Node::Literal(Literal::Integer(x)) => ValueRef::stack(Value::Integer(*x)),
+        Node::Literal(Literal::Integer(x)) => ValueRef::stack(Value::Integer(*x as i32)),
+        Node::Literal(Literal::Long(x)) => ValueRef::stack(Value::Long(*x)),
+        Node::Literal(Literal::Float(x)) => ValueRef::stack(Value::Float(*x)),
+        Node::Literal(Literal::Double(x)) => ValueRef::stack(Value::Double(*x)),
         Node::Literal(Literal::StringLiteral(x)) => ValueRef::stack(Value::String(x.to_string())),
         Node::Literal(Literal::Boolean(x)) => ValueRef::stack(Value::Boolean(*x)),
-        Node::VariableDeclaration { name, value, .. } => {
+        Node::Literal(Literal::Char(x)) => ValueRef::stack(Value::Char(*x)),
+        Node::VariableDeclaration {
+            name,
+            value,
+            var_type,
+            ..
+        } => {
             let value = if let Some(body) = value {
-                evaluate_node(body, stack, global_environment)
+                coerce_value_to_type(evaluate_node(body, stack, global_environment), var_type)
             } else {
                 ValueRef::stack(Value::Undefined)
             };
@@ -1386,11 +1752,22 @@ pub fn evaluate_node(
             })
         }
         Node::StructInitialization { name, fields } => {
+            let struct_def = global_environment
+                .borrow()
+                .get_struct(name)
+                .unwrap_or_else(|| panic!("unknown struct `{}`", name))
+                .clone();
             let mut field_values: FxHashMap<String, ValueRef> = FxHashMap::default();
             for (name, node) in fields {
+                let field_type = struct_def
+                    .fields
+                    .iter()
+                    .find(|field| field.0 == *name)
+                    .map(|field| field.1.clone())
+                    .unwrap_or_else(|| panic!("unknown field `{}` on `{}`", name, struct_def.name));
                 field_values.insert(
                     name.to_string(),
-                    evaluate_node(node, stack, global_environment),
+                    coerce_value_to_type(evaluate_node(node, stack, global_environment), &field_type),
                 );
             }
             ValueRef::heap(Value::StructInstance {
@@ -1449,7 +1826,7 @@ pub fn evaluate_node(
             ..
         } => match _type {
             Type::Array {
-                elem_type: _,
+                elem_type,
                 dimensions,
             } => {
                 let mut size: usize = 1;
@@ -1457,17 +1834,17 @@ pub fn evaluate_node(
                 for dim_node in dimensions {
                     let dim_val = evaluate_node(dim_node, stack, global_environment);
                     let i = dim_val
-                        .map_match(|v| match v {
-                            Value::Integer(i) => Some(*i),
-                            _ => None,
-                        })
+                        .map_match(value_as_i64)
                         .expect("expected integer in array size");
                     int_dimensions.push(i);
                     size = size * (i) as usize;
                 }
                 let mut arr = Vec::with_capacity(size);
                 for _ in 0..size {
-                    arr.push(evaluate_node(&arguments[0], stack, global_environment));
+                    arr.push(coerce_value_to_type(
+                        evaluate_node(&arguments[0], stack, global_environment),
+                        elem_type.deref(),
+                    ));
                 }
                 ValueRef::heap(Value::Array {
                     arr,
@@ -1567,11 +1944,24 @@ pub fn evaluate_node(
             let operand_val = evaluate_node(operand, stack, global_environment);
             match operator {
                 ast::UnaryOperator::Plus => operand_val, // unary `+` doesn't change the value
-                ast::UnaryOperator::Minus => operand_val.map_value(|v| match v {
-                    Value::Integer(val) => Value::Integer(-val),
-                    _ => panic!("Unary minus is only supported for integers"),
+                ast::UnaryOperator::Minus => operand_val.map_value(|v| {
+                    if let Some(number) = value_to_numeric(v) {
+                        match number {
+                            NumericValue::Byte(v) => Value::Integer(-(v as i32)),
+                            NumericValue::Short(v) => Value::Integer(-(v as i32)),
+                            NumericValue::Integer(v) => Value::Integer(-v),
+                            NumericValue::Long(v) => Value::Long(-v),
+                            NumericValue::Float(v) => Value::Float(-v),
+                            NumericValue::Double(v) => Value::Double(-v),
+                        }
+                    } else {
+                        panic!("Unary minus is only supported for numeric values")
+                    }
                 }),
-                _ => panic!("unsupported unary operator: {:?}", operator),
+                ast::UnaryOperator::Negate => operand_val.map_value(|v| match v {
+                    Value::Boolean(val) => Value::Boolean(!val),
+                    _ => panic!("Unary negate is only supported for booleans"),
+                }),
             }
         }
         Node::BinaryOp {
@@ -1584,51 +1974,54 @@ pub fn evaluate_node(
             let mut res = Value::Undefined;
             left_val.unwrap(|left_inner| {
                 right_val.unwrap(|right_inner| {
-                    res = match (left_inner, right_inner) {
-                        (Value::Integer(l), Value::Integer(r)) => match operator {
-                            Operator::Add => Value::Integer(l + r),
-                            Operator::Subtract => Value::Integer(l - r),
-                            Operator::Multiply => Value::Integer(l * r),
-                            Operator::Divide => Value::Integer(l / r),
-                            Operator::Mod => Value::Integer(l % r),
-                            Operator::Equals => Value::Boolean(l == r),
-                            Operator::LessThanOrEqual => Value::Boolean(l <= r),
-                            Operator::LessThan => Value::Boolean(l < r),
-                            Operator::GreaterThanOrEqual => Value::Boolean(l >= r),
-                            Operator::GreaterThan => Value::Boolean(l > r),
-                            _ => panic!("Unsupported operator"),
-                        },
-                        (Value::Boolean(a), Value::Boolean(b)) => match operator {
-                            Operator::And => Value::Boolean(*a && *b),
-                            Operator::Or => Value::Boolean(*a || *b),
-                            _ => panic!("Unsupported operator"),
-                        },
-                        (Value::String(s1), Value::String(s2)) => match operator {
-                            Operator::Add => Value::String(format!("{}{}", s1, s2)),
-                            _ => panic!("Unsupported operator for string concatenation"),
-                        },
-                        (Value::String(s), Value::Integer(i)) => match operator {
-                            Operator::Add => Value::String(format!("{}{}", s, i)),
-                            _ => panic!("Unsupported operator for string concatenation"),
-                        },
-                        (Value::Integer(i), Value::String(s)) => match operator {
-                            Operator::Add => Value::String(format!("{}{}", i, s)),
-                            _ => panic!("Unsupported operator for string concatenation"),
-                        },
-                        (Value::Boolean(i), Value::String(s)) => match operator {
-                            Operator::Add => Value::String(format!("{}{}", i, s)),
-                            _ => panic!("Unsupported operator for string concatenation"),
-                        },
-                        (Value::String(s), Value::Boolean(i)) => match operator {
-                            Operator::Add => Value::String(format!("{}{}", s, i)),
-                            _ => panic!("Unsupported operator for string concatenation"),
-                        },
-                        _ => panic!(
-                            "Unsupported binary operation={:?}, left={:?}, right={:?}",
-                            operator, left_val, right_val
-                        ),
-                        _ => panic!("Unsupported operator"),
-                    }
+                    res = if let (Some(left_num), Some(right_num)) =
+                        (value_to_numeric(left_inner), value_to_numeric(right_inner))
+                    {
+                        eval_numeric_binary_op(left_num, right_num, operator)
+                    } else {
+                        match (left_inner, right_inner) {
+                            (Value::Boolean(a), Value::Boolean(b)) => match operator {
+                                Operator::And => Value::Boolean(*a && *b),
+                                Operator::Or => Value::Boolean(*a || *b),
+                                Operator::Equals => Value::Boolean(*a == *b),
+                                Operator::NotEquals => Value::Boolean(*a != *b),
+                                _ => panic!("Unsupported operator"),
+                            },
+                            (Value::Char(a), Value::Char(b)) => match operator {
+                                Operator::Equals => Value::Boolean(*a == *b),
+                                Operator::NotEquals => Value::Boolean(*a != *b),
+                                Operator::LessThan => Value::Boolean(*a < *b),
+                                Operator::LessThanOrEqual => Value::Boolean(*a <= *b),
+                                Operator::GreaterThan => Value::Boolean(*a > *b),
+                                Operator::GreaterThanOrEqual => Value::Boolean(*a >= *b),
+                                _ => panic!("Unsupported operator for char"),
+                            },
+                            (Value::String(s1), Value::String(s2)) => match operator {
+                                Operator::Add => Value::String(format!("{}{}", s1, s2)),
+                                Operator::Equals => Value::Boolean(s1 == s2),
+                                Operator::NotEquals => Value::Boolean(s1 != s2),
+                                _ => panic!("Unsupported operator for strings"),
+                            },
+                            (Value::String(s), other) => {
+                                if *operator == Operator::Add {
+                                    Value::String(format!("{}{}", s, other))
+                                } else {
+                                    panic!("Unsupported operator for string concatenation")
+                                }
+                            }
+                            (other, Value::String(s)) => {
+                                if *operator == Operator::Add {
+                                    Value::String(format!("{}{}", other, s))
+                                } else {
+                                    panic!("Unsupported operator for string concatenation")
+                                }
+                            }
+                            _ => panic!(
+                                "Unsupported binary operation={:?}, left={:?}, right={:?}",
+                                operator, left_val, right_val
+                            ),
+                        }
+                    };
                 })
             });
             ValueRef::stack(res)
@@ -1636,7 +2029,7 @@ pub fn evaluate_node(
 
         Node::Print(value) => {
             let val = evaluate_node(value, stack, global_environment);
-            println!("{:?}", val);
+            println!("{}", val.get_value());
             ValueRef::stack(Value::Void)
         }
         Node::Identifier(name) => stack.borrow().get_variable(name).unwrap().clone(),
@@ -2579,5 +2972,32 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(1), res.get_value());
+    }
+
+    #[test]
+    fn test_new_primitive_runtime_values() {
+        let source_code = r#"
+                         b: byte = 10;
+                         s: short = 20;
+                         i: int = b + s;
+                         l: long = i + 30L;
+                         f: float = 1.5f;
+                         d: double = l + f;
+                         d;
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Double(61.5), res.get_value());
+    }
+
+    #[test]
+    fn test_char_literal_equality() {
+        let source_code = r#"
+                         c: char = 'A';
+                         c == 'A';
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Boolean(true), res.get_value());
     }
 }

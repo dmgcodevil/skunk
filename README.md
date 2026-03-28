@@ -6,7 +6,7 @@
 
 ## Features
 
-- **Basic Types**: `int`, `string`, `boolean`
+- **Basic Types**: `byte`, `short`, `int`, `long`, `float`, `double`, `boolean`, `char`, `string`
 - **User-Defined Structs**: Define custom types with fields and methods
 - **Control Flow**: `if`, `for` loops, and blocks for scoped variable overrides
 - **Arrays**: Support for array initialization, slicing (upcoming), and dynamic resizing
@@ -17,6 +17,24 @@
 - **Generics**: Upcoming for flexible and reusable data structures
 
 ## Example Programs
+
+### Primitive Types
+```skunk
+function main(): void {
+    b: byte = 10;
+    s: short = 20;
+    i: int = 30;
+    l: long = 40L;
+    f: float = 1.5f;
+    d: double = l + f;
+    c: char = 'A';
+    ok: boolean = c == 'A';
+
+    print(c);
+    print(d);
+    print(ok);
+}
+```
 
 ### Hello, World
 ```skunk

@@ -1,5 +1,9 @@
 use crate::ast::Type::Void;
-use crate::ast::{Literal, Metadata, Node, Operator, Type};
+use crate::ast::{
+    fits_integer_type, is_integral_type, is_numeric_assignable, is_numeric_type, is_scalar_type,
+    promoted_numeric_type, type_to_string, Literal, Metadata, Node, Operator, Type,
+    UnaryOperator,
+};
 use std::collections::HashMap;
 use std::fmt::format;
 use std::ops::Deref;
@@ -186,78 +190,142 @@ impl GlobalScope {
     }
 }
 
-fn resolve_cmp(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Boolean),
-        _ => Err(format!(
-            "unexpected types for < > <= >= : {:?} and {:?}",
-            left, right
-        )),
+fn is_assignable(expected: &Type, actual: &Type) -> bool {
+    expected == actual || is_numeric_assignable(expected, actual)
+}
+
+fn resolve_literal_type(literal: &Literal, expected_type_opt: Option<&Type>) -> Result<Type, String> {
+    match literal {
+        Literal::Integer(value) => {
+            if let Some(expected_type) = expected_type_opt {
+                if is_integral_type(expected_type) {
+                    if *expected_type == Type::Long && !fits_integer_type(*value, &Type::Int) {
+                        return Err(format!(
+                            "integer literal `{}` is out of range for `int`; use an `L` suffix for `long`",
+                            value
+                        ));
+                    }
+                    if fits_integer_type(*value, expected_type) {
+                        return Ok(expected_type.clone());
+                    }
+                    return Err(format!(
+                        "integer literal `{}` is out of range for `{}`",
+                        value,
+                        type_to_string(expected_type)
+                    ));
+                }
+            }
+
+            if fits_integer_type(*value, &Type::Int) {
+                Ok(Type::Int)
+            } else {
+                Err(format!(
+                    "integer literal `{}` is out of range for `int`; use an `L` suffix for `long`",
+                    value
+                ))
+            }
+        }
+        Literal::Long(_) => Ok(Type::Long),
+        Literal::Float(_) => Ok(Type::Float),
+        Literal::Double(_) => Ok(Type::Double),
+        Literal::StringLiteral(_) => Ok(Type::String),
+        Literal::Boolean(_) => Ok(Type::Boolean),
+        Literal::Char(_) => Ok(Type::Char),
     }
 }
+
+fn resolve_cmp(left: &Type, right: &Type) -> Result<Type, String> {
+    if promoted_numeric_type(left, right).is_some() || (*left == Type::Char && *right == Type::Char)
+    {
+        Ok(Type::Boolean)
+    } else {
+        Err(format!(
+            "unexpected types for < > <= >= : {:?} and {:?}",
+            left, right
+        ))
+    }
+}
+
 fn resolve_eq(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Boolean),
-        (Type::String, Type::String) => Ok(Type::Boolean),
-        (Type::Boolean, Type::Boolean) => Ok(Type::Boolean),
-        _ => Err(format!(
+    if promoted_numeric_type(left, right).is_some()
+        || (*left == Type::String && *right == Type::String)
+        || (*left == Type::Boolean && *right == Type::Boolean)
+        || (*left == Type::Char && *right == Type::Char)
+    {
+        Ok(Type::Boolean)
+    } else {
+        Err(format!(
             "unexpected types for '==' : {:?} and {:?}",
             left, right
-        )),
+        ))
     }
 }
 
 fn resolve_not_eq(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Boolean),
-        (Type::Boolean, Type::Boolean) => Ok(Type::Boolean),
-        _ => Err(format!(
-            "unexpected types for '==' : {:?} and {:?}",
-            left, right
-        )),
-    }
+    resolve_eq(left, right)
 }
 
 fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Int),
-        (Type::String, Type::String) => Ok(Type::String),
-        (Type::Int, Type::String) => Ok(Type::String),
-        (Type::String, Type::Int) => Ok(Type::String),
-        _ => Err(format!(
+    if let Some(promoted) = promoted_numeric_type(left, right) {
+        Ok(promoted)
+    } else if (*left == Type::String && is_scalar_type(right))
+        || (is_scalar_type(left) && *right == Type::String)
+    {
+        Ok(Type::String)
+    } else {
+        Err(format!(
             "unexpected types for +: {:?} and {:?}",
             left, right
-        )),
+        ))
     }
 }
 
 fn resolve_subtract(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Int),
-        _ => Err(format!(
-            "unexpected types for +: {:?} and {:?}",
+    promoted_numeric_type(left, right).ok_or_else(|| {
+        format!(
+            "unexpected types for -: {:?} and {:?}",
             left, right
-        )),
-    }
+        )
+    })
 }
 
 fn resolve_multiply(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Int),
-        _ => Err(format!(
-            "unexpected types for +: {:?} and {:?}",
+    promoted_numeric_type(left, right).ok_or_else(|| {
+        format!(
+            "unexpected types for *: {:?} and {:?}",
             left, right
-        )),
-    }
+        )
+    })
+}
+
+fn resolve_divide(left: &Type, right: &Type) -> Result<Type, String> {
+    promoted_numeric_type(left, right).ok_or_else(|| {
+        format!(
+            "unexpected types for /: {:?} and {:?}",
+            left, right
+        )
+    })
 }
 
 fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
-    match (left, right) {
-        (Type::Int, Type::Int) => Ok(Type::Int),
-        _ => Err(format!(
-            "unexpected types for +: {:?} and {:?}",
+    if is_integral_type(left) && is_integral_type(right) {
+        Ok(promoted_numeric_type(left, right).unwrap())
+    } else {
+        Err(format!(
+            "unexpected types for %: {:?} and {:?}",
             left, right
-        )),
+        ))
+    }
+}
+
+fn resolve_logical(left: &Type, right: &Type) -> Result<Type, String> {
+    if *left == Type::Boolean && *right == Type::Boolean {
+        Ok(Type::Boolean)
+    } else {
+        Err(format!(
+            "unexpected types for boolean operation: {:?} and {:?}",
+            left, right
+        ))
     }
 }
 
@@ -391,11 +459,16 @@ fn resolve_function_call(
                         ));
                     }
                     let mut argument_types = Vec::new();
-                    for arg in args {
-                        argument_types.push(resolve_type(global_scope, symbol_tables, arg, None)?);
+                    for i in 0..args.len() {
+                        argument_types.push(resolve_type(
+                            global_scope,
+                            symbol_tables,
+                            &args[i],
+                            Some(&parameters[i]),
+                        )?);
                     }
                     for i in 0..argument_types.len() {
-                        if argument_types[i].sk_type != parameters[i] {
+                        if !is_assignable(&parameters[i], &argument_types[i].sk_type) {
                             return Err(format!(
                                 "error {}:{}:arguments to function '{}' are incorrect. \
                                 parameter pos='{}', expected type='{:?}', actual type='{:?}'",
@@ -547,10 +620,10 @@ fn resolve_type(
                     global_scope,
                     symbol_tables,
                     &body.deref(),
-                    expected_type_opt,
+                    Some(var_type),
                 )?
                 .sk_type;
-                if *var_type != value_type {
+                if !is_assignable(var_type, &value_type) {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
                         name.clone(),
@@ -601,8 +674,14 @@ fn resolve_type(
                 Operator::Multiply => {
                     resolve_multiply(&left_type, &right_type).map(|t| ResolveResult::new(t))
                 }
+                Operator::Divide => {
+                    resolve_divide(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
                 Operator::Mod => {
                     resolve_mod(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                }
+                Operator::And | Operator::Or => {
+                    resolve_logical(&left_type, &right_type).map(|t| ResolveResult::new(t))
                 }
                 Operator::LessThan
                 | Operator::GreaterThan
@@ -626,10 +705,10 @@ fn resolve_type(
                 global_scope,
                 symbol_tables,
                 value.deref(),
-                expected_type_opt,
+                Some(&var_type),
             )?
             .sk_type;
-            if var_type != value_type {
+            if !is_assignable(&var_type, &value_type) {
                 // todo include var name, metadata
                 Err(format!(
                     "assignment type mismatch. expected: {:?}, actual: {:?}",
@@ -642,23 +721,42 @@ fn resolve_type(
         }
         Node::ArrayInit { elements } => {
             assert!(elements.len() > 0, "array init cannot be empty");
-            let mut curr: Type =
-                resolve_type(global_scope, symbol_tables, &elements[0], expected_type_opt)?.sk_type;
-            for i in 1..elements.len() {
-                let t = resolve_type(global_scope, symbol_tables, &elements[i], expected_type_opt)?
-                    .sk_type;
-                if t != curr {
-                    return Err("invalid arr value type".to_string());
+            let expected_elem_type_opt = match expected_type_opt {
+                Some(Type::Array { elem_type, .. }) | Some(Type::Slice { elem_type, .. }) => {
+                    Some(elem_type.deref())
                 }
-                curr = t;
+                _ => None,
+            };
+
+            let mut curr: Type = resolve_type(
+                global_scope,
+                symbol_tables,
+                &elements[0],
+                expected_elem_type_opt,
+            )?
+            .sk_type;
+            for i in 1..elements.len() {
+                let t = resolve_type(
+                    global_scope,
+                    symbol_tables,
+                    &elements[i],
+                    expected_elem_type_opt,
+                )?
+                .sk_type;
+                if t != curr {
+                    if let Some(promoted) = promoted_numeric_type(&curr, &t) {
+                        curr = promoted;
+                    } else {
+                        return Err("invalid arr value type".to_string());
+                    }
+                }
             }
             Ok(ResolveResult::new(Type::Slice {
                 elem_type: Box::new(curr),
             }))
         }
-        Node::Literal(Literal::Integer(_)) => Ok(ResolveResult::new(Type::Int)),
-        Node::Literal(Literal::Boolean(_)) => Ok(ResolveResult::new(Type::Boolean)),
-        Node::Literal(Literal::StringLiteral(_)) => Ok(ResolveResult::new(Type::String)),
+        Node::Literal(literal) => resolve_literal_type(literal, expected_type_opt)
+            .map(|t| ResolveResult::new(t)),
         Node::EOI => Ok(ResolveResult::new(Type::Void)),
         Node::Identifier(name) => {
             let res = symbol_tables
@@ -691,9 +789,15 @@ fn resolve_type(
         } => {
             match _type {
                 Type::Void => {}
+                Type::Byte => {}
+                Type::Short => {}
                 Type::Int => {}
+                Type::Long => {}
+                Type::Float => {}
+                Type::Double => {}
                 Type::String => {}
                 Type::Boolean => {}
+                Type::Char => {}
                 Type::Array { elem_type, .. } => {
                     if arguments.len() != 1 {
                         return Err(format!(
@@ -705,9 +809,9 @@ fn resolve_type(
                         global_scope,
                         symbol_tables,
                         arguments.get(0).unwrap(),
-                        expected_type_opt,
+                        Some(elem_type.deref()),
                     )?;
-                    if arg_type.sk_type != *elem_type.deref() {
+                    if !is_assignable(elem_type.deref(), &arg_type.sk_type) {
                         return Err(format!("error {}:{}: array `new`. expected arg type is `{:?}` but given `{:?}`",
                                            metadata.span.line,
                                            metadata.span.start,
@@ -839,20 +943,44 @@ fn resolve_type(
         Node::Return(body_opt) => {
             let mut res = ResolveResult::returned(Type::Void);
             if let Some(body) = body_opt {
-                res = resolve_type(global_scope, symbol_tables, body, None)?.to_returned();
+                res = resolve_type(global_scope, symbol_tables, body, expected_type_opt)?.to_returned();
             }
             if let Some(expected_type) = expected_type_opt {
-                if *expected_type != res.sk_type {
+                if !is_assignable(expected_type, &res.sk_type) {
                     return Err(format!(
                         "return invalid type. expected={:?}, actual={:?}, body={:?}",
                         expected_type, res.sk_type, body_opt
                     ));
                 }
+                res = ResolveResult::returned(expected_type.clone());
             }
             Ok(res)
         }
         Node::UnaryOp { operator, operand } => {
-            resolve_type(global_scope, symbol_tables, operand, expected_type_opt)
+            let operand_type =
+                resolve_type(global_scope, symbol_tables, operand, expected_type_opt)?.sk_type;
+            match operator {
+                UnaryOperator::Plus | UnaryOperator::Minus => {
+                    if is_numeric_type(&operand_type) {
+                        Ok(ResolveResult::new(operand_type))
+                    } else {
+                        Err(format!(
+                            "unary operator `{:?}` requires a numeric operand, got {:?}",
+                            operator, operand_type
+                        ))
+                    }
+                }
+                UnaryOperator::Negate => {
+                    if operand_type == Type::Boolean {
+                        Ok(ResolveResult::new(Type::Boolean))
+                    } else {
+                        Err(format!(
+                            "unary operator `!` requires a boolean operand, got {:?}",
+                            operand_type
+                        ))
+                    }
+                }
+            }
         }
         _ => unreachable!("{}", format!("{:?}", node)),
     }
@@ -1413,5 +1541,35 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_new_primitives_and_numeric_widening() {
+        let source_code = r#"
+        function main(): double {
+            b: byte = 10;
+            s: short = 20;
+            i: int = b + s;
+            l: long = i + 30L;
+            f: float = 1.5f;
+            c: char = 'A';
+            ok: bool = c == 'A';
+            d: double = l + f;
+            return d;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_float_literal_requires_suffix() {
+        let source_code = r#"
+        function main(): void {
+            f: float = 1.5;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
     }
 }
