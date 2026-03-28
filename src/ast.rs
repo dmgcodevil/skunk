@@ -80,6 +80,10 @@ pub enum Node {
     ArrayAccess {
         coordinates: Vec<Node>,
     },
+    SliceAccess {
+        start: Option<Box<Node>>,
+        end: Option<Box<Node>>,
+    },
     MemberAccess {
         member: Box<Node>, // field, function
         metadata: Metadata,
@@ -250,7 +254,7 @@ impl PestImpl {
             Rule::assignment => self.create_assignment(pair),
             Rule::struct_decl => self.create_struct_decl(pair),
             Rule::var_decl => self.create_var_decl(pair),
-            Rule::var_decl_stmt => self.create_var_decl(pair),
+            Rule::var_decl_stmt => self.create_var_decl(pair.into_inner().next().unwrap()),
             Rule::func_decl => self.create_func_decl(pair),
             Rule::lambda_expr => self.create_func_decl(pair),
             Rule::literal => self.create_literal(pair),
@@ -397,6 +401,20 @@ impl PestImpl {
         Node::ArrayAccess { coordinates }
     }
 
+    fn create_slice_access(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(Rule::slice_access, pair.as_rule());
+        let mut pairs = pair.into_inner();
+        let start = pairs
+            .next()
+            .and_then(|p| p.into_inner().next())
+            .map(|p| Box::new(self.create_ast(p)));
+        let end = pairs
+            .next()
+            .and_then(|p| p.into_inner().next())
+            .map(|p| Box::new(self.create_ast(p)));
+        Node::SliceAccess { start, end }
+    }
+
     fn create_inline_array_init(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
         let elements = inner_pairs.map(|p| self.create_ast(p)).collect();
@@ -425,11 +443,16 @@ impl PestImpl {
         let mut nodes: Vec<Node> = Vec::new();
         let mut inner_pairs = pair.into_inner();
         while let Some(inner_pair) = inner_pairs.next() {
-            match inner_pair.as_rule() {
-                Rule::IDENTIFIER => nodes.push(self.create_identifier(inner_pair)),
-                Rule::member_access => nodes.push(self.create_member_access(inner_pair)),
-                Rule::array_access => nodes.push(self.create_array_access(inner_pair)),
-                _ => panic!("unsupported chained access node: {:?}", inner_pair),
+            let mut step_pair = inner_pair;
+            if step_pair.as_rule() == Rule::access_step {
+                step_pair = step_pair.into_inner().next().unwrap();
+            }
+            match step_pair.as_rule() {
+                Rule::IDENTIFIER => nodes.push(self.create_identifier(step_pair)),
+                Rule::member_access => nodes.push(self.create_member_access(step_pair)),
+                Rule::array_access => nodes.push(self.create_array_access(step_pair)),
+                Rule::slice_access => nodes.push(self.create_slice_access(step_pair)),
+                _ => panic!("unsupported chained access node: {:?}", step_pair),
             }
         }
         nodes
@@ -592,6 +615,43 @@ impl PestImpl {
         }
     }
 
+    fn create_type_prefix(&self, pair: Pair<Rule>) -> Option<Node> {
+        assert_eq!(pair.as_rule(), Rule::type_prefix);
+        pair.into_inner().next().map(|p| self.create_ast(p))
+    }
+
+    fn apply_type_prefixes(&self, base_type: Type, prefixes: Vec<Option<Node>>) -> Type {
+        let mut current = base_type;
+        for prefix in prefixes.into_iter().rev() {
+            match prefix {
+                Some(dimension) => match current {
+                    Type::Array {
+                        elem_type,
+                        mut dimensions,
+                    } => {
+                        dimensions.insert(0, dimension);
+                        current = Type::Array {
+                            elem_type,
+                            dimensions,
+                        };
+                    }
+                    other => {
+                        current = Type::Array {
+                            elem_type: Box::new(other),
+                            dimensions: vec![dimension],
+                        };
+                    }
+                },
+                None => {
+                    current = Type::Slice {
+                        elem_type: Box::new(current),
+                    };
+                }
+            }
+        }
+        current
+    }
+
     fn create_type(&self, pair: Pair<Rule>) -> Type {
         match pair.as_rule() {
             Rule::base_type => create_base_type_from_str(pair.as_str()),
@@ -620,29 +680,33 @@ impl PestImpl {
                     unreachable!()
                 }
             }
-            Rule::slice_type => {
+            Rule::prefixed_type => {
+                let mut inner_pairs: Vec<Pair<Rule>> = pair.into_inner().collect();
+                let base_type = self.create_type(inner_pairs.pop().unwrap());
+                let prefixes = inner_pairs
+                    .into_iter()
+                    .map(|p| self.create_type_prefix(p))
+                    .collect();
+                self.apply_type_prefixes(base_type, prefixes)
+            }
+            Rule::legacy_slice_type => {
                 let mut inner_pairs = pair.into_inner();
                 Type::Slice {
                     elem_type: Box::new(self.create_type(inner_pairs.next().unwrap())),
                 }
             }
-            Rule::array_type => {
+            Rule::legacy_array_type => {
                 let mut inner_pairs = pair.into_inner();
                 let elem_type = self.create_type(
                     inner_pairs
                         .next()
-                        .filter(|x| matches!(x.as_rule(), Rule::base_type)) // only arrays of primitives ?
+                        .filter(|x| matches!(x.as_rule(), Rule::base_type))
                         .unwrap_or_else(|| panic!("array type is missing")),
                 );
                 let mut dimensions: Vec<Node> = Vec::new();
                 while let Some(dim_pair) = inner_pairs.next() {
                     let dim = self.create_ast(dim_pair.into_inner().next().unwrap());
                     dimensions.push(dim);
-                    // match dim {
-                    //     Node::Literal(Literal::Integer(v)) => dimensions.push(v),
-                    //     //todo support Access nodes, e.g. identifier
-                    //     _ => panic!("incorrect array size literal: {:?}", dim),
-                    // }
                 }
                 Type::Array {
                     elem_type: Box::new(elem_type),
@@ -879,8 +943,45 @@ pub fn type_to_string(t: &Type) -> String {
         Type::String => "string".to_string(),
         Type::Boolean => "boolean".to_string(),
         Type::Char => "char".to_string(),
+        Type::Array {
+            elem_type,
+            dimensions,
+        } => {
+            let prefix = dimensions
+                .iter()
+                .map(|dim| format!("[{}]", type_expr_to_string(dim)))
+                .collect::<String>();
+            format!("{}{}", prefix, type_to_string(elem_type))
+        }
+        Type::Slice { elem_type } => format!("[]{}", type_to_string(elem_type)),
+        Type::Function {
+            parameters,
+            return_type,
+        } => format!(
+            "({}) -> {}",
+            parameters
+                .iter()
+                .map(type_to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            type_to_string(return_type)
+        ),
+        Type::SkSelf => "self".to_string(),
         Type::Custom(v) => v.to_string(),
-        _ => panic!("unsupported type {:?}", t),
+    }
+}
+
+fn type_expr_to_string(node: &Node) -> String {
+    match node {
+        Node::Literal(Literal::Integer(value)) => value.to_string(),
+        Node::Literal(Literal::Long(value)) => format!("{}L", value),
+        Node::Literal(Literal::Float(value)) => format!("{}f", value),
+        Node::Literal(Literal::Double(value)) => value.to_string(),
+        Node::Literal(Literal::StringLiteral(value)) => format!("{:?}", value),
+        Node::Literal(Literal::Boolean(value)) => value.to_string(),
+        Node::Literal(Literal::Char(value)) => format!("{:?}", value),
+        Node::Identifier(name) => name.clone(),
+        other => format!("{:?}", other),
     }
 }
 
@@ -2238,6 +2339,64 @@ mod tests {
     }
 
     #[test]
+    fn test_prefix_int_array_fill() {
+        let source_code = r#"
+            arr: [1]int = [1]int::fill(1);
+        "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        var_type: Type::Array {
+                            elem_type: Box::new(Type::Int),
+                            dimensions: Vec::from([Node::Literal(Literal::Integer(1))])
+                        },
+                        name: "arr".to_string(),
+                        value: Some(Box::new(Node::StaticFunctionCall {
+                            _type: Type::Array {
+                                elem_type: Box::new(Type::Int),
+                                dimensions: Vec::from([Node::Literal(Literal::Integer(1))])
+                            },
+                            name: "fill".to_string(),
+                            arguments: Vec::from([Node::Literal(Literal::Integer(1))]),
+                            metadata: Metadata::EMPTY
+                        })),
+                        metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
+    #[test]
+    fn test_prefix_array_without_initializer() {
+        let source_code = r#"
+            arr: [3]int;
+        "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::VariableDeclaration {
+                        var_type: Type::Array {
+                            elem_type: Box::new(Type::Int),
+                            dimensions: Vec::from([Node::Literal(Literal::Integer(3))])
+                        },
+                        name: "arr".to_string(),
+                        value: None,
+                        metadata: Metadata::EMPTY
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
+    #[test]
     fn test_array_init_inline() {
         let source_code = r#"
         arr: int[2] = [1, 2];
@@ -2322,6 +2481,35 @@ mod tests {
         "#;
 
         println!("{:?}", parse(source_code));
+    }
+
+    #[test]
+    fn test_prefix_slice_type() {
+        let source_code = r#"
+            slice: []int = [1, 2, 3];
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    name: "slice".to_string(),
+                    var_type: Type::Slice {
+                        elem_type: Box::new(Type::Int),
+                    },
+                    value: Some(Box::new(Node::ArrayInit {
+                        elements: vec![
+                            Node::Literal(Literal::Integer(1)),
+                            Node::Literal(Literal::Integer(2)),
+                            Node::Literal(Literal::Integer(3)),
+                        ],
+                    })),
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
     }
 
     #[test]

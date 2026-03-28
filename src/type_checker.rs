@@ -194,6 +194,53 @@ fn is_assignable(expected: &Type, actual: &Type) -> bool {
     expected == actual || is_numeric_assignable(expected, actual)
 }
 
+fn is_zero_initializable_type(sk_type: &Type) -> bool {
+    match sk_type {
+        Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::String
+        | Type::Boolean
+        | Type::Char => true,
+        Type::Array { elem_type, .. } => is_zero_initializable_type(elem_type.deref()),
+        _ => false,
+    }
+}
+
+fn array_item_type(sk_type: &Type) -> Option<Type> {
+    match sk_type {
+        Type::Array {
+            elem_type,
+            dimensions,
+        } => {
+            if dimensions.len() > 1 {
+                Some(Type::Array {
+                    elem_type: elem_type.clone(),
+                    dimensions: dimensions[1..].to_vec(),
+                })
+            } else {
+                Some(elem_type.deref().clone())
+            }
+        }
+        Type::Slice { elem_type } => Some(elem_type.deref().clone()),
+        _ => None,
+    }
+}
+
+fn expected_fixed_array_length(sk_type: &Type) -> Option<i64> {
+    match sk_type {
+        Type::Array { dimensions, .. } => match dimensions.first() {
+            Some(Node::Literal(Literal::Integer(value))) => Some(*value),
+            Some(Node::Literal(Literal::Long(value))) => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn resolve_literal_type(literal: &Literal, expected_type_opt: Option<&Type>) -> Result<Type, String> {
     match literal {
         Literal::Integer(value) => {
@@ -340,19 +387,90 @@ fn resolve_access(
         return Ok(curr);
     }
     match access_nodes.get(i).unwrap() {
-        Node::ArrayAccess { .. } => match curr {
-            Type::Array { elem_type, .. } => resolve_access(
-                global_scope,
-                symbol_tables,
-                elem_type.deref().clone(),
-                i + 1,
-                access_nodes,
-            ),
-            Type::Slice { elem_type, .. } => Ok(elem_type.deref().clone()),
+        Node::ArrayAccess { coordinates } => match curr {
+            Type::Array {
+                elem_type,
+                dimensions,
+            } => {
+                if coordinates.len() > dimensions.len() {
+                    return Err("too many indices for array access".to_string());
+                }
+                let remaining_dimensions = dimensions[coordinates.len()..].to_vec();
+                let next_type = if remaining_dimensions.is_empty() {
+                    elem_type.deref().clone()
+                } else {
+                    Type::Array {
+                        elem_type,
+                        dimensions: remaining_dimensions,
+                    }
+                };
+                resolve_access(global_scope, symbol_tables, next_type, i + 1, access_nodes)
+            }
+            Type::Slice { elem_type, .. } => {
+                if coordinates.len() != 1 {
+                    return Err("slice access expects exactly one index".to_string());
+                }
+                resolve_access(
+                    global_scope,
+                    symbol_tables,
+                    elem_type.deref().clone(),
+                    i + 1,
+                    access_nodes,
+                )
+            }
             _ => Err("array access to not array variable".to_string()),
         },
+        Node::SliceAccess { start, end } => {
+            if let Some(start) = start {
+                let start_type = resolve_type(global_scope, symbol_tables, start, Some(&Type::Int))?;
+                if !is_integral_type(&start_type.sk_type) {
+                    return Err("slice start index must be an integer".to_string());
+                }
+            }
+            if let Some(end) = end {
+                let end_type = resolve_type(global_scope, symbol_tables, end, Some(&Type::Int))?;
+                if !is_integral_type(&end_type.sk_type) {
+                    return Err("slice end index must be an integer".to_string());
+                }
+            }
+            let next_type = match curr {
+                Type::Array {
+                    elem_type,
+                    dimensions,
+                } => {
+                    let sliced_elem_type = if dimensions.len() > 1 {
+                        Type::Array {
+                            elem_type,
+                            dimensions: dimensions[1..].to_vec(),
+                        }
+                    } else {
+                        elem_type.deref().clone()
+                    };
+                    Type::Slice {
+                        elem_type: Box::new(sliced_elem_type),
+                    }
+                }
+                Type::Slice { elem_type } => Type::Slice { elem_type },
+                _ => return Err("slice access requires an array or slice value".to_string()),
+            };
+            resolve_access(global_scope, symbol_tables, next_type, i + 1, access_nodes)
+        }
 
         Node::MemberAccess { member, metadata } => match curr {
+            Type::Array { .. } | Type::Slice { .. } => match member.deref() {
+                Node::Identifier(field_name) if field_name == "len" => resolve_access(
+                    global_scope,
+                    symbol_tables,
+                    Type::Int,
+                    i + 1,
+                    access_nodes,
+                ),
+                Node::Identifier(field_name) => Err(format!(
+                    "error {}:{}: no field `{}` on array or slice type",
+                    metadata.span.line, metadata.span.start, field_name
+                )),
+                _ => Err("array or slice member access expects an identifier".to_string()),
+            },
             Type::Custom(struct_name) => {
                 if !global_scope.structs.contains_key(&struct_name) {
                     return Err("error: struct doesn't exist".to_string());
@@ -636,7 +754,19 @@ fn resolve_type(
                     Ok(ResolveResult::new(var_type.clone()))
                 }
             } else {
-                Ok(ResolveResult::new(var_type.clone()))
+                match var_type {
+                    Type::Array { elem_type, .. } if is_zero_initializable_type(elem_type) => {
+                        Ok(ResolveResult::new(var_type.clone()))
+                    }
+                    Type::Array { .. } => Err(format!(
+                        "variable `{}` can omit an initializer only when its array element type has a zero value",
+                        name
+                    )),
+                    _ => Err(format!(
+                        "variable `{}` requires an initializer; only fixed arrays may omit one",
+                        name
+                    )),
+                }
             }
         }
         Node::FunctionCall {
@@ -721,12 +851,18 @@ fn resolve_type(
         }
         Node::ArrayInit { elements } => {
             assert!(elements.len() > 0, "array init cannot be empty");
-            let expected_elem_type_opt = match expected_type_opt {
-                Some(Type::Array { elem_type, .. }) | Some(Type::Slice { elem_type, .. }) => {
-                    Some(elem_type.deref())
+            if let Some(expected_len) = expected_type_opt.and_then(expected_fixed_array_length) {
+                if expected_len != elements.len() as i64 {
+                    return Err(format!(
+                        "array literal has length {}, but the target array expects {} elements",
+                        elements.len(),
+                        expected_len
+                    ));
                 }
-                _ => None,
-            };
+            }
+
+            let expected_elem_type = expected_type_opt.and_then(array_item_type);
+            let expected_elem_type_opt = expected_elem_type.as_ref();
 
             let mut curr: Type = resolve_type(
                 global_scope,
@@ -751,9 +887,14 @@ fn resolve_type(
                     }
                 }
             }
-            Ok(ResolveResult::new(Type::Slice {
-                elem_type: Box::new(curr),
-            }))
+            match expected_type_opt {
+                Some(Type::Array { .. }) | Some(Type::Slice { .. }) => {
+                    Ok(ResolveResult::new(expected_type_opt.unwrap().clone()))
+                }
+                _ => Ok(ResolveResult::new(Type::Slice {
+                    elem_type: Box::new(curr),
+                })),
+            }
         }
         Node::Literal(literal) => resolve_literal_type(literal, expected_type_opt)
             .map(|t| ResolveResult::new(t)),
@@ -799,10 +940,16 @@ fn resolve_type(
                 Type::Boolean => {}
                 Type::Char => {}
                 Type::Array { elem_type, .. } => {
+                    if name != "fill" && name != "new" {
+                        return Err(format!(
+                            "error {}:{}: array type does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
                     if arguments.len() != 1 {
                         return Err(format!(
-                            "error {}:{}: array `new` method should have exactly one argument",
-                            metadata.span.line, metadata.span.start,
+                            "error {}:{}: array `{}` method should have exactly one argument",
+                            metadata.span.line, metadata.span.start, name
                         ));
                     }
                     let arg_type = resolve_type(
@@ -812,10 +959,10 @@ fn resolve_type(
                         Some(elem_type.deref()),
                     )?;
                     if !is_assignable(elem_type.deref(), &arg_type.sk_type) {
-                        return Err(format!("error {}:{}: array `new`. expected arg type is `{:?}` but given `{:?}`",
+                        return Err(format!("error {}:{}: array `{}`. expected arg type is `{:?}` but given `{:?}`",
                                            metadata.span.line,
                                            metadata.span.start,
-                                           elem_type.deref(), arg_type));
+                                           name, elem_type.deref(), arg_type));
                     }
                 }
                 Type::Slice { .. } => {}
@@ -1113,6 +1260,34 @@ mod tests {
     }
 
     #[test]
+    fn test_prefix_fixed_array_inline_init() {
+        let source_code = r#"
+            arr: [4]int = [1,2,3,4];
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_zero_initialized_fixed_array_declaration() {
+        let source_code = r#"
+            arr: [4]int;
+            arr[0];
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_missing_initializer_non_array_is_rejected() {
+        let source_code = r#"
+            x: int;
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
     fn test_inline_array_init_invalid_type() {
         let source_code = r#"
             arr:int[] = [1,"2"];
@@ -1125,6 +1300,16 @@ mod tests {
     fn test_access_slice() {
         let source_code = r#"
              arr:int[] = [1];
+             arr[0];
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_prefix_slice_type_access() {
+        let source_code = r#"
+             arr: []int = [1];
              arr[0];
         "#;
         let program = ast::parse(source_code);

@@ -1,5 +1,5 @@
 use crate::ast::{self, Literal, Node, Operator, Type, UnaryOperator};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,30 +16,68 @@ enum LlvmType {
     Char16,
     I1,
     PtrI8,
+    Struct(String),
+    Function {
+        parameters: Vec<LlvmType>,
+        return_type: Box<LlvmType>,
+    },
+    Slice {
+        elem_type: Box<LlvmType>,
+    },
+    Array {
+        elem_type: Box<LlvmType>,
+        len: usize,
+    },
     Void,
 }
 
 impl LlvmType {
-    fn ir(&self) -> &'static str {
+    fn ir(&self) -> String {
         match self {
-            LlvmType::I8 => "i8",
-            LlvmType::I16 => "i16",
-            LlvmType::I32 => "i32",
-            LlvmType::I64 => "i64",
-            LlvmType::F32 => "float",
-            LlvmType::F64 => "double",
-            LlvmType::Char16 => "i16",
-            LlvmType::I1 => "i1",
-            LlvmType::PtrI8 => "ptr",
-            LlvmType::Void => "void",
+            LlvmType::I8 => "i8".to_string(),
+            LlvmType::I16 => "i16".to_string(),
+            LlvmType::I32 => "i32".to_string(),
+            LlvmType::I64 => "i64".to_string(),
+            LlvmType::F32 => "float".to_string(),
+            LlvmType::F64 => "double".to_string(),
+            LlvmType::Char16 => "i16".to_string(),
+            LlvmType::I1 => "i1".to_string(),
+            LlvmType::PtrI8 => "ptr".to_string(),
+            LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
+            LlvmType::Function { .. } => "{ ptr, ptr }".to_string(),
+            LlvmType::Slice { .. } => "{ ptr, i32 }".to_string(),
+            LlvmType::Array { elem_type, len } => format!("[{} x {}]", len, elem_type.ir()),
+            LlvmType::Void => "void".to_string(),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct FunctionSignature {
+    symbol_name: String,
     return_type: LlvmType,
     parameters: Vec<LlvmType>,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionPlan {
+    symbol_name: String,
+    parameters: Vec<(String, Type)>,
+    return_type: Type,
+    body: Vec<Node>,
+    is_method: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StructLayout {
+    name: String,
+    fields: Vec<(String, LlvmType)>,
+}
+
+#[derive(Clone, Debug)]
+struct ClosureEnv {
+    type_name: String,
+    captures: Vec<(String, LlvmType)>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +122,7 @@ fn escape_llvm_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn llvm_type(sk_type: &Type) -> Result<LlvmType, String> {
+fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<LlvmType, String> {
     match sk_type {
         Type::Byte => Ok(LlvmType::I8),
         Type::Short => Ok(LlvmType::I16),
@@ -95,12 +133,108 @@ fn llvm_type(sk_type: &Type) -> Result<LlvmType, String> {
         Type::Boolean => Ok(LlvmType::I1),
         Type::String => Ok(LlvmType::PtrI8),
         Type::Char => Ok(LlvmType::Char16),
+        Type::Array {
+            elem_type,
+            dimensions,
+        } => {
+            let mut llvm_elem = llvm_type(elem_type, structs)?;
+            for dimension in dimensions.iter().rev() {
+                llvm_elem = LlvmType::Array {
+                    elem_type: Box::new(llvm_elem),
+                    len: array_len_from_dimension(dimension)?,
+                };
+            }
+            Ok(llvm_elem)
+        }
+        Type::Slice { elem_type } => Ok(LlvmType::Slice {
+            elem_type: Box::new(llvm_type(elem_type, structs)?),
+        }),
+        Type::Function {
+            parameters,
+            return_type,
+        } => Ok(LlvmType::Function {
+            parameters: parameters
+                .iter()
+                .map(|param| llvm_type(param, structs))
+                .collect::<Result<Vec<_>, _>>()?,
+            return_type: Box::new(llvm_type(return_type, structs)?),
+        }),
+        Type::Custom(name) => {
+            if structs.contains_key(name) {
+                Ok(LlvmType::Struct(name.clone()))
+            } else {
+                Err(format!("unknown struct `{}` in LLVM backend", name))
+            }
+        }
         Type::Void => Ok(LlvmType::Void),
         other => Err(format!(
             "LLVM backend does not support type `{}` yet",
             ast::type_to_string(other)
         )),
     }
+}
+
+fn array_len_from_dimension(dimension: &Node) -> Result<usize, String> {
+    let value = match dimension {
+        Node::Literal(Literal::Integer(value)) => *value,
+        Node::Literal(Literal::Long(value)) => *value,
+        other => {
+            return Err(format!(
+                "LLVM backend requires array dimensions to be integer literals, found `{:?}`",
+                other
+            ))
+        }
+    };
+    usize::try_from(value).map_err(|_| {
+        format!(
+            "LLVM backend requires non-negative array dimensions, found `{}`",
+            value
+        )
+    })
+}
+
+fn collect_struct_layouts(statements: &[Node]) -> Result<HashMap<String, StructLayout>, String> {
+    let mut raw_fields = HashMap::<String, Vec<(String, Type)>>::new();
+    for statement in statements {
+        if let Node::StructDeclaration { name, fields, .. } = statement {
+            raw_fields.insert(name.clone(), fields.clone());
+        }
+    }
+
+    let mut layouts = HashMap::<String, StructLayout>::new();
+    for (name, fields) in &raw_fields {
+        let llvm_fields = fields
+            .iter()
+            .map(|(field_name, field_type)| {
+                Ok((
+                    field_name.clone(),
+                    llvm_type(field_type, &layouts_with_raw(raw_fields.keys(), &layouts))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        layouts.insert(
+            name.clone(),
+            StructLayout {
+                name: name.clone(),
+                fields: llvm_fields,
+            },
+        );
+    }
+    Ok(layouts)
+}
+
+fn layouts_with_raw<'a>(
+    raw_names: impl Iterator<Item = &'a String>,
+    layouts: &HashMap<String, StructLayout>,
+) -> HashMap<String, StructLayout> {
+    let mut merged = layouts.clone();
+    for name in raw_names {
+        merged.entry(name.clone()).or_insert_with(|| StructLayout {
+            name: name.clone(),
+            fields: Vec::new(),
+        });
+    }
+    merged
 }
 
 fn is_integer_llvm_type(llvm_type: &LlvmType) -> bool {
@@ -136,7 +270,12 @@ struct FunctionCompiler<'a> {
     function_name: &'a str,
     return_type: LlvmType,
     signatures: &'a HashMap<String, FunctionSignature>,
+    structs: &'a HashMap<String, StructLayout>,
     globals: &'a mut Vec<GlobalString>,
+    extra_type_decls: &'a mut Vec<String>,
+    extra_function_irs: &'a mut Vec<String>,
+    lambda_counter: &'a mut usize,
+    closure_env: Option<ClosureEnv>,
     scopes: Vec<HashMap<String, LocalVar>>,
     lines: Vec<String>,
     temp_counter: usize,
@@ -149,13 +288,23 @@ impl<'a> FunctionCompiler<'a> {
         function_name: &'a str,
         return_type: LlvmType,
         signatures: &'a HashMap<String, FunctionSignature>,
+        structs: &'a HashMap<String, StructLayout>,
         globals: &'a mut Vec<GlobalString>,
+        extra_type_decls: &'a mut Vec<String>,
+        extra_function_irs: &'a mut Vec<String>,
+        lambda_counter: &'a mut usize,
+        closure_env: Option<ClosureEnv>,
     ) -> Self {
         Self {
             function_name,
             return_type,
             signatures,
+            structs,
             globals,
+            extra_type_decls,
+            extra_function_irs,
+            lambda_counter,
+            closure_env,
             scopes: vec![HashMap::new()],
             lines: Vec::new(),
             temp_counter: 0,
@@ -169,18 +318,45 @@ impl<'a> FunctionCompiler<'a> {
         parameters: &[(String, Type)],
         body: &[Node],
     ) -> Result<Vec<String>, String> {
+        let mut arg_index = 0usize;
+        if let Some(env) = self.closure_env.clone() {
+            for (capture_index, (name, llvm_type)) in env.captures.iter().enumerate() {
+                let field_ptr = self.next_temp();
+                self.emit_line(format!(
+                    "{} = getelementptr inbounds %env.{}, ptr %env, i32 0, i32 {}",
+                    field_ptr,
+                    sanitize_name(&env.type_name),
+                    capture_index
+                ));
+                let capture_ptr = self.next_temp();
+                self.emit_line(format!(
+                    "{} = load ptr, ptr {}, align 8",
+                    capture_ptr, field_ptr
+                ));
+                self.declare_local(name.clone(), capture_ptr, llvm_type.clone());
+            }
+            arg_index = 1;
+        }
+
         for (index, (name, sk_type)) in parameters.iter().enumerate() {
-            let llvm_type = llvm_type(sk_type)?;
-            let arg_name = format!("%arg{}", index);
-            let ptr = self.emit_alloca(llvm_type.clone(), name);
+            let arg_name = format!("%arg{}", arg_index);
+            if index == 0 && name == "self" {
+                let llvm_type = llvm_type(sk_type, self.structs)?;
+                self.declare_local(name.clone(), arg_name, llvm_type);
+                arg_index += 1;
+                continue;
+            }
+            let llvm_type = llvm_type(sk_type, self.structs)?;
+            let ptr = self.emit_heap_alloc(llvm_type.clone(), name);
             self.emit_line(format!(
                 "store {} {}, ptr {}, align {}",
                 llvm_type.ir(),
                 arg_name,
                 ptr,
-                Self::align_of(&llvm_type)
+                self.align_of(&llvm_type)
             ));
             self.declare_local(name.clone(), ptr, llvm_type);
+            arg_index += 1;
         }
 
         self.compile_statements(body)?;
@@ -218,20 +394,20 @@ impl<'a> FunctionCompiler<'a> {
                 value,
                 ..
             } => {
-                let llvm_type = llvm_type(var_type)?;
-                let ptr = self.emit_alloca(llvm_type.clone(), name);
+                let llvm_type = llvm_type(var_type, self.structs)?;
+                let ptr = self.emit_heap_alloc(llvm_type.clone(), name);
+                self.declare_local(name.clone(), ptr.clone(), llvm_type.clone());
                 let init = match value {
-                    Some(value) => self.compile_expr(value)?,
+                    Some(value) => self.compile_expr_with_expected(value, Some(&llvm_type))?,
                     None => self.default_value(&llvm_type),
                 };
                 let init = self.coerce_expr(init, &llvm_type, "variable declaration")?;
                 self.emit_store(&ptr, &init);
-                self.declare_local(name.clone(), ptr, llvm_type);
                 Ok(())
             }
             Node::Assignment { var, value, .. } => {
-                let expr = self.compile_expr(value)?;
                 let local = self.resolve_local_from_access(var)?;
+                let expr = self.compile_expr_with_expected(value, Some(&local.llvm_type))?;
                 let expr = self.coerce_expr(expr, &local.llvm_type, "assignment")?;
                 self.emit_store(&local.ptr, &expr);
                 Ok(())
@@ -257,7 +433,8 @@ impl<'a> FunctionCompiler<'a> {
             Node::Return(value) => {
                 match value {
                     Some(value) => {
-                        let expr = self.compile_expr(value)?;
+                        let return_type = self.return_type.clone();
+                        let expr = self.compile_expr_with_expected(value, Some(&return_type))?;
                         let return_type = self.return_type.clone();
                         let expr = self.coerce_expr(expr, &return_type, "return")?;
                         self.emit_line(format!("ret {} {}", expr.llvm_type.ir(), expr.value));
@@ -278,6 +455,10 @@ impl<'a> FunctionCompiler<'a> {
             }
             Node::Print(value) => self.compile_print(value),
             Node::FunctionCall { .. } => {
+                let _ = self.compile_expr(node)?;
+                Ok(())
+            }
+            Node::Access { .. } => {
                 let _ = self.compile_expr(node)?;
                 Ok(())
             }
@@ -471,11 +652,23 @@ impl<'a> FunctionCompiler<'a> {
                 ));
                 Ok(())
             }
+            LlvmType::Struct(_) => Err("cannot print a struct value directly".to_string()),
+            LlvmType::Function { .. } => Err("cannot print a function value directly".to_string()),
+            LlvmType::Slice { .. } => Err("cannot print a slice value directly".to_string()),
+            LlvmType::Array { .. } => Err("cannot print an array value directly".to_string()),
             LlvmType::Void => Err("cannot print a void value".to_string()),
         }
     }
 
     fn compile_expr(&mut self, node: &Node) -> Result<ExprValue, String> {
+        self.compile_expr_with_expected(node, None)
+    }
+
+    fn compile_expr_with_expected(
+        &mut self,
+        node: &Node,
+        expected: Option<&LlvmType>,
+    ) -> Result<ExprValue, String> {
         match node {
             Node::Literal(Literal::Integer(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::I32,
@@ -509,20 +702,38 @@ impl<'a> FunctionCompiler<'a> {
                 })
             }
             Node::Identifier(name) => self.load_local(name),
-            Node::Access { nodes } => {
-                if nodes.len() != 1 {
-                    return Err(
-                        "LLVM backend currently supports only plain variable access".to_string()
-                    );
-                }
-                match &nodes[0] {
-                    Node::Identifier(name) => self.load_local(name),
-                    _ => Err("LLVM backend currently supports only plain variable access"
-                        .to_string()),
+            Node::Access { nodes } => self.compile_access_expr(nodes),
+            Node::ArrayInit { elements } => {
+                let expected = expected.ok_or_else(|| {
+                    "LLVM backend needs a concrete array type for array literals".to_string()
+                })?;
+                match expected {
+                    LlvmType::Slice { .. } => self.compile_slice_literal(elements, expected),
+                    _ => self.compile_array_literal(elements, expected),
                 }
             }
+            Node::StructInitialization { name, fields } => match expected {
+                Some(expected) => self.compile_struct_literal(name, fields, expected),
+                None => {
+                    let inferred = LlvmType::Struct(name.clone());
+                    self.compile_struct_literal(name, fields, &inferred)
+                }
+            },
+            Node::StaticFunctionCall {
+                _type,
+                name,
+                arguments,
+                ..
+            } => self.compile_static_function_call(_type, name, arguments),
+            Node::FunctionDeclaration {
+                parameters,
+                return_type,
+                body,
+                lambda: true,
+                ..
+            } => self.compile_lambda_expr(parameters, return_type, body, expected),
             Node::UnaryOp { operator, operand } => {
-                let value = self.compile_expr(operand)?;
+                let value = self.compile_expr_with_expected(operand, expected)?;
                 match operator {
                     UnaryOperator::Plus => Ok(value),
                     UnaryOperator::Minus => {
@@ -587,29 +798,894 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
-    fn compile_function_call(
+    fn compile_static_function_call(
         &mut self,
+        sk_type: &Type,
         name: &str,
-        arguments: &[Vec<Node>],
+        arguments: &[Node],
     ) -> Result<ExprValue, String> {
-        if arguments.len() != 1 {
-            return Err(
-                "LLVM backend does not support chained closure-style function calls yet"
-                    .to_string(),
-            );
+        match sk_type {
+            Type::Array { .. } if name == "fill" || name == "new" => {
+                if arguments.len() != 1 {
+                    return Err(format!(
+                        "array `{}` expects exactly one argument in LLVM backend",
+                        name
+                    ));
+                }
+                let llvm_type = llvm_type(sk_type, self.structs)?;
+                self.compile_array_fill(&llvm_type, &arguments[0])
+            }
+            Type::Array { .. } => Err(format!(
+                "array static method `{}` is not supported in LLVM backend",
+                name
+            )),
+            _ => Err(format!(
+                "LLVM backend does not support static function call `{}::{}` yet",
+                ast::type_to_string(sk_type),
+                name
+            )),
+        }
+    }
+
+    fn compile_array_literal(
+        &mut self,
+        elements: &[Node],
+        expected: &LlvmType,
+    ) -> Result<ExprValue, String> {
+        match expected {
+            LlvmType::Array { elem_type, len } => {
+                if elements.len() != *len {
+                    return Err(format!(
+                        "array literal expected {} elements, got {}",
+                        len,
+                        elements.len()
+                    ));
+                }
+                let mut aggregate = ExprValue {
+                    llvm_type: expected.clone(),
+                    value: "zeroinitializer".to_string(),
+                };
+                for (index, element) in elements.iter().enumerate() {
+                    let element = self.compile_expr_with_expected(element, Some(elem_type.as_ref()))?;
+                    let element = self.coerce_expr(element, elem_type.as_ref(), "array literal element")?;
+                    let temp = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = insertvalue {} {}, {} {}, {}",
+                        temp,
+                        expected.ir(),
+                        aggregate.value,
+                        element.llvm_type.ir(),
+                        element.value,
+                        index
+                    ));
+                    aggregate = ExprValue {
+                        llvm_type: expected.clone(),
+                        value: temp,
+                    };
+                }
+                Ok(aggregate)
+            }
+            other => Err(format!(
+                "LLVM backend cannot use an array literal to initialize `{}`",
+                other.ir()
+            )),
+        }
+    }
+
+    fn compile_array_fill(
+        &mut self,
+        expected: &LlvmType,
+        fill_node: &Node,
+    ) -> Result<ExprValue, String> {
+        match expected {
+            LlvmType::Array { elem_type, len } => {
+                let mut aggregate = ExprValue {
+                    llvm_type: expected.clone(),
+                    value: "zeroinitializer".to_string(),
+                };
+                for index in 0..*len {
+                    let element = self.compile_array_fill(elem_type.as_ref(), fill_node)?;
+                    let temp = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = insertvalue {} {}, {} {}, {}",
+                        temp,
+                        expected.ir(),
+                        aggregate.value,
+                        element.llvm_type.ir(),
+                        element.value,
+                        index
+                    ));
+                    aggregate = ExprValue {
+                        llvm_type: expected.clone(),
+                        value: temp,
+                    };
+                }
+                Ok(aggregate)
+            }
+            _ => {
+                let element = self.compile_expr_with_expected(fill_node, Some(expected))?;
+                self.coerce_expr(element, expected, "array fill")
+            }
+        }
+    }
+
+    fn compile_slice_literal(
+        &mut self,
+        elements: &[Node],
+        expected: &LlvmType,
+    ) -> Result<ExprValue, String> {
+        let elem_type = match expected {
+            LlvmType::Slice { elem_type } => elem_type.as_ref().clone(),
+            other => {
+                return Err(format!(
+                    "LLVM backend cannot use a slice literal to initialize `{}`",
+                    other.ir()
+                ))
+            }
+        };
+
+        let backing_type = LlvmType::Array {
+            elem_type: Box::new(elem_type),
+            len: elements.len(),
+        };
+        let aggregate = self.compile_array_literal(elements, &backing_type)?;
+        let backing_ptr = self.emit_heap_alloc(backing_type.clone(), "slice_lit");
+        self.emit_store(&backing_ptr, &aggregate);
+        self.build_slice_from_array_ptr(&backing_ptr, &backing_type, None, None)
+    }
+
+    fn compile_slice_from_ptr(
+        &mut self,
+        ptr: &str,
+        current_type: &LlvmType,
+        start: Option<&Node>,
+        end: Option<&Node>,
+    ) -> Result<ExprValue, String> {
+        match current_type {
+            LlvmType::Array { .. } => self.build_slice_from_array_ptr(ptr, current_type, start, end),
+            LlvmType::Slice { elem_type } => {
+                let slice_value = self.load_from_ptr(ptr, current_type)?;
+                let data_ptr = self.extract_slice_data(&slice_value)?;
+                let len_value = self.extract_slice_len(&slice_value)?;
+                self.build_slice_header_from_data_ptr(
+                    &data_ptr,
+                    elem_type.as_ref(),
+                    &len_value,
+                    start,
+                    end,
+                )
+            }
+            other => Err(format!(
+                "cannot take a slice of `{}` in LLVM backend",
+                other.ir()
+            )),
+        }
+    }
+
+    fn build_slice_from_array_ptr(
+        &mut self,
+        array_ptr: &str,
+        array_type: &LlvmType,
+        start: Option<&Node>,
+        end: Option<&Node>,
+    ) -> Result<ExprValue, String> {
+        let (elem_type, len) = match array_type {
+            LlvmType::Array { elem_type, len } => (elem_type.as_ref(), *len),
+            other => {
+                return Err(format!(
+                    "expected array storage for slice construction, found `{}`",
+                    other.ir()
+                ))
+            }
+        };
+        let len_value = ExprValue {
+            llvm_type: LlvmType::I32,
+            value: len.to_string(),
+        };
+        let data_ptr = if len == 0 {
+            "null".to_string()
+        } else {
+            let data_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = getelementptr inbounds {}, ptr {}, i64 0, i64 0",
+                data_ptr,
+                array_type.ir(),
+                array_ptr
+            ));
+            data_ptr
+        };
+        self.build_slice_header_from_data_ptr(&data_ptr, elem_type, &len_value, start, end)
+    }
+
+    fn build_slice_header_from_data_ptr(
+        &mut self,
+        data_ptr: &str,
+        elem_type: &LlvmType,
+        base_len: &ExprValue,
+        start: Option<&Node>,
+        end: Option<&Node>,
+    ) -> Result<ExprValue, String> {
+        let start_value = match start {
+            Some(node) => {
+                let value = self.compile_expr_with_expected(node, Some(&LlvmType::I32))?;
+                self.coerce_expr(value, &LlvmType::I32, "slice start")?
+            }
+            None => ExprValue {
+                llvm_type: LlvmType::I32,
+                value: "0".to_string(),
+            },
+        };
+        let end_value = match end {
+            Some(node) => {
+                let value = self.compile_expr_with_expected(node, Some(&LlvmType::I32))?;
+                self.coerce_expr(value, &LlvmType::I32, "slice end")?
+            }
+            None => base_len.clone(),
+        };
+
+        let start_i64 = self.coerce_expr(start_value.clone(), &LlvmType::I64, "slice start")?;
+        let offset_ptr = if data_ptr == "null" {
+            "null".to_string()
+        } else {
+            let offset_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = getelementptr inbounds {}, ptr {}, i64 {}",
+                offset_ptr,
+                elem_type.ir(),
+                data_ptr,
+                start_i64.value
+            ));
+            offset_ptr
+        };
+
+        let slice_len = self.next_temp();
+        self.emit_line(format!(
+            "{} = sub i32 {}, {}",
+            slice_len, end_value.value, start_value.value
+        ));
+
+        let slice_type = LlvmType::Slice {
+            elem_type: Box::new(elem_type.clone()),
+        };
+        let with_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, ptr {}, 0",
+            with_ptr,
+            slice_type.ir(),
+            offset_ptr
+        ));
+        let full = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} {}, i32 {}, 1",
+            full,
+            slice_type.ir(),
+            with_ptr,
+            slice_len
+        ));
+        Ok(ExprValue {
+            llvm_type: slice_type,
+            value: full,
+        })
+    }
+
+    fn load_from_ptr(&mut self, ptr: &str, llvm_type: &LlvmType) -> Result<ExprValue, String> {
+        let temp = self.next_temp();
+        self.emit_line(format!(
+            "{} = load {}, ptr {}, align {}",
+            temp,
+            llvm_type.ir(),
+            ptr,
+            self.align_of(llvm_type)
+        ));
+        Ok(ExprValue {
+            llvm_type: llvm_type.clone(),
+            value: temp,
+        })
+    }
+
+    fn extract_slice_data(&mut self, slice: &ExprValue) -> Result<String, String> {
+        match &slice.llvm_type {
+            LlvmType::Slice { .. } => {
+                let data_ptr = self.next_temp();
+                self.emit_line(format!(
+                    "{} = extractvalue {} {}, 0",
+                    data_ptr,
+                    slice.llvm_type.ir(),
+                    slice.value
+                ));
+                Ok(data_ptr)
+            }
+            other => Err(format!("expected slice value, found `{}`", other.ir())),
+        }
+    }
+
+    fn extract_slice_len(&mut self, slice: &ExprValue) -> Result<ExprValue, String> {
+        match &slice.llvm_type {
+            LlvmType::Slice { .. } => {
+                let len = self.next_temp();
+                self.emit_line(format!(
+                    "{} = extractvalue {} {}, 1",
+                    len,
+                    slice.llvm_type.ir(),
+                    slice.value
+                ));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::I32,
+                    value: len,
+                })
+            }
+            other => Err(format!("expected slice value, found `{}`", other.ir())),
+        }
+    }
+
+    fn compile_struct_literal(
+        &mut self,
+        struct_name: &str,
+        fields: &[(String, Node)],
+        expected: &LlvmType,
+    ) -> Result<ExprValue, String> {
+        let expected_name = match expected {
+            LlvmType::Struct(name) => name,
+            other => {
+                return Err(format!(
+                    "LLVM backend cannot use struct literal `{}` to initialize `{}`",
+                    struct_name,
+                    other.ir()
+                ))
+            }
+        };
+        if expected_name != struct_name {
+            return Err(format!(
+                "struct literal `{}` cannot initialize `{}`",
+                struct_name, expected_name
+            ));
         }
 
+        let layout = self
+            .structs
+            .get(struct_name)
+            .ok_or_else(|| format!("unknown struct `{}` in LLVM backend", struct_name))?;
+
+        let mut aggregate = ExprValue {
+            llvm_type: expected.clone(),
+            value: "zeroinitializer".to_string(),
+        };
+
+        for (field_name, field_node) in fields {
+            let (index, field_type) = self
+                .struct_field_info(struct_name, field_name)
+                .ok_or_else(|| format!("unknown field `{}` on struct `{}`", field_name, struct_name))?;
+            let field_value =
+                self.compile_expr_with_expected(field_node, Some(&field_type))?;
+            let field_value = self.coerce_expr(field_value, &field_type, "struct field")?;
+            let temp = self.next_temp();
+            self.emit_line(format!(
+                "{} = insertvalue {} {}, {} {}, {}",
+                temp,
+                expected.ir(),
+                aggregate.value,
+                field_value.llvm_type.ir(),
+                field_value.value,
+                index
+            ));
+            aggregate = ExprValue {
+                llvm_type: expected.clone(),
+                value: temp,
+            };
+        }
+
+        if fields.len() > layout.fields.len() {
+            return Err(format!(
+                "too many fields provided when initializing `{}`",
+                struct_name
+            ));
+        }
+
+        Ok(aggregate)
+    }
+
+    fn compile_access_expr(&mut self, nodes: &[Node]) -> Result<ExprValue, String> {
+        if let Some(expr) = self.try_compile_member_call(nodes)? {
+            return Ok(expr);
+        }
+        if let Some(expr) = self.compile_length_member(nodes)? {
+            return Ok(expr);
+        }
+        let (ptr, llvm_type) = self.resolve_access_ptr(nodes)?;
+        self.load_from_ptr(&ptr, &llvm_type)
+    }
+
+    fn try_compile_member_call(&mut self, nodes: &[Node]) -> Result<Option<ExprValue>, String> {
+        let (receiver_nodes, method_name, arguments) = match nodes.last() {
+            Some(Node::MemberAccess { member, .. }) => match member.as_ref() {
+                Node::FunctionCall { name, arguments, .. } => {
+                    (&nodes[..nodes.len() - 1], name.as_str(), arguments)
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let receiver_type = if let Ok((_, llvm_type)) = self.resolve_access_ptr(receiver_nodes) {
+            llvm_type
+        } else {
+            self.compile_expr(&Node::Access {
+                nodes: receiver_nodes.to_vec(),
+            })?
+            .llvm_type
+        };
+
+        let struct_name = match receiver_type {
+            LlvmType::Struct(name) => name,
+            other => {
+                return Err(format!(
+                    "method `{}` requires a struct receiver, found `{}`",
+                    method_name,
+                    other.ir()
+                ))
+            }
+        };
+
+        let signature_key = format!("{}::{}", struct_name, method_name);
         let signature = self
             .signatures
-            .get(name)
+            .get(&signature_key)
             .cloned()
-            .ok_or_else(|| format!("unknown function `{}` in LLVM backend", name))?;
+            .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, struct_name))?;
 
-        let provided_args = &arguments[0];
+        let receiver_ptr = match self.resolve_access_ptr(receiver_nodes) {
+            Ok((ptr, _)) => ptr,
+            Err(_) => {
+                let temp_var =
+                    self.emit_heap_alloc(LlvmType::Struct(struct_name.clone()), "receiver_tmp");
+                let receiver_expr = self.compile_expr(&Node::Access {
+                    nodes: receiver_nodes.to_vec(),
+                })?;
+                self.emit_store(&temp_var, &receiver_expr);
+                temp_var
+            }
+        };
+
+        let first_args = arguments
+            .first()
+            .ok_or_else(|| "method call is missing its first argument group".to_string())?;
+        if first_args.len() != signature.parameters.len() {
+            return Err(format!(
+                "method `{}` expects {} arguments, got {}",
+                method_name,
+                signature.parameters.len(),
+                first_args.len()
+            ));
+        }
+        let mut arg_parts = vec![format!("ptr {}", receiver_ptr)];
+        for (arg_node, expected_type) in first_args.iter().zip(signature.parameters.iter()) {
+            let arg = self.compile_expr_with_expected(arg_node, Some(expected_type))?;
+            let arg = self.coerce_expr(arg, expected_type, "method argument")?;
+            arg_parts.push(format!("{} {}", arg.llvm_type.ir(), arg.value));
+        }
+
+        let mut current = if signature.return_type == LlvmType::Void {
+            self.emit_line(format!(
+                "call void @{}({})",
+                signature.symbol_name,
+                arg_parts.join(", ")
+            ));
+            ExprValue {
+                llvm_type: LlvmType::Void,
+                value: "void".to_string(),
+            }
+        } else {
+            let temp = self.next_temp();
+            self.emit_line(format!(
+                "{} = call {} @{}({})",
+                temp,
+                signature.return_type.ir(),
+                signature.symbol_name,
+                arg_parts.join(", ")
+            ));
+            ExprValue {
+                llvm_type: signature.return_type,
+                value: temp,
+            }
+        };
+
+        for arg_group in arguments.iter().skip(1) {
+            current = self.compile_closure_call(current, arg_group, "method call")?;
+        }
+
+        Ok(Some(current))
+    }
+
+    fn compile_length_member(&mut self, nodes: &[Node]) -> Result<Option<ExprValue>, String> {
+        if let Some(Node::MemberAccess { member, .. }) = nodes.last() {
+            if let Node::Identifier(name) = member.as_ref() {
+                if name == "len" {
+                    let mut current = self.access_base_type(nodes)?;
+                    for node in &nodes[1..nodes.len() - 1] {
+                        current = self.apply_access_type_step(current, node)?;
+                    }
+                    return match current {
+                        LlvmType::Array { len, .. } => Ok(Some(ExprValue {
+                            llvm_type: LlvmType::I32,
+                            value: len.to_string(),
+                        })),
+                        LlvmType::Slice { .. } => {
+                            let (ptr, llvm_type) = self.resolve_access_ptr(&nodes[..nodes.len() - 1])?;
+                            let slice_value = self.load_from_ptr(&ptr, &llvm_type)?;
+                            Ok(Some(self.extract_slice_len(&slice_value)?))
+                        }
+                        other => Err(format!(
+                            "member `len` is only available on arrays and slices in LLVM backend, found `{}`",
+                            other.ir()
+                        )),
+                    };
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn access_base_type(&self, nodes: &[Node]) -> Result<LlvmType, String> {
+        match nodes.first() {
+            Some(Node::Identifier(name)) => self
+                .lookup_local(name)
+                .map(|local| local.llvm_type.clone())
+                .ok_or_else(|| format!("unknown variable `{}` in LLVM backend", name)),
+            _ => Err("LLVM backend currently supports only identifier-rooted access".to_string()),
+        }
+    }
+
+    fn apply_access_type_step(&self, current: LlvmType, node: &Node) -> Result<LlvmType, String> {
+        match node {
+            Node::ArrayAccess { coordinates } => {
+                let mut current = current;
+                for _ in coordinates {
+                    current = match current {
+                        LlvmType::Array { elem_type, .. } => *elem_type,
+                        LlvmType::Slice { elem_type } => *elem_type,
+                        other => {
+                            return Err(format!(
+                                "cannot index non-array type `{}` in LLVM backend",
+                                other.ir()
+                            ))
+                        }
+                    };
+                }
+                Ok(current)
+            }
+            Node::SliceAccess { .. } => match current {
+                LlvmType::Array { elem_type, .. } => Ok(LlvmType::Slice { elem_type }),
+                LlvmType::Slice { elem_type } => Ok(LlvmType::Slice { elem_type }),
+                other => Err(format!(
+                    "cannot take a slice of `{}` in LLVM backend",
+                    other.ir()
+                )),
+            },
+            Node::MemberAccess { member, .. } => match member.as_ref() {
+                Node::Identifier(name) if name == "len" => Ok(current),
+                Node::Identifier(name) => match current {
+                    LlvmType::Struct(struct_name) => self
+                        .struct_field_info(&struct_name, name)
+                        .map(|(_, field_type)| field_type)
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown field `{}` on struct `{}` in LLVM backend",
+                                name, struct_name
+                            )
+                        }),
+                    other => Err(format!(
+                        "member `{}` is not available on `{}` in LLVM backend",
+                        name,
+                        other.ir()
+                    )),
+                },
+                Node::FunctionCall { .. } => Ok(current),
+                other => Err(format!(
+                    "LLVM backend does not support member access `{:?}` yet",
+                    other
+                )),
+            },
+            other => Err(format!(
+                "LLVM backend does not support access step `{:?}` yet",
+                other
+            )),
+        }
+    }
+
+    fn resolve_access_ptr(&mut self, nodes: &[Node]) -> Result<(String, LlvmType), String> {
+        let (mut ptr, mut current_type) = match nodes.first() {
+            Some(Node::Identifier(name)) => {
+                let local = self
+                    .lookup_local(name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown variable `{}` in LLVM backend", name))?;
+                (local.ptr, local.llvm_type)
+            }
+            _ => {
+                return Err(
+                    "LLVM backend currently supports only identifier-rooted access".to_string()
+                )
+            }
+        };
+
+        for node in &nodes[1..] {
+            match node {
+                Node::ArrayAccess { coordinates } => {
+                    for coordinate in coordinates {
+                        let index = self.compile_expr(coordinate)?;
+                        let index = self.coerce_expr(index, &LlvmType::I64, "array index")?;
+                        match current_type.clone() {
+                            LlvmType::Array { elem_type, .. } => {
+                                let temp = self.next_temp();
+                                self.emit_line(format!(
+                                    "{} = getelementptr inbounds {}, ptr {}, i64 0, i64 {}",
+                                    temp,
+                                    current_type.ir(),
+                                    ptr,
+                                    index.value
+                                ));
+                                ptr = temp;
+                                current_type = *elem_type;
+                            }
+                            LlvmType::Slice { elem_type } => {
+                                let slice_value = self.load_from_ptr(&ptr, &current_type)?;
+                                let data_ptr = self.extract_slice_data(&slice_value)?;
+                                let temp = self.next_temp();
+                                self.emit_line(format!(
+                                    "{} = getelementptr inbounds {}, ptr {}, i64 {}",
+                                    temp,
+                                    elem_type.ir(),
+                                    data_ptr,
+                                    index.value
+                                ));
+                                ptr = temp;
+                                current_type = *elem_type;
+                            }
+                            other => {
+                                return Err(format!(
+                                    "cannot index non-array type `{}` in LLVM backend",
+                                    other.ir()
+                                ))
+                            }
+                        }
+                    }
+                }
+                Node::SliceAccess { start, end } => {
+                    let slice_value = self.compile_slice_from_ptr(
+                        &ptr,
+                        &current_type,
+                        start.as_deref(),
+                        end.as_deref(),
+                    )?;
+                    let slice_ptr = self.emit_alloca(slice_value.llvm_type.clone(), "slice_tmp");
+                    self.emit_store(&slice_ptr, &slice_value);
+                    ptr = slice_ptr;
+                    current_type = slice_value.llvm_type;
+                }
+                Node::MemberAccess { member, .. } => match member.as_ref() {
+                    Node::Identifier(name) if name == "len" => break,
+                    Node::Identifier(name) => match current_type.clone() {
+                        LlvmType::Struct(struct_name) => {
+                            let (field_index, field_type) = self
+                                .struct_field_info(&struct_name, name)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "unknown field `{}` on struct `{}` in LLVM backend",
+                                        name, struct_name
+                                    )
+                                })?;
+                            let temp = self.next_temp();
+                            self.emit_line(format!(
+                                "{} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
+                                temp,
+                                current_type.ir(),
+                                ptr,
+                                field_index
+                            ));
+                            ptr = temp;
+                            current_type = field_type;
+                        }
+                        other => {
+                            return Err(format!(
+                                "member `{}` is not available on `{}` in LLVM backend",
+                                name,
+                                other.ir()
+                            ))
+                        }
+                    },
+                    Node::FunctionCall { .. } => break,
+                    other => {
+                        return Err(format!(
+                            "LLVM backend does not support member access `{:?}` yet",
+                            other
+                        ))
+                    }
+                },
+                other => {
+                    return Err(format!(
+                        "LLVM backend does not support access step `{:?}` yet",
+                        other
+                    ))
+                }
+            }
+        }
+
+        Ok((ptr, current_type))
+    }
+
+    fn struct_field_info(&self, struct_name: &str, field_name: &str) -> Option<(usize, LlvmType)> {
+        self.structs.get(struct_name).and_then(|layout| {
+            layout
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, (name, _))| name == field_name)
+                .map(|(index, (_, llvm_type))| (index, llvm_type.clone()))
+        })
+    }
+
+    fn visible_locals(&self) -> Vec<(String, LocalVar)> {
+        let mut locals = BTreeMap::<String, LocalVar>::new();
+        for scope in &self.scopes {
+            for (name, local) in scope {
+                locals.insert(name.clone(), local.clone());
+            }
+        }
+        locals.into_iter().collect()
+    }
+
+    fn compile_lambda_expr(
+        &mut self,
+        parameters: &[(String, Type)],
+        return_type: &Type,
+        body: &[Node],
+        expected: Option<&LlvmType>,
+    ) -> Result<ExprValue, String> {
+        let function_type = match expected {
+            Some(LlvmType::Function {
+                parameters,
+                return_type,
+            }) => LlvmType::Function {
+                parameters: parameters.clone(),
+                return_type: return_type.clone(),
+            },
+            Some(other) => {
+                return Err(format!(
+                    "lambda expression cannot initialize `{}` in LLVM backend",
+                    other.ir()
+                ))
+            }
+            None => LlvmType::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|(_, sk_type)| llvm_type(sk_type, self.structs))
+                    .collect::<Result<Vec<_>, _>>()?,
+                return_type: Box::new(llvm_type(return_type, self.structs)?),
+            },
+        };
+
+        let visible_locals = self.visible_locals();
+        let captures = visible_locals
+            .iter()
+            .map(|(name, local)| (name.clone(), local.llvm_type.clone()))
+            .collect::<Vec<_>>();
+
+        let lambda_id = *self.lambda_counter;
+        *self.lambda_counter += 1;
+        let symbol_name = format!("skunk_lambda_{}_{}", sanitize_name(self.function_name), lambda_id);
+        let env_type_name = format!("{}_env", symbol_name);
+        let env = ClosureEnv {
+            type_name: env_type_name.clone(),
+            captures: captures.clone(),
+        };
+
+        let env_fields = if captures.is_empty() {
+            String::new()
+        } else {
+            vec!["ptr"; captures.len()].join(", ")
+        };
+        self.extra_type_decls.push(format!(
+            "%env.{} = type {{ {} }}",
+            sanitize_name(&env.type_name),
+            env_fields
+        ));
+
+        let lambda_return_type = match &function_type {
+            LlvmType::Function { return_type, .. } => return_type.as_ref().clone(),
+            _ => unreachable!(),
+        };
+
+        let nested_compiler = FunctionCompiler::new(
+            &symbol_name,
+            lambda_return_type.clone(),
+            self.signatures,
+            self.structs,
+            self.globals,
+            self.extra_type_decls,
+            self.extra_function_irs,
+            self.lambda_counter,
+            Some(env.clone()),
+        );
+        let body_lines = nested_compiler.compile(parameters, body)?;
+        let param_defs = parameters
+            .iter()
+            .enumerate()
+            .map(|(index, (_, ty))| Ok(format!("{} %arg{}", llvm_type(ty, self.structs)?.ir(), index + 1)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut function_ir = String::new();
+        let _ = writeln!(
+            function_ir,
+            "define {} @{}({}) {{",
+            lambda_return_type.ir(),
+            symbol_name,
+            std::iter::once("ptr %env".to_string())
+                .chain(param_defs.into_iter())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let _ = writeln!(function_ir, "entry:");
+        for line in body_lines {
+            let _ = writeln!(function_ir, "{}", line);
+        }
+        let _ = writeln!(function_ir, "}}");
+        self.extra_function_irs.push(function_ir);
+
+        let env_ptr = if visible_locals.is_empty() {
+            "null".to_string()
+        } else {
+            let env_size = captures.len() * 8;
+            let env_ptr = self.next_temp();
+            self.emit_line(format!("{} = call ptr @malloc(i64 {})", env_ptr, env_size));
+            for (index, (_, local)) in visible_locals.iter().enumerate() {
+                let field_ptr = self.next_temp();
+                self.emit_line(format!(
+                    "{} = getelementptr inbounds %env.{}, ptr {}, i32 0, i32 {}",
+                    field_ptr,
+                    sanitize_name(&env.type_name),
+                    env_ptr,
+                    index
+                ));
+                self.emit_line(format!(
+                    "store ptr {}, ptr {}, align 8",
+                    local.ptr, field_ptr
+                ));
+            }
+            env_ptr
+        };
+
+        let with_fn = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, ptr @{}, 0",
+            with_fn,
+            function_type.ir(),
+            symbol_name
+        ));
+        let full = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} {}, ptr {}, 1",
+            full,
+            function_type.ir(),
+            with_fn,
+            env_ptr
+        ));
+        Ok(ExprValue {
+            llvm_type: function_type,
+            value: full,
+        })
+    }
+
+    fn compile_direct_call(
+        &mut self,
+        display_name: &str,
+        signature: &FunctionSignature,
+        provided_args: &[Node],
+        context: &str,
+    ) -> Result<ExprValue, String> {
         if provided_args.len() != signature.parameters.len() {
             return Err(format!(
-                "function `{}` expects {} arguments, got {}",
-                name,
+                "{} `{}` expects {} arguments, got {}",
+                context,
+                display_name,
                 signature.parameters.len(),
                 provided_args.len()
             ));
@@ -617,15 +1693,15 @@ impl<'a> FunctionCompiler<'a> {
 
         let mut arg_parts = Vec::with_capacity(provided_args.len());
         for (arg_node, expected_type) in provided_args.iter().zip(signature.parameters.iter()) {
-            let arg = self.compile_expr(arg_node)?;
-            let arg = self.coerce_expr(arg, expected_type, "function argument")?;
+            let arg = self.compile_expr_with_expected(arg_node, Some(expected_type))?;
+            let arg = self.coerce_expr(arg, expected_type, &format!("{} argument", context))?;
             arg_parts.push(format!("{} {}", arg.llvm_type.ir(), arg.value));
         }
 
         if signature.return_type == LlvmType::Void {
             self.emit_line(format!(
-                "call void @skunk_{}({})",
-                name,
+                "call void @{}({})",
+                signature.symbol_name,
                 arg_parts.join(", ")
             ));
             Ok(ExprValue {
@@ -635,17 +1711,129 @@ impl<'a> FunctionCompiler<'a> {
         } else {
             let temp = self.next_temp();
             self.emit_line(format!(
-                "{} = call {} @skunk_{}({})",
+                "{} = call {} @{}({})",
                 temp,
                 signature.return_type.ir(),
-                name,
+                signature.symbol_name,
                 arg_parts.join(", ")
             ));
             Ok(ExprValue {
-                llvm_type: signature.return_type,
+                llvm_type: signature.return_type.clone(),
                 value: temp,
             })
         }
+    }
+
+    fn compile_closure_call(
+        &mut self,
+        callee: ExprValue,
+        provided_args: &[Node],
+        context: &str,
+    ) -> Result<ExprValue, String> {
+        let (parameters, return_type) = match &callee.llvm_type {
+            LlvmType::Function {
+                parameters,
+                return_type,
+            } => (parameters.clone(), return_type.as_ref().clone()),
+            other => {
+                return Err(format!(
+                    "{} requires a function value, found `{}`",
+                    context,
+                    other.ir()
+                ))
+            }
+        };
+
+        if provided_args.len() != parameters.len() {
+            return Err(format!(
+                "{} expects {} arguments, got {}",
+                context,
+                parameters.len(),
+                provided_args.len()
+            ));
+        }
+
+        let fn_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, 0",
+            fn_ptr,
+            callee.llvm_type.ir(),
+            callee.value
+        ));
+        let env_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, 1",
+            env_ptr,
+            callee.llvm_type.ir(),
+            callee.value
+        ));
+
+        let mut arg_parts = vec![format!("ptr {}", env_ptr)];
+        for (arg_node, expected_type) in provided_args.iter().zip(parameters.iter()) {
+            let arg = self.compile_expr_with_expected(arg_node, Some(expected_type))?;
+            let arg = self.coerce_expr(arg, expected_type, "function argument")?;
+            arg_parts.push(format!("{} {}", arg.llvm_type.ir(), arg.value));
+        }
+
+        if return_type == LlvmType::Void {
+            self.emit_line(format!(
+                "call void {}({})",
+                fn_ptr,
+                arg_parts.join(", ")
+            ));
+            Ok(ExprValue {
+                llvm_type: LlvmType::Void,
+                value: "void".to_string(),
+            })
+        } else {
+            let temp = self.next_temp();
+            self.emit_line(format!(
+                "{} = call {} {}({})",
+                temp,
+                return_type.ir(),
+                fn_ptr,
+                arg_parts.join(", ")
+            ));
+            Ok(ExprValue {
+                llvm_type: return_type,
+                value: temp,
+            })
+        }
+    }
+
+    fn compile_function_call(
+        &mut self,
+        name: &str,
+        arguments: &[Vec<Node>],
+    ) -> Result<ExprValue, String> {
+        if let Some(local) = self.lookup_local(name).cloned() {
+            return match local.llvm_type {
+                LlvmType::Function { .. } => {
+                    let mut current = self.load_from_ptr(&local.ptr, &local.llvm_type)?;
+                    for arg_group in arguments {
+                        current = self.compile_closure_call(current, arg_group, "function call")?;
+                    }
+                    Ok(current)
+                }
+                other => Err(format!(
+                    "`{}` is not callable in LLVM backend; found `{}`",
+                    name,
+                    other.ir()
+                )),
+            };
+        }
+
+        let signature = self
+            .signatures
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown function `{}` in LLVM backend", name))?;
+
+        let mut current = self.compile_direct_call(name, &signature, &arguments[0], "function")?;
+        for arg_group in arguments.iter().skip(1) {
+            current = self.compile_closure_call(current, arg_group, "function call")?;
+        }
+        Ok(current)
     }
 
     fn compile_binary_expr(
@@ -843,32 +2031,30 @@ impl<'a> FunctionCompiler<'a> {
             .lookup_local(name)
             .cloned()
             .ok_or_else(|| format!("unknown variable `{}` in LLVM backend", name))?;
-        let temp = self.next_temp();
-        self.emit_line(format!(
-            "{} = load {}, ptr {}, align {}",
-            temp,
-            local.llvm_type.ir(),
-            local.ptr,
-            Self::align_of(&local.llvm_type)
-        ));
-        Ok(ExprValue {
-            llvm_type: local.llvm_type,
-            value: temp,
-        })
+        self.load_from_ptr(&local.ptr, &local.llvm_type)
     }
 
-    fn resolve_local_from_access(&self, node: &Node) -> Result<LocalVar, String> {
+    fn resolve_local_from_access(&mut self, node: &Node) -> Result<LocalVar, String> {
         match node {
-            Node::Access { nodes } if nodes.len() == 1 => match &nodes[0] {
-                Node::Identifier(name) => self
-                    .lookup_local(name)
-                    .cloned()
-                    .ok_or_else(|| format!("unknown variable `{}` in LLVM backend", name)),
-                _ => Err("LLVM backend currently supports only plain variable assignments"
-                    .to_string()),
-            },
-            _ => Err("LLVM backend currently supports only plain variable assignments"
-                .to_string()),
+            Node::Access { nodes } => {
+                if let Some(Node::MemberAccess { member, .. }) = nodes.last() {
+                    match member.as_ref() {
+                        Node::Identifier(name) if name == "len" => {
+                            return Err("cannot assign to array length".to_string())
+                        }
+                        Node::FunctionCall { .. } => {
+                            return Err("cannot assign to a method call result".to_string())
+                        }
+                        _ => {}
+                    }
+                }
+                if matches!(nodes.last(), Some(Node::SliceAccess { .. })) {
+                    return Err("cannot assign to a slice expression".to_string());
+                }
+                let (ptr, llvm_type) = self.resolve_access_ptr(nodes)?;
+                Ok(LocalVar { ptr, llvm_type })
+            }
+            _ => Err("LLVM backend currently supports only access assignments".to_string()),
         }
     }
 
@@ -910,6 +2096,22 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: LlvmType::PtrI8,
                 value: "null".to_string(),
             },
+            LlvmType::Struct(_) => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
+            LlvmType::Function { .. } => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
+            LlvmType::Slice { .. } => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
+            LlvmType::Array { .. } => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
             LlvmType::Void => ExprValue {
                 llvm_type: LlvmType::Void,
                 value: "void".to_string(),
@@ -929,6 +2131,38 @@ impl<'a> FunctionCompiler<'a> {
 
         let temp = self.next_temp();
         let line = match (&value.llvm_type, expected) {
+            (LlvmType::Struct(_), LlvmType::Struct(_)) => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
+            (LlvmType::Array { .. }, LlvmType::Array { .. }) => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
+            (LlvmType::Function { .. }, LlvmType::Function { .. }) => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
+            (LlvmType::Slice { .. }, LlvmType::Slice { .. }) => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
             (LlvmType::I8, LlvmType::I16) => format!("{} = sext i8 {} to i16", temp, value.value),
             (LlvmType::I8, LlvmType::I32) => format!("{} = sext i8 {} to i32", temp, value.value),
             (LlvmType::I8, LlvmType::I64) => format!("{} = sext i8 {} to i64", temp, value.value),
@@ -989,7 +2223,7 @@ impl<'a> FunctionCompiler<'a> {
             expr.llvm_type.ir(),
             expr.value,
             ptr,
-            Self::align_of(&expr.llvm_type)
+            self.align_of(&expr.llvm_type)
         ));
     }
 
@@ -1000,7 +2234,18 @@ impl<'a> FunctionCompiler<'a> {
             "{} = alloca {}, align {}",
             ptr,
             llvm_type.ir(),
-            Self::align_of(&llvm_type)
+            self.align_of(&llvm_type)
+        ));
+        ptr
+    }
+
+    fn emit_heap_alloc(&mut self, llvm_type: LlvmType, hint: &str) -> String {
+        let ptr = format!("%{}_{}", sanitize_name(hint), self.temp_counter);
+        self.temp_counter += 1;
+        self.emit_line(format!(
+            "{} = call ptr @malloc(i64 {})",
+            ptr,
+            self.size_of(&llvm_type)
         ));
         ptr
     }
@@ -1044,13 +2289,68 @@ impl<'a> FunctionCompiler<'a> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
-    fn align_of(llvm_type: &LlvmType) -> usize {
+    fn align_of(&self, llvm_type: &LlvmType) -> usize {
         match llvm_type {
             LlvmType::I8 | LlvmType::I1 => 1,
             LlvmType::I16 | LlvmType::Char16 => 2,
             LlvmType::I32 | LlvmType::F32 => 4,
             LlvmType::I64 | LlvmType::F64 | LlvmType::PtrI8 => 8,
+            LlvmType::Function { .. } => 8,
+            LlvmType::Struct(name) => self
+                .structs
+                .get(name)
+                .map(|layout| {
+                    layout
+                        .fields
+                        .iter()
+                        .map(|(_, field_type)| self.align_of(field_type))
+                        .max()
+                        .unwrap_or(1)
+                })
+                .unwrap_or(8),
+            LlvmType::Slice { .. } => 8,
+            LlvmType::Array { elem_type, .. } => self.align_of(elem_type),
             LlvmType::Void => 1,
+        }
+    }
+
+    fn size_of(&self, llvm_type: &LlvmType) -> usize {
+        match llvm_type {
+            LlvmType::I8 | LlvmType::I1 => 1,
+            LlvmType::I16 | LlvmType::Char16 => 2,
+            LlvmType::I32 | LlvmType::F32 => 4,
+            LlvmType::I64 | LlvmType::F64 | LlvmType::PtrI8 => 8,
+            LlvmType::Function { .. } => 16,
+            LlvmType::Slice { .. } => 16,
+            LlvmType::Array { elem_type, len } => self.size_of(elem_type) * len,
+            LlvmType::Struct(name) => {
+                let Some(layout) = self.structs.get(name) else {
+                    return 8;
+                };
+                let mut offset = 0usize;
+                let mut max_align = 1usize;
+                for (_, field_type) in &layout.fields {
+                    let align = self.align_of(field_type);
+                    max_align = max_align.max(align);
+                    offset = align_up(offset, align);
+                    offset += self.size_of(field_type);
+                }
+                align_up(offset, max_align)
+            }
+            LlvmType::Void => 1,
+        }
+    }
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        value
+    } else {
+        let rem = value % align;
+        if rem == 0 {
+            value
+        } else {
+            value + (align - rem)
         }
     }
 }
@@ -1115,8 +2415,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         }
     };
 
+    let structs = collect_struct_layouts(statements)?;
     let mut signatures = HashMap::<String, FunctionSignature>::new();
-    let mut functions = Vec::<&Node>::new();
+    let mut functions = Vec::<FunctionPlan>::new();
 
     for statement in statements {
         match statement {
@@ -1124,32 +2425,81 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 name,
                 parameters,
                 return_type,
+                body,
                 ..
             } => {
                 let params = parameters
                     .iter()
-                    .map(|(_, ty)| llvm_type(ty))
+                    .map(|(_, ty)| llvm_type(ty, &structs))
                     .collect::<Result<Vec<_>, _>>()?;
-                let return_type = llvm_type(return_type)?;
+                let llvm_return_type = llvm_type(return_type, &structs)?;
                 signatures.insert(
                     name.clone(),
                     FunctionSignature {
-                        return_type,
+                        symbol_name: format!("skunk_{}", name),
+                        return_type: llvm_return_type,
                         parameters: params,
                     },
                 );
-                functions.push(statement);
+                functions.push(FunctionPlan {
+                    symbol_name: format!("skunk_{}", name),
+                    parameters: parameters.clone(),
+                    return_type: return_type.clone(),
+                    body: body.clone(),
+                    is_method: false,
+                });
             }
             Node::EOI => {}
-            Node::StructDeclaration { .. } => {
-                return Err(
-                    "LLVM backend does not support structs yet; the interpreter still does"
-                        .to_string(),
-                );
+            Node::StructDeclaration {
+                name,
+                functions: struct_functions,
+                ..
+            } => {
+                for function in struct_functions {
+                    if let Node::FunctionDeclaration {
+                        name: method_name,
+                        parameters,
+                        return_type,
+                        body,
+                        ..
+                    } = function
+                    {
+                        let mut parameter_types = Vec::new();
+                        let mut compile_params = Vec::new();
+                        for (param_name, param_type) in parameters {
+                            if *param_type == Type::SkSelf {
+                                continue;
+                            }
+                            parameter_types.push(llvm_type(param_type, &structs)?);
+                            compile_params.push((param_name.clone(), param_type.clone()));
+                        }
+                        let llvm_return_type = llvm_type(return_type, &structs)?;
+                        let key = format!("{}::{}", name, method_name);
+                        let symbol_name =
+                            format!("skunk_{}_{}", sanitize_name(name), sanitize_name(method_name));
+                        signatures.insert(
+                            key,
+                            FunctionSignature {
+                                symbol_name: symbol_name.clone(),
+                                return_type: llvm_return_type.clone(),
+                                parameters: parameter_types,
+                            },
+                        );
+                        let mut method_params = vec![("self".to_string(), Type::Custom(name.clone()))];
+                        method_params.extend(compile_params);
+                        functions.push(FunctionPlan {
+                            symbol_name,
+                            parameters: method_params,
+                            return_type: return_type.clone(),
+                            body: body.clone(),
+                            is_method: true,
+                        });
+                    }
+                }
             }
             other => {
                 return Err(format!(
-                    "LLVM backend currently expects top-level function declarations only, found `{:?}`",
+                    "LLVM backend currently expects top-level function declarations and struct declarations only, found `{:?}`",
                     other
                 ))
             }
@@ -1161,40 +2511,57 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     }
 
     let mut globals = Vec::<GlobalString>::new();
+    let mut extra_type_decls = Vec::<String>::new();
     let mut function_irs = Vec::<String>::new();
+    let mut extra_function_irs = Vec::<String>::new();
+    let mut lambda_counter = 0usize;
 
-    for function in functions {
-        if let Node::FunctionDeclaration {
-            name,
-            parameters,
-            return_type,
-            body,
-            ..
-        } = function
-        {
-            let return_type = llvm_type(return_type)?;
-            let param_defs = parameters
+    for function in &functions {
+        let llvm_return_type = llvm_type(&function.return_type, &structs)?;
+        let param_defs = if function.is_method {
+            let mut defs = vec![format!("ptr %arg0")];
+            for (index, (_, ty)) in function.parameters.iter().skip(1).enumerate() {
+                defs.push(format!(
+                    "{} %arg{}",
+                    llvm_type(ty, &structs)?.ir(),
+                    index + 1
+                ));
+            }
+            defs
+        } else {
+            function
+                .parameters
                 .iter()
                 .enumerate()
-                .map(|(index, (_, ty))| Ok(format!("{} %arg{}", llvm_type(ty)?.ir(), index)))
-                .collect::<Result<Vec<_>, String>>()?;
-            let compiler = FunctionCompiler::new(name, return_type.clone(), &signatures, &mut globals);
-            let body_lines = compiler.compile(parameters, body)?;
-            let mut function_ir = String::new();
-            let _ = writeln!(
-                function_ir,
-                "define {} @skunk_{}({}) {{",
-                return_type.ir(),
-                name,
-                param_defs.join(", ")
-            );
-            let _ = writeln!(function_ir, "entry:");
-            for line in body_lines {
-                let _ = writeln!(function_ir, "{}", line);
-            }
-            let _ = writeln!(function_ir, "}}");
-            function_irs.push(function_ir);
+                .map(|(index, (_, ty))| Ok(format!("{} %arg{}", llvm_type(ty, &structs)?.ir(), index)))
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        let compiler = FunctionCompiler::new(
+            &function.symbol_name,
+            llvm_return_type.clone(),
+            &signatures,
+            &structs,
+            &mut globals,
+            &mut extra_type_decls,
+            &mut extra_function_irs,
+            &mut lambda_counter,
+            None,
+        );
+        let body_lines = compiler.compile(&function.parameters, &function.body)?;
+        let mut function_ir = String::new();
+        let _ = writeln!(
+            function_ir,
+            "define {} @{}({}) {{",
+            llvm_return_type.ir(),
+            function.symbol_name,
+            param_defs.join(", ")
+        );
+        let _ = writeln!(function_ir, "entry:");
+        for line in body_lines {
+            let _ = writeln!(function_ir, "{}", line);
         }
+        let _ = writeln!(function_ir, "}}");
+        function_irs.push(function_ir);
     }
 
     let main_signature = signatures
@@ -1227,11 +2594,47 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         LlvmType::PtrI8 => {
             return Err("LLVM backend does not support `main` returning string yet".to_string())
         }
+        LlvmType::Function { .. } => {
+            return Err("LLVM backend does not support `main` returning functions yet".to_string())
+        }
+        LlvmType::Slice { .. } => {
+            return Err("LLVM backend does not support `main` returning slices yet".to_string())
+        }
+        LlvmType::Array { .. } => {
+            return Err("LLVM backend does not support `main` returning arrays yet".to_string())
+        }
+        LlvmType::Struct(_) => {
+            return Err("LLVM backend does not support `main` returning structs yet".to_string())
+        }
     };
 
     let mut ir = String::new();
     let _ = writeln!(ir, "declare i32 @printf(ptr, ...)");
+    let _ = writeln!(ir, "declare ptr @malloc(i64)");
     let _ = writeln!(ir);
+    for layout in structs.values() {
+        let field_types = layout
+            .fields
+            .iter()
+            .map(|(_, field_type)| field_type.ir())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            ir,
+            "%struct.{} = type {{ {} }}",
+            sanitize_name(&layout.name),
+            field_types
+        );
+    }
+    if !structs.is_empty() {
+        let _ = writeln!(ir);
+    }
+    for decl in &extra_type_decls {
+        let _ = writeln!(ir, "{}", decl);
+    }
+    if !extra_type_decls.is_empty() {
+        let _ = writeln!(ir);
+    }
     for global in &globals {
         let _ = writeln!(ir, "{}", global.ir_decl());
     }
@@ -1239,6 +2642,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         let _ = writeln!(ir);
     }
     for function_ir in function_irs {
+        let _ = writeln!(ir, "{}", function_ir);
+    }
+    for function_ir in extra_function_irs {
         let _ = writeln!(ir, "{}", function_ir);
     }
     let _ = writeln!(ir, "define i32 @main() {{");
@@ -1251,6 +2657,39 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::type_checker;
+    use std::env;
+    use std::process::Command;
+    use uuid::Uuid;
+
+    fn compile_and_run(source: &str) -> Result<String, String> {
+        let program = ast::parse(source);
+        type_checker::check(&program)?;
+
+        let id = Uuid::new_v4().to_string();
+        let source_path = env::temp_dir().join(format!("skunk_compiler_test_{}.skunk", id));
+        let output_path = env::temp_dir().join(format!("skunk_compiler_test_{}", id));
+        fs::write(&source_path, source)
+            .map_err(|err| format!("failed to write test source: {}", err))?;
+
+        let artifact = compile_to_executable(&program, &source_path, &output_path)?;
+        let output = Command::new(&artifact.binary_path)
+            .output()
+            .map_err(|err| format!("failed to run compiled test binary: {}", err))?;
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&artifact.llvm_ir_path);
+        let _ = fs::remove_file(&artifact.binary_path);
+
+        if !output.status.success() {
+            return Err(format!(
+                "compiled program exited with status {}",
+                output.status
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
 
     #[test]
     fn compiles_basic_program_to_ir() {
@@ -1274,19 +2713,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_structs_for_now() {
+    fn compiles_structs_to_ir() {
         let program = ast::parse(
             r#"
             struct Point {
                 x: int;
+                y: int;
+
+                function sum(self): int {
+                    return self.x + self.y;
+                }
             }
 
-            function main(): void {}
+            function main(): void {
+                p: Point = Point { x: 2, y: 3 };
+                print(p.sum());
+            }
             "#,
         );
 
-        let err = compile_to_llvm_ir(&program).unwrap_err();
-        assert!(err.contains("does not support structs yet"));
+        let ir = compile_to_llvm_ir(&program).unwrap();
+        assert!(ir.contains("%struct.Point = type { i32, i32 }"));
+        assert!(ir.contains("define i32 @skunk_Point_sum(ptr %arg0)"));
+        assert!(ir.contains("insertvalue %struct.Point"));
+        assert!(ir.contains("getelementptr inbounds %struct.Point"));
     }
 
     #[test]
@@ -1309,5 +2759,297 @@ mod tests {
         assert!(ir.contains("define double @skunk_main()"));
         assert!(ir.contains("sitofp i64"));
         assert!(ir.contains("fadd float"));
+    }
+
+    #[test]
+    fn compiles_fixed_arrays_to_ir() {
+        let program = ast::parse(
+            r#"
+            function main(): void {
+                values: [3]int = [1, 2, 3];
+                values[1] = values[0] + 9;
+                print(values[1]);
+                print(values.len);
+            }
+            "#,
+        );
+
+        let ir = compile_to_llvm_ir(&program).unwrap();
+        assert!(ir.contains("[3 x i32]"));
+        assert!(ir.contains("getelementptr inbounds [3 x i32]"));
+        assert!(ir.contains("insertvalue [3 x i32]"));
+    }
+
+    #[test]
+    fn runs_compiled_fixed_array_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                zeros: [3]int;
+                filled: [3]int = [3]int::fill(7);
+                filled[1] = filled[1] + 1;
+                print(zeros[0]);
+                print(filled[1]);
+                print(filled.len);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "0\n8\n3\n");
+    }
+
+    #[test]
+    fn runs_compiled_nested_array_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                matrix: [2][2]int = [
+                    [1, 2],
+                    [3, 4]
+                ];
+                matrix[1][0] = matrix[0][1] + 5;
+                print(matrix[1][0]);
+                print(matrix[0].len);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n2\n");
+    }
+
+    #[test]
+    fn runs_compiled_array_return_and_argument_program() {
+        let stdout = compile_and_run(
+            r#"
+            function make(): [3]int {
+                return [3]int::fill(2);
+            }
+
+            function sum(values: [3]int): int {
+                return values[0] + values[1] + values[2];
+            }
+
+            function main(): void {
+                values: [3]int = make();
+                values[1] = 5;
+                print(sum(values));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "9\n");
+    }
+
+    #[test]
+    fn runs_compiled_struct_field_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            function main(): void {
+                p: Point = Point { x: 1, y: 2 };
+                p.x = p.x + 9;
+                print(p.x);
+                print(p.y);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "10\n2\n");
+    }
+
+    #[test]
+    fn runs_compiled_nested_struct_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            struct Line {
+                start: Point;
+                end: Point;
+            }
+
+            function main(): void {
+                line: Line = Line {
+                    start: Point { x: 3, y: 4 },
+                    end: Point { x: 5, y: 6 }
+                };
+                line.start.x = line.start.x + line.end.y;
+                print(line.start.x);
+                print(line.end.x);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "9\n5\n");
+    }
+
+    #[test]
+    fn runs_compiled_struct_method_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+
+                function set_x(self, x: int): void {
+                    self.x = x;
+                }
+
+                function sum(self): int {
+                    return self.x + self.y;
+                }
+            }
+
+            function main(): void {
+                p: Point = Point { x: 1, y: 2 };
+                p.set_x(10);
+                print(p.sum());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "12\n");
+    }
+
+    #[test]
+    fn runs_compiled_slice_program() {
+        let stdout = compile_and_run(
+            r#"
+            function sum_pair(values: []int): int {
+                pair: []int = values[1:3];
+                return pair[0] + pair[1];
+            }
+
+            function main(): void {
+                values: [5]int = [10, 20, 30, 40, 50];
+                middle: []int = values[1:4];
+                head: []int = values[:2];
+                tail: []int = middle[1:];
+                print(middle.len);
+                print(head[1]);
+                print(tail[0]);
+                print(sum_pair(values[:4]));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "3\n20\n30\n50\n");
+    }
+
+    #[test]
+    fn runs_compiled_slice_literal_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                values: []int = [1, 2, 3];
+                print(values.len);
+                print(values[2]);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "3\n3\n");
+    }
+
+    #[test]
+    fn runs_compiled_lambda_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                id: (int) -> int = function(a: int): int {
+                    return a;
+                };
+                print(id(7));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n");
+    }
+
+    #[test]
+    fn runs_compiled_closure_program() {
+        let stdout = compile_and_run(
+            r#"
+            function counter(): () -> int {
+                c: int = 0;
+                return function(): int {
+                    c = c + 1;
+                    return c;
+                };
+            }
+
+            function main(): void {
+                count: () -> int = counter();
+                print(count());
+                print(count());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "1\n2\n");
+    }
+
+    #[test]
+    fn runs_compiled_recursive_lambda_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                factorial: (int) -> int = function(n: int): int {
+                    if (n == 0) {
+                        return 1;
+                    } else {
+                        return n * factorial(n - 1);
+                    }
+                };
+                print(factorial(5));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "120\n");
+    }
+
+    #[test]
+    fn runs_compiled_method_returning_lambda_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Foo {
+                factor: int;
+
+                function make(self): (int) -> int {
+                    return function(i: int): int {
+                        return self.factor + i;
+                    };
+                }
+            }
+
+            function main(): void {
+                foo: Foo = Foo { factor: 4 };
+                print(foo.make()(3));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n");
     }
 }

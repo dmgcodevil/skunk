@@ -472,6 +472,83 @@ fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
     }
 }
 
+fn is_zero_initializable_type(target: &Type) -> bool {
+    match target {
+        Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::String
+        | Type::Boolean
+        | Type::Char => true,
+        Type::Array { elem_type, .. } => is_zero_initializable_type(elem_type.deref()),
+        _ => false,
+    }
+}
+
+fn evaluate_array_dimensions(
+    dimensions: &[Node],
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+) -> Vec<i64> {
+    let mut int_dimensions = Vec::with_capacity(dimensions.len());
+    for dim_node in dimensions {
+        let dim_val = evaluate_node(dim_node, stack, global_environment);
+        let i = dim_val
+            .map_match(value_as_i64)
+            .expect("expected integer in array size");
+        int_dimensions.push(i);
+    }
+    int_dimensions
+}
+
+fn default_value_for_type(
+    target: &Type,
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+) -> ValueRef {
+    match target {
+        Type::Byte => ValueRef::stack(Value::Byte(0)),
+        Type::Short => ValueRef::stack(Value::Short(0)),
+        Type::Int => ValueRef::stack(Value::Integer(0)),
+        Type::Long => ValueRef::stack(Value::Long(0)),
+        Type::Float => ValueRef::stack(Value::Float(0.0)),
+        Type::Double => ValueRef::stack(Value::Double(0.0)),
+        Type::String => ValueRef::stack(Value::String(String::new())),
+        Type::Boolean => ValueRef::stack(Value::Boolean(false)),
+        Type::Char => ValueRef::stack(Value::Char('\0')),
+        Type::Array {
+            elem_type,
+            dimensions,
+        } => {
+            assert!(
+                is_zero_initializable_type(elem_type.deref()),
+                "array element type {:?} does not have a zero value",
+                elem_type
+            );
+            let int_dimensions = evaluate_array_dimensions(dimensions, stack, global_environment);
+            let size = int_dimensions
+                .iter()
+                .fold(1usize, |acc, dim| acc.saturating_mul(*dim as usize));
+            let mut arr = Vec::with_capacity(size);
+            for _ in 0..size {
+                arr.push(default_value_for_type(
+                    elem_type.deref(),
+                    stack,
+                    global_environment,
+                ));
+            }
+            ValueRef::heap(Value::Array {
+                arr,
+                dimensions: int_dimensions,
+            })
+        }
+        _ => ValueRef::stack(Value::Undefined),
+    }
+}
+
 fn promoted_numeric_value_type(left: &NumericValue, right: &NumericValue) -> Type {
     promoted_numeric_type(&left.sk_type(), &right.sk_type()).unwrap()
 }
@@ -1702,6 +1779,8 @@ pub fn evaluate_node(
         } => {
             let value = if let Some(body) = value {
                 coerce_value_to_type(evaluate_node(body, stack, global_environment), var_type)
+            } else if matches!(var_type, Type::Array { .. }) {
+                default_value_for_type(var_type, stack, global_environment)
             } else {
                 ValueRef::stack(Value::Undefined)
             };
@@ -1821,7 +1900,7 @@ pub fn evaluate_node(
         }
         Node::StaticFunctionCall {
             _type,
-            name: _,
+            name,
             arguments,
             ..
         } => match _type {
@@ -1829,16 +1908,13 @@ pub fn evaluate_node(
                 elem_type,
                 dimensions,
             } => {
-                let mut size: usize = 1;
-                let mut int_dimensions: Vec<i64> = vec![];
-                for dim_node in dimensions {
-                    let dim_val = evaluate_node(dim_node, stack, global_environment);
-                    let i = dim_val
-                        .map_match(value_as_i64)
-                        .expect("expected integer in array size");
-                    int_dimensions.push(i);
-                    size = size * (i) as usize;
+                if name != "fill" && name != "new" {
+                    panic!("unsupported array static method `{}`", name);
                 }
+                let int_dimensions = evaluate_array_dimensions(dimensions, stack, global_environment);
+                let size = int_dimensions
+                    .iter()
+                    .fold(1usize, |acc, dim| acc.saturating_mul(*dim as usize));
                 let mut arr = Vec::with_capacity(size);
                 for _ in 0..size {
                     arr.push(coerce_value_to_type(
@@ -2067,6 +2143,39 @@ mod tests {
          arr: int[2][3] = int[2][3]::new(1);
          arr[1][2] = 2;
          arr[1][2];
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(2), res.get_value());
+    }
+
+    #[test]
+    fn test_prefix_array_fill() {
+        let source_code = r#"
+         arr: [3]int = [3]int::fill(7);
+         arr[2];
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(7), res.get_value());
+    }
+
+    #[test]
+    fn test_zero_initialized_fixed_array() {
+        let source_code = r#"
+         arr: [3]int;
+         arr[1];
+        "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(0), res.get_value());
+    }
+
+    #[test]
+    fn test_prefix_slice_type_runtime() {
+        let source_code = r#"
+         arr: []int = [1, 2, 3];
+         arr[1];
         "#;
         let program = ast::parse(source_code);
         let res = evaluate(&program);

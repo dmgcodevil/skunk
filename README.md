@@ -2,15 +2,15 @@
 
 # Skunk Programming Language
 
-**Skunk** is a statically typed, interpreted programming language designed for simplicity, learning, and extensibility. It provides a clean syntax for working with structured data, control flow, and functions while supporting extensible features like user-defined types and type inference.
+**Skunk** is a statically typed programming language with both an interpreter and an LLVM-based native compiler. It provides a clean syntax for working with structured data, control flow, and functions while supporting extensible features like user-defined types and type inference.
 
 ## Features
 
 - **Basic Types**: `byte`, `short`, `int`, `long`, `float`, `double`, `boolean`, `char`, `string`
 - **User-Defined Structs**: Define custom types with fields and methods
 - **Control Flow**: `if`, `for` loops, and blocks for scoped variable overrides
-- **Arrays**: Support for array initialization, slicing (upcoming), and dynamic resizing
-- **Functions**: First-class functions with support for closures and higher-order programming (upcoming)
+- **Arrays**: Fixed-size arrays with zero initialization, explicit fill initialization, and slice types
+- **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
 - **Type Inference**: Planned for a cleaner developer experience
 - **String Interpolation and Concatenation**: Upcoming for intuitive string operations
@@ -80,10 +80,13 @@ function main(): void {
 ### Arrays
 ```skunk
 function main(): void {
-    arr: int[3] = [1, 2, 3];
-    for (i: int = 0; i < arr.len; i = i + 1) {
-        print(arr[i]);
-    }
+    a: [3]int;
+    b: [3]int = [3]int::fill(7);
+    c: [3]int = [1, 2, 3];
+
+    print(a[0]); // 0
+    print(b[1]); // 7
+    print(c[2]); // 3
 }
 ```
 
@@ -280,23 +283,21 @@ Skunk now includes an LLVM-based compiler path alongside the interpreter.
 Currently supported in `cargo run -- compile ...`:
 
 - Top-level function declarations
-- `int`, `boolean`, and string literals
+- `byte`, `short`, `int`, `long`, `float`, `double`, `boolean`, `char`, and string literals
 - Local variables and assignments
-- Arithmetic and comparisons on integers
+- Arithmetic and comparisons on numeric primitives
 - Boolean logic
 - `if`, `for`, `return`
-- Function calls
+- Function calls, including chained call forms like `f()(1)`
 - `print`
+- Fixed arrays: zero initialization, `::fill(...)`, inline array literals, indexing, assignment, `.len`, and array pass/return by value
+- Structs, field access, nested structs, methods, and method chaining that returns callable values
+- Slices: `[]T`, slice literals, `a[lo:hi]`, omitted bounds, `.len`, indexing, and slice parameters
+- Closures and lambdas, including captured locals, recursive lambdas, returned functions, and methods returning closures
 
-Not compiled yet:
+Current compiler/runtime trade-off:
 
-- Structs
-- Arrays
-- Closures/lambdas
-- Member access
-- Chained function-call forms
-
-Those features still work through the interpreter, and the compiler returns a clear error when it hits one of the unsupported constructs.
+- The native compiler currently heap-allocates local storage that needs to outlive a stack frame for arrays, slices, structs, and closures. This keeps closure and slice semantics working while the runtime is still small, but it also means there is no allocator API or memory reclamation yet.
 
 ## Fibonacci Benchmark
 
