@@ -509,10 +509,6 @@ fn resolve_type(
             for n in body {
                 let t = resolve_type(global_scope, symbol_tables, n, Some(return_type))?;
                 if t.returned {
-                    println!(
-                        "function '{}', return type={:?}, actual={:?}",
-                        name, return_type, t.sk_type
-                    );
                     returned = true;
                     actual_return_type = assert_type(actual_return_type, t.sk_type)?;
                 }
@@ -844,10 +840,6 @@ fn resolve_type(
             let mut res = ResolveResult::returned(Type::Void);
             if let Some(body) = body_opt {
                 res = resolve_type(global_scope, symbol_tables, body, None)?.to_returned();
-                println!(
-                    "return body: {:?}, type={:?}, expected={:?}",
-                    body, res, expected_type_opt
-                );
             }
             if let Some(expected_type) = expected_type_opt {
                 if *expected_type != res.sk_type {

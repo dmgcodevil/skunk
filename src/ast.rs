@@ -213,7 +213,6 @@ impl PestImpl {
     pub fn parse(&self, code: &str) -> Result<Node, String> {
         match SkunkParser::parse(Rule::program, code) {
             Ok(pairs) => {
-                Self::pretty_print(pairs.clone().next().unwrap(), 0);
                 Ok(self.create_ast(pairs.clone().next().unwrap()))
             }
             Err(e) => Err(format!("parser failed: {}", e)),
@@ -626,19 +625,6 @@ impl PestImpl {
             }
             Rule::_type => self.create_type(pair.into_inner().next().unwrap()),
             _ => panic!("unexpected pair {:?}", pair),
-        }
-    }
-
-    fn pretty_print(pair: Pair<Rule>, depth: usize) {
-        println!(
-            "{:indent$}{:?}: `{}`",
-            "",
-            pair.as_rule(),
-            pair.as_str(),
-            indent = depth * 2
-        );
-        for inner_pair in pair.into_inner() {
-            Self::pretty_print(inner_pair, depth + 1);
         }
     }
 

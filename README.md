@@ -239,15 +239,88 @@ Skunk is still under development. For now, you can build and run Skunk programs 
    cd skunk
    ```
 
-2. Build the interpreter:
+2. Build Skunk:
    ```bash
    cargo build
    ```
 
-3. Run a Skunk program:
+3. Interpret a Skunk program:
    ```bash
    cargo run -- examples/hello.skunk
    ```
+
+4. Compile a Skunk program to a native executable with LLVM/Clang:
+   ```bash
+   cargo run -- compile examples/hello.skunk ./hello
+   ./hello
+   ```
+
+## LLVM Compilation Status
+
+Skunk now includes an LLVM-based compiler path alongside the interpreter.
+
+Currently supported in `cargo run -- compile ...`:
+
+- Top-level function declarations
+- `int`, `boolean`, and string literals
+- Local variables and assignments
+- Arithmetic and comparisons on integers
+- Boolean logic
+- `if`, `for`, `return`
+- Function calls
+- `print`
+
+Not compiled yet:
+
+- Structs
+- Arrays
+- Closures/lambdas
+- Member access
+- Chained function-call forms
+
+Those features still work through the interpreter, and the compiler returns a clear error when it hits one of the unsupported constructs.
+
+## Fibonacci Benchmark
+
+To compare the current LLVM compiler path against Python, this repository includes:
+
+- `examples/fibonacci_recursive.skunk`
+- `examples/fibonacci_recursive.py`
+
+Both programs recursively compute and sum the first `N = 35` Fibonacci values.
+
+Build and run the Skunk version:
+
+```bash
+cargo build
+target/debug/skunk compile examples/fibonacci_recursive.skunk /tmp/skunk_fibonacci_recursive
+/tmp/skunk_fibonacci_recursive
+```
+
+Run the Python version:
+
+```bash
+python3 examples/fibonacci_recursive.py
+```
+
+Measured on this machine on March 28, 2026:
+
+- Skunk compile time: `0.53347s`
+- Skunk compiled binary median runtime: `0.066419s`
+- Python median runtime: `1.703019s`
+- Skunk speedup vs Python: `25.64x`
+
+Both programs produced the same result:
+
+```text
+14930351
+```
+
+These numbers are only an example benchmark and will vary by machine, optimization settings, and workload.
+
+## Language Development
+
+Implementation direction and the current language-development contract live in [docs/language-development.md](/Users/dmgcodevil/dev/skunk-llvm/skunk/docs/language-development.md).
 
 ## Contributing
 
@@ -266,4 +339,3 @@ Skunk is open-source and distributed under the MIT License. See `LICENSE` for de
 ---
 
 Happy coding with Skunk! 🦨
-
