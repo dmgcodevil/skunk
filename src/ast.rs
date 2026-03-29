@@ -26,11 +26,20 @@ pub enum Node {
         fields: Vec<(String, Type)>,
         functions: Vec<Node>,
     },
+    EnumDeclaration {
+        name: String,
+        variants: Vec<EnumVariant>,
+    },
     GenericStructDeclaration {
         name: String,
         generic_params: Vec<String>,
         fields: Vec<(String, Type)>,
         functions: Vec<Node>,
+    },
+    GenericEnumDeclaration {
+        name: String,
+        generic_params: Vec<String>,
+        variants: Vec<EnumVariant>,
     },
     VariableDeclaration {
         var_type: Type,
@@ -66,6 +75,10 @@ pub enum Node {
         body: Vec<Node>,               // The body of the `if` or `else if`
         else_if_blocks: Vec<Node>,     // List of else if blocks
         else_block: Option<Vec<Node>>, // Optional else block
+    },
+    Match {
+        value: Box<Node>,
+        cases: Vec<MatchCase>,
     },
     For {
         init: Option<Box<Node>>,      // Initialization is a statement node
@@ -120,6 +133,27 @@ pub enum Node {
     },
     EOI,
     EMPTY,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload_type: Option<Type>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct MatchCase {
+    pub pattern: MatchPattern,
+    pub body: Vec<Node>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum MatchPattern {
+    EnumVariant {
+        enum_type: Option<Type>,
+        variant: String,
+        binding: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -284,6 +318,7 @@ impl PestImpl {
             Rule::expression => self.create_expression(pair),
             Rule::assignment => self.create_assignment(pair),
             Rule::struct_decl => self.create_struct_decl(pair),
+            Rule::enum_decl => self.create_enum_decl(pair),
             Rule::var_decl => self.create_var_decl(pair),
             Rule::var_decl_stmt => self.create_var_decl(pair.into_inner().next().unwrap()),
             Rule::func_decl => self.create_func_decl(pair),
@@ -320,6 +355,7 @@ impl PestImpl {
                 match p.as_rule() {
                     Rule::if_expr => self.create_if_expr(p),
                     Rule::for_expr => self.create_for_classic(p),
+                    Rule::match_expr => self.create_match_expr(p),
                     _ => panic!("unsupported control flow"),
                 }
             }
@@ -831,6 +867,52 @@ impl PestImpl {
         }
     }
 
+    fn create_match_expr(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::match_expr);
+        let mut inner_pairs = pair.into_inner();
+        let value = self.create_ast(inner_pairs.next().unwrap());
+        let cases = inner_pairs
+            .map(|case_pair| self.create_match_case(case_pair))
+            .collect();
+        Node::Match {
+            value: Box::new(value),
+            cases,
+        }
+    }
+
+    fn create_match_case(&self, pair: Pair<Rule>) -> MatchCase {
+        assert_eq!(pair.as_rule(), Rule::match_case);
+        let mut inner_pairs = pair.into_inner();
+        let pattern = self.create_match_pattern(inner_pairs.next().unwrap());
+        let body = inner_pairs.map(|p| self.create_ast(p)).collect();
+        MatchCase { pattern, body }
+    }
+
+    fn create_match_pattern(&self, pair: Pair<Rule>) -> MatchPattern {
+        assert_eq!(pair.as_rule(), Rule::match_pattern);
+        self.create_enum_match_pattern(pair.into_inner().next().unwrap())
+    }
+
+    fn create_enum_match_pattern(&self, pair: Pair<Rule>) -> MatchPattern {
+        assert_eq!(pair.as_rule(), Rule::enum_match_pattern);
+        let mut inner_pairs = pair.into_inner().peekable();
+        let enum_type = if inner_pairs
+            .peek()
+            .is_some_and(|p| p.as_rule() == Rule::nominal_type)
+        {
+            Some(self.create_nominal_type(inner_pairs.next().unwrap()))
+        } else {
+            None
+        };
+        let variant = inner_pairs.next().unwrap().as_str().to_string();
+        let binding = inner_pairs.next().map(|p| p.as_str().to_string());
+        MatchPattern::EnumVariant {
+            enum_type,
+            variant,
+            binding,
+        }
+    }
+
     fn create_body(&self, pairs: &mut pest::iterators::Pairs<Rule>) -> Vec<Node> {
         pairs.by_ref().map(|p| self.create_ast(p)).collect()
     }
@@ -906,6 +988,38 @@ impl PestImpl {
                 functions,
             }
         }
+    }
+
+    fn create_enum_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::enum_decl);
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let mut generic_params = Vec::<String>::new();
+        if let Some(peeked) = inner_pairs.peek() {
+            if peeked.as_rule() == Rule::generic_params {
+                generic_params = self.create_generic_params(inner_pairs.next().unwrap());
+            }
+        }
+        let variants = inner_pairs
+            .map(|p| self.create_enum_variant_decl(p))
+            .collect::<Vec<_>>();
+        if generic_params.is_empty() {
+            Node::EnumDeclaration { name, variants }
+        } else {
+            Node::GenericEnumDeclaration {
+                name,
+                generic_params,
+                variants,
+            }
+        }
+    }
+
+    fn create_enum_variant_decl(&self, pair: Pair<Rule>) -> EnumVariant {
+        assert_eq!(pair.as_rule(), Rule::enum_variant_decl);
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let payload_type = inner_pairs.next().map(|p| self.create_type(p));
+        EnumVariant { name, payload_type }
     }
 
     fn create_struct_field_dec(&self, pair: Pair<Rule>) -> (String, Type) {

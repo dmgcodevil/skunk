@@ -13,6 +13,7 @@
 - **Pointers and Allocation**: `*T`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(...)`, `alloc.free(...)`, and `Arena`
 - **Modules and Imports**: `module foo.bar;` and `import foo.bar;` for multi-file Skunk programs
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
+- **Enums and Match**: Generic enums with unit and single-payload variants, plus exhaustive enum-focused `match`
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
 - **Type Inference**: Planned for a cleaner developer experience
 - **String Interpolation and Concatenation**: Upcoming for intuitive string operations
@@ -117,6 +118,30 @@ function main(): void {
     print(a[0]); // 0
     print(b[1]); // 7
     print(c[2]); // 3
+}
+```
+
+### Generic Enums and Match
+```skunk
+enum Option[T] {
+    None;
+    Some(T);
+}
+
+function unwrap(value: Option[int]): int {
+    match (value) {
+        case None: {
+            return 0;
+        }
+        case Some(v): {
+            return v;
+        }
+    }
+}
+
+function main(): void {
+    print(unwrap(Option[int]::None()));
+    print(unwrap(Option[int]::Some(7)));
 }
 ```
 
@@ -349,6 +374,7 @@ Currently supported in `cargo run -- compile ...`:
 - `print`
 - Fixed arrays: zero initialization, `::fill(...)`, inline array literals, indexing, assignment, `.len`, and array pass/return by value
 - Structs, field access, nested structs, methods, and method chaining that returns callable values
+- Generic enums with unit and single-payload variants, plus exhaustive `match`
 - Slices: `[]T`, slice literals, `a[lo:hi]`, omitted bounds, `.len`, indexing, and slice parameters
 - Closures and lambdas, including captured locals, recursive lambdas, returned functions, and methods returning closures
 - Pointers and allocation: `*T`, `System::allocator()`, `Arena::init(...)`, `arena.allocator()`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(ptr)`, and `alloc.free(slice)`

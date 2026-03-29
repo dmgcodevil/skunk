@@ -21,6 +21,18 @@ struct StructSymbol {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+struct EnumVariantSymbol {
+    name: String,
+    payload_type: Option<Type>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct EnumSymbol {
+    name: String,
+    variants: HashMap<String, EnumVariantSymbol>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 struct SymbolTable {
     vars: HashMap<String, Symbol>,
 }
@@ -120,6 +132,7 @@ fn func_decl_node_to_symbol(node: &Node) -> Symbol {
 #[derive(Debug, PartialEq, Clone)]
 struct GlobalScope {
     structs: HashMap<String, StructSymbol>,
+    enums: HashMap<String, EnumSymbol>,
     functions: HashMap<String, Symbol>,
     variables: HashMap<String, Symbol>,
 }
@@ -128,6 +141,7 @@ impl GlobalScope {
     fn new() -> Self {
         GlobalScope {
             structs: HashMap::new(),
+            enums: HashMap::new(),
             functions: HashMap::new(),
             variables: HashMap::new(),
         }
@@ -163,6 +177,26 @@ impl GlobalScope {
                                 (fun_symbol.name.clone(), fun_symbol)
                             })
                             .collect::<HashMap<_, _>>(),
+                    },
+                );
+            }
+            Node::EnumDeclaration { name, variants } => {
+                self.enums.insert(
+                    name.clone(),
+                    EnumSymbol {
+                        name: name.clone(),
+                        variants: variants
+                            .iter()
+                            .map(|variant| {
+                                (
+                                    variant.name.clone(),
+                                    EnumVariantSymbol {
+                                        name: variant.name.clone(),
+                                        payload_type: variant.payload_type.clone(),
+                                    },
+                                )
+                            })
+                            .collect(),
                     },
                 );
             }
@@ -237,6 +271,66 @@ fn expected_fixed_array_length(sk_type: &Type) -> Option<i64> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn enum_symbol_for_type<'a>(
+    global_scope: &'a GlobalScope,
+    sk_type: &Type,
+) -> Option<&'a EnumSymbol> {
+    match sk_type {
+        Type::Custom(name) => global_scope.enums.get(name),
+        _ => None,
+    }
+}
+
+fn resolve_match_pattern(
+    global_scope: &GlobalScope,
+    matched_type: &Type,
+    pattern: &crate::ast::MatchPattern,
+) -> Result<(String, Option<Type>), String> {
+    let enum_symbol = enum_symbol_for_type(global_scope, matched_type).ok_or_else(|| {
+        format!(
+            "match expects an enum value, found `{}`",
+            type_to_string(matched_type)
+        )
+    })?;
+
+    match pattern {
+        crate::ast::MatchPattern::EnumVariant {
+            enum_type,
+            variant,
+            binding,
+        } => {
+            if let Some(enum_type) = enum_type {
+                if enum_type != matched_type {
+                    return Err(format!(
+                        "match pattern expects `{}`, but value has type `{}`",
+                        type_to_string(enum_type),
+                        type_to_string(matched_type)
+                    ));
+                }
+            }
+            let variant_symbol = enum_symbol.variants.get(variant).ok_or_else(|| {
+                format!(
+                    "enum `{}` does not contain variant `{}`",
+                    enum_symbol.name, variant
+                )
+            })?;
+            match (&variant_symbol.payload_type, binding) {
+                (Some(_), None) => {
+                    return Err(format!("variant `{}` requires a payload binding", variant));
+                }
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "unit variant `{}` does not take a payload binding",
+                        variant
+                    ));
+                }
+                _ => {}
+            }
+            Ok((variant.clone(), variant_symbol.payload_type.clone()))
+        }
     }
 }
 
@@ -738,7 +832,7 @@ fn resolve_type(
         Node::StructInitialization { _type, .. } => match _type {
             Type::Custom(name) => {
                 if !global_scope.structs.contains_key(name) {
-                    Err("struct doesn't exist".to_string())
+                    Err(format!("struct `{}` doesn't exist", name))
                 } else {
                     Ok(ResolveResult::new(Type::Custom(name.clone())))
                 }
@@ -746,6 +840,10 @@ fn resolve_type(
             other => Ok(ResolveResult::new(other.clone())),
         },
         Node::StructDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
+        Node::EnumDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
+        Node::GenericStructDeclaration { .. } | Node::GenericEnumDeclaration { .. } => {
+            Ok(ResolveResult::new(Type::Void))
+        }
         Node::FunctionDeclaration {
             name,
             parameters,
@@ -1112,6 +1210,50 @@ fn resolve_type(
                     }
                     return Ok(ResolveResult::new(Type::Allocator));
                 }
+                Type::Custom(custom_name) if global_scope.enums.contains_key(custom_name) => {
+                    let enum_symbol = global_scope.enums.get(custom_name).unwrap();
+                    let variant_symbol = enum_symbol.variants.get(name).ok_or_else(|| {
+                        format!(
+                            "error {}:{}: enum `{}` does not support variant `{}`",
+                            metadata.span.line, metadata.span.start, custom_name, name
+                        )
+                    })?;
+                    match &variant_symbol.payload_type {
+                        Some(payload_type) => {
+                            if arguments.len() != 1 {
+                                return Err(format!(
+                                    "error {}:{}: enum variant `{}` expects one argument",
+                                    metadata.span.line, metadata.span.start, name
+                                ));
+                            }
+                            let arg_type = resolve_type(
+                                global_scope,
+                                symbol_tables,
+                                &arguments[0],
+                                Some(payload_type),
+                            )?;
+                            if !is_assignable(payload_type, &arg_type.sk_type) {
+                                return Err(format!(
+                                    "error {}:{}: enum variant `{}` expected `{}` but got `{}`",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    name,
+                                    type_to_string(payload_type),
+                                    type_to_string(&arg_type.sk_type)
+                                ));
+                            }
+                        }
+                        None => {
+                            if !arguments.is_empty() {
+                                return Err(format!(
+                                    "error {}:{}: unit enum variant `{}` expects no arguments",
+                                    metadata.span.line, metadata.span.start, name
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(ResolveResult::new(_type.clone()));
+                }
                 Type::Custom(_) | Type::GenericInstance { .. } => {
                     if name != "create" {
                         return Err(format!(
@@ -1211,6 +1353,69 @@ fn resolve_type(
             } else {
                 returned = false;
             }
+            if returned {
+                Ok(ResolveResult::returned(result))
+            } else {
+                Ok(ResolveResult::new(Type::Void))
+            }
+        }
+        Node::Match { value, cases } => {
+            let matched_type =
+                resolve_type(global_scope, symbol_tables, value, expected_type_opt)?.sk_type;
+            let enum_symbol =
+                enum_symbol_for_type(global_scope, &matched_type).ok_or_else(|| {
+                    format!(
+                        "match expects an enum value, found `{}`",
+                        type_to_string(&matched_type)
+                    )
+                })?;
+            let mut seen_variants = HashMap::<String, bool>::new();
+            let mut returned = true;
+            let mut result = Type::Void;
+
+            for case in cases {
+                let (variant_name, payload_type) =
+                    resolve_match_pattern(global_scope, &matched_type, &case.pattern)?;
+                if seen_variants.insert(variant_name.clone(), true).is_some() {
+                    return Err(format!(
+                        "duplicate match case for variant `{}`",
+                        variant_name
+                    ));
+                }
+                let var_table = symbol_tables.get().clone();
+                symbol_tables.add(var_table);
+                let crate::ast::MatchPattern::EnumVariant { binding, .. } = &case.pattern;
+                if let (Some(binding), Some(payload_type)) = (binding, payload_type) {
+                    symbol_tables.get_mut().add(Symbol {
+                        name: binding.clone(),
+                        sk_type: payload_type,
+                    });
+                }
+                let mut case_returned = false;
+                let mut case_result = Type::Void;
+                for statement in &case.body {
+                    let res =
+                        resolve_type(global_scope, symbol_tables, statement, expected_type_opt)?;
+                    if res.returned {
+                        case_returned = true;
+                        case_result = assert_type(case_result, res.sk_type)?;
+                    }
+                }
+                symbol_tables.pop();
+                if case_returned {
+                    result = assert_type(result, case_result)?;
+                } else {
+                    returned = false;
+                }
+            }
+
+            if seen_variants.len() != enum_symbol.variants.len() {
+                return Err(format!(
+                    "match on `{}` is not exhaustive",
+                    type_to_string(&matched_type)
+                ));
+            }
+
             if returned {
                 Ok(ResolveResult::returned(result))
             } else {
@@ -1927,6 +2132,49 @@ mod tests {
         let source_code = r#"
         function main(): void {
             f: float = 1.5;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_enum_match_is_exhaustive() {
+        let source_code = r#"
+        enum OptionInt {
+            None;
+            Some(int);
+        }
+
+        function unwrap(value: OptionInt): int {
+            match (value) {
+                case None: {
+                    return 0;
+                }
+                case Some(v): {
+                    return v;
+                }
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_enum_match_requires_all_variants() {
+        let source_code = r#"
+        enum OptionInt {
+            None;
+            Some(int);
+        }
+
+        function unwrap(value: OptionInt): int {
+            match (value) {
+                case Some(v): {
+                    return v;
+                }
+            }
         }
         "#;
         let program = ast::parse(source_code);

@@ -19,6 +19,7 @@ enum LlvmType {
     Allocator,
     Arena,
     Struct(String),
+    Enum(String),
     Pointer {
         target_type: Box<LlvmType>,
     },
@@ -51,6 +52,7 @@ impl LlvmType {
             LlvmType::Allocator => "ptr".to_string(),
             LlvmType::Arena => "ptr".to_string(),
             LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
+            LlvmType::Enum(name) => format!("%enum.{}", sanitize_name(name)),
             LlvmType::Pointer { .. } => "ptr".to_string(),
             LlvmType::Function { .. } => "{ ptr, ptr }".to_string(),
             LlvmType::Slice { .. } => "{ ptr, i32 }".to_string(),
@@ -80,6 +82,20 @@ struct FunctionPlan {
 struct StructLayout {
     name: String,
     fields: Vec<(String, LlvmType)>,
+}
+
+#[derive(Clone, Debug)]
+struct EnumVariantLayout {
+    name: String,
+    tag: usize,
+    payload_type: Option<LlvmType>,
+    field_index: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct EnumLayout {
+    name: String,
+    variants: Vec<EnumVariantLayout>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,7 +146,11 @@ fn escape_llvm_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<LlvmType, String> {
+fn llvm_type(
+    sk_type: &Type,
+    structs: &HashMap<String, StructLayout>,
+    enums: &HashMap<String, EnumLayout>,
+) -> Result<LlvmType, String> {
     match sk_type {
         Type::Byte => Ok(LlvmType::I8),
         Type::Short => Ok(LlvmType::I16),
@@ -147,7 +167,7 @@ fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<
             elem_type,
             dimensions,
         } => {
-            let mut llvm_elem = llvm_type(elem_type, structs)?;
+            let mut llvm_elem = llvm_type(elem_type, structs, enums)?;
             for dimension in dimensions.iter().rev() {
                 llvm_elem = LlvmType::Array {
                     elem_type: Box::new(llvm_elem),
@@ -157,10 +177,10 @@ fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<
             Ok(llvm_elem)
         }
         Type::Slice { elem_type } => Ok(LlvmType::Slice {
-            elem_type: Box::new(llvm_type(elem_type, structs)?),
+            elem_type: Box::new(llvm_type(elem_type, structs, enums)?),
         }),
         Type::Pointer { target_type } => Ok(LlvmType::Pointer {
-            target_type: Box::new(llvm_type(target_type, structs)?),
+            target_type: Box::new(llvm_type(target_type, structs, enums)?),
         }),
         Type::Function {
             parameters,
@@ -168,15 +188,17 @@ fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<
         } => Ok(LlvmType::Function {
             parameters: parameters
                 .iter()
-                .map(|param| llvm_type(param, structs))
+                .map(|param| llvm_type(param, structs, enums))
                 .collect::<Result<Vec<_>, _>>()?,
-            return_type: Box::new(llvm_type(return_type, structs)?),
+            return_type: Box::new(llvm_type(return_type, structs, enums)?),
         }),
         Type::Custom(name) => {
             if structs.contains_key(name) {
                 Ok(LlvmType::Struct(name.clone()))
+            } else if enums.contains_key(name) {
+                Ok(LlvmType::Enum(name.clone()))
             } else {
-                Err(format!("unknown struct `{}` in LLVM backend", name))
+                Err(format!("unknown nominal type `{}` in LLVM backend", name))
             }
         }
         Type::Void => Ok(LlvmType::Void),
@@ -208,6 +230,7 @@ fn array_len_from_dimension(dimension: &Node) -> Result<usize, String> {
 
 fn collect_struct_layouts(statements: &[Node]) -> Result<HashMap<String, StructLayout>, String> {
     let mut raw_fields = HashMap::<String, Vec<(String, Type)>>::new();
+    let enum_placeholders = collect_enum_placeholders(statements);
     for statement in statements {
         if let Node::StructDeclaration { name, fields, .. } = statement {
             raw_fields.insert(name.clone(), fields.clone());
@@ -221,7 +244,11 @@ fn collect_struct_layouts(statements: &[Node]) -> Result<HashMap<String, StructL
             .map(|(field_name, field_type)| {
                 Ok((
                     field_name.clone(),
-                    llvm_type(field_type, &layouts_with_raw(raw_fields.keys(), &layouts))?,
+                    llvm_type(
+                        field_type,
+                        &layouts_with_raw(raw_fields.keys(), &layouts),
+                        &enum_placeholders,
+                    )?,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -234,6 +261,67 @@ fn collect_struct_layouts(statements: &[Node]) -> Result<HashMap<String, StructL
         );
     }
     Ok(layouts)
+}
+
+fn collect_enum_layouts(
+    statements: &[Node],
+    structs: &HashMap<String, StructLayout>,
+) -> Result<HashMap<String, EnumLayout>, String> {
+    let mut layouts = HashMap::<String, EnumLayout>::new();
+    let enum_placeholders = collect_enum_placeholders(statements);
+
+    for statement in statements {
+        let Node::EnumDeclaration { name, variants } = statement else {
+            continue;
+        };
+
+        let mut variant_layouts = Vec::new();
+        let mut next_field_index = 1usize;
+        for (tag, variant) in variants.iter().enumerate() {
+            let payload_type = variant
+                .payload_type
+                .as_ref()
+                .map(|payload_type| llvm_type(payload_type, structs, &enum_placeholders))
+                .transpose()?;
+            let field_index = payload_type.as_ref().map(|_| {
+                let current = next_field_index;
+                next_field_index += 1;
+                current
+            });
+            variant_layouts.push(EnumVariantLayout {
+                name: variant.name.clone(),
+                tag,
+                payload_type,
+                field_index,
+            });
+        }
+
+        layouts.insert(
+            name.clone(),
+            EnumLayout {
+                name: name.clone(),
+                variants: variant_layouts,
+            },
+        );
+    }
+
+    Ok(layouts)
+}
+
+fn collect_enum_placeholders(statements: &[Node]) -> HashMap<String, EnumLayout> {
+    statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Node::EnumDeclaration { name, .. } => Some((
+                name.clone(),
+                EnumLayout {
+                    name: name.clone(),
+                    variants: Vec::new(),
+                },
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 fn layouts_with_raw<'a>(
@@ -284,6 +372,7 @@ struct FunctionCompiler<'a> {
     return_type: LlvmType,
     signatures: &'a HashMap<String, FunctionSignature>,
     structs: &'a HashMap<String, StructLayout>,
+    enums: &'a HashMap<String, EnumLayout>,
     globals: &'a mut Vec<GlobalString>,
     extra_type_decls: &'a mut Vec<String>,
     extra_function_irs: &'a mut Vec<String>,
@@ -302,6 +391,7 @@ impl<'a> FunctionCompiler<'a> {
         return_type: LlvmType,
         signatures: &'a HashMap<String, FunctionSignature>,
         structs: &'a HashMap<String, StructLayout>,
+        enums: &'a HashMap<String, EnumLayout>,
         globals: &'a mut Vec<GlobalString>,
         extra_type_decls: &'a mut Vec<String>,
         extra_function_irs: &'a mut Vec<String>,
@@ -313,6 +403,7 @@ impl<'a> FunctionCompiler<'a> {
             return_type,
             signatures,
             structs,
+            enums,
             globals,
             extra_type_decls,
             extra_function_irs,
@@ -354,12 +445,12 @@ impl<'a> FunctionCompiler<'a> {
         for (index, (name, sk_type)) in parameters.iter().enumerate() {
             let arg_name = format!("%arg{}", arg_index);
             if index == 0 && name == "self" {
-                let llvm_type = llvm_type(sk_type, self.structs)?;
+                let llvm_type = llvm_type(sk_type, self.structs, self.enums)?;
                 self.declare_local(name.clone(), arg_name, llvm_type);
                 arg_index += 1;
                 continue;
             }
-            let llvm_type = llvm_type(sk_type, self.structs)?;
+            let llvm_type = llvm_type(sk_type, self.structs, self.enums)?;
             let ptr = self.emit_heap_alloc(llvm_type.clone(), name);
             self.emit_line(format!(
                 "store {} {}, ptr {}, align {}",
@@ -407,7 +498,7 @@ impl<'a> FunctionCompiler<'a> {
                 value,
                 ..
             } => {
-                let llvm_type = llvm_type(var_type, self.structs)?;
+                let llvm_type = llvm_type(var_type, self.structs, self.enums)?;
                 let ptr = self.emit_heap_alloc(llvm_type.clone(), name);
                 self.declare_local(name.clone(), ptr.clone(), llvm_type.clone());
                 let init = match value {
@@ -437,6 +528,7 @@ impl<'a> FunctionCompiler<'a> {
                 else_if_blocks,
                 else_block,
             } => self.compile_if(condition, body, else_if_blocks, else_block.as_deref()),
+            Node::Match { value, cases } => self.compile_match(value, cases),
             Node::For {
                 init,
                 condition,
@@ -532,6 +624,98 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         if then_terminated && else_terminated {
+            self.terminated = true;
+        } else {
+            self.emit_label(&after_label);
+            self.terminated = false;
+        }
+        Ok(())
+    }
+
+    fn compile_match(&mut self, value: &Node, cases: &[ast::MatchCase]) -> Result<(), String> {
+        let matched = self.compile_expr(value)?;
+        let LlvmType::Enum(enum_name) = &matched.llvm_type else {
+            return Err("match expects an enum value in LLVM backend".to_string());
+        };
+        let enum_layout = self
+            .enums
+            .get(enum_name)
+            .ok_or_else(|| format!("unknown enum `{}` in LLVM backend", enum_name))?;
+        let tag = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, 0",
+            tag,
+            matched.llvm_type.ir(),
+            matched.value
+        ));
+
+        let after_label = self.next_label("match_end");
+        let default_label = self.next_label("match_default");
+        let case_labels = cases
+            .iter()
+            .map(|_| self.next_label("match_case"))
+            .collect::<Vec<_>>();
+        let targets = cases
+            .iter()
+            .zip(case_labels.iter())
+            .map(|(case, label)| {
+                let ast::MatchPattern::EnumVariant { variant, .. } = &case.pattern;
+                let variant_layout = enum_layout
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.name == *variant)
+                    .ok_or_else(|| {
+                        format!("unknown variant `{}` on enum `{}`", variant, enum_name)
+                    })?;
+                Ok(format!("i32 {}, label %{}", variant_layout.tag, label))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.emit_line(format!(
+            "switch i32 {}, label %{} [ {} ]",
+            tag,
+            default_label,
+            targets.join(" ")
+        ));
+
+        let mut all_terminated = true;
+        for ((case, label), index) in cases.iter().zip(case_labels.iter()).zip(0..) {
+            self.emit_label(label);
+            self.push_scope();
+            let ast::MatchPattern::EnumVariant {
+                variant, binding, ..
+            } = &case.pattern;
+            if let Some(binding) = binding {
+                let variant_layout = enum_layout
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.name == *variant)
+                    .ok_or_else(|| {
+                        format!("unknown variant `{}` on enum `{}`", variant, enum_name)
+                    })?;
+                let payload_type = variant_layout
+                    .payload_type
+                    .clone()
+                    .ok_or_else(|| format!("variant `{}` does not carry a payload", variant))?;
+                let payload_value = self.extract_enum_payload(&matched, variant_layout)?;
+                let payload_ptr = self.emit_heap_alloc(payload_type.clone(), binding);
+                self.emit_store(&payload_ptr, &payload_value);
+                self.declare_local(binding.clone(), payload_ptr, payload_type);
+            }
+            self.compile_statements(&case.body)?;
+            self.pop_scope();
+            if !self.terminated {
+                all_terminated = false;
+                self.emit_line(format!("br label %{}", after_label));
+            }
+            if index + 1 < cases.len() {
+                self.terminated = false;
+            }
+        }
+
+        self.emit_label(&default_label);
+        self.emit_line("unreachable".to_string());
+
+        if all_terminated {
             self.terminated = true;
         } else {
             self.emit_label(&after_label);
@@ -674,6 +858,7 @@ impl<'a> FunctionCompiler<'a> {
                 Err("cannot print a pointer-like value directly".to_string())
             }
             LlvmType::Struct(_) => Err("cannot print a struct value directly".to_string()),
+            LlvmType::Enum(_) => Err("cannot print an enum value directly".to_string()),
             LlvmType::Function { .. } => Err("cannot print a function value directly".to_string()),
             LlvmType::Slice { .. } => Err("cannot print a slice value directly".to_string()),
             LlvmType::Array { .. } => Err("cannot print an array value directly".to_string()),
@@ -882,7 +1067,7 @@ impl<'a> FunctionCompiler<'a> {
                     self.coerce_expr(allocator, &LlvmType::Allocator, "slice alloc allocator")?;
                 let len = self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I32))?;
                 let len = self.coerce_expr(len, &LlvmType::I32, "slice alloc length")?;
-                let llvm_slice_type = llvm_type(sk_type, self.structs)?;
+                let llvm_slice_type = llvm_type(sk_type, self.structs, self.enums)?;
                 let elem_type = match &llvm_slice_type {
                     LlvmType::Slice { elem_type } => elem_type.as_ref().clone(),
                     _ => unreachable!(),
@@ -920,8 +1105,11 @@ impl<'a> FunctionCompiler<'a> {
                         name
                     ));
                 }
-                let llvm_type = llvm_type(sk_type, self.structs)?;
+                let llvm_type = llvm_type(sk_type, self.structs, self.enums)?;
                 self.compile_array_fill(&llvm_type, &arguments[0])
+            }
+            Type::Custom(enum_name) if self.enums.contains_key(enum_name) => {
+                self.compile_enum_constructor(enum_name, name, arguments)
             }
             Type::Custom(_)
             | Type::Byte
@@ -945,7 +1133,7 @@ impl<'a> FunctionCompiler<'a> {
                 let allocator =
                     self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::Allocator))?;
                 let allocator = self.coerce_expr(allocator, &LlvmType::Allocator, "type create")?;
-                let target_type = llvm_type(sk_type, self.structs)?;
+                let target_type = llvm_type(sk_type, self.structs, self.enums)?;
                 let temp = self.next_temp();
                 self.emit_line(format!(
                     "{} = call ptr @skunk_alloc_create(ptr {}, i64 {})",
@@ -969,6 +1157,66 @@ impl<'a> FunctionCompiler<'a> {
                 ast::type_to_string(sk_type),
                 name
             )),
+        }
+    }
+
+    fn compile_enum_constructor(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+        arguments: &[Node],
+    ) -> Result<ExprValue, String> {
+        let enum_layout = self
+            .enums
+            .get(enum_name)
+            .ok_or_else(|| format!("unknown enum `{}` in LLVM backend", enum_name))?;
+        let variant = enum_layout
+            .variants
+            .iter()
+            .find(|candidate| candidate.name == variant_name)
+            .ok_or_else(|| format!("unknown variant `{}` on enum `{}`", variant_name, enum_name))?;
+        let llvm_enum_type = LlvmType::Enum(enum_name.to_string());
+        let with_tag = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, i32 {}, 0",
+            with_tag,
+            llvm_enum_type.ir(),
+            variant.tag
+        ));
+        if let Some(payload_type) = &variant.payload_type {
+            if arguments.len() != 1 {
+                return Err(format!(
+                    "enum variant `{}::{}` expects one argument",
+                    enum_name, variant_name
+                ));
+            }
+            let payload = self.compile_expr_with_expected(&arguments[0], Some(payload_type))?;
+            let payload = self.coerce_expr(payload, payload_type, "enum variant payload")?;
+            let full = self.next_temp();
+            self.emit_line(format!(
+                "{} = insertvalue {} {}, {} {}, {}",
+                full,
+                llvm_enum_type.ir(),
+                with_tag,
+                payload_type.ir(),
+                payload.value,
+                variant.field_index.expect("payload field exists")
+            ));
+            Ok(ExprValue {
+                llvm_type: llvm_enum_type,
+                value: full,
+            })
+        } else {
+            if !arguments.is_empty() {
+                return Err(format!(
+                    "unit enum variant `{}::{}` expects no arguments",
+                    enum_name, variant_name
+                ));
+            }
+            Ok(ExprValue {
+                llvm_type: llvm_enum_type,
+                value: with_tag,
+            })
         }
     }
 
@@ -1860,9 +2108,9 @@ impl<'a> FunctionCompiler<'a> {
             None => LlvmType::Function {
                 parameters: parameters
                     .iter()
-                    .map(|(_, sk_type)| llvm_type(sk_type, self.structs))
+                    .map(|(_, sk_type)| llvm_type(sk_type, self.structs, self.enums))
                     .collect::<Result<Vec<_>, _>>()?,
-                return_type: Box::new(llvm_type(return_type, self.structs)?),
+                return_type: Box::new(llvm_type(return_type, self.structs, self.enums)?),
             },
         };
 
@@ -1906,6 +2154,7 @@ impl<'a> FunctionCompiler<'a> {
             lambda_return_type.clone(),
             self.signatures,
             self.structs,
+            self.enums,
             self.globals,
             self.extra_type_decls,
             self.extra_function_irs,
@@ -1919,7 +2168,7 @@ impl<'a> FunctionCompiler<'a> {
             .map(|(index, (_, ty))| {
                 Ok(format!(
                     "{} %arg{}",
-                    llvm_type(ty, self.structs)?.ir(),
+                    llvm_type(ty, self.structs, self.enums)?.ir(),
                     index + 1
                 ))
             })
@@ -2420,6 +2669,10 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: llvm_type.clone(),
                 value: "zeroinitializer".to_string(),
             },
+            LlvmType::Enum(_) => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
             LlvmType::Function { .. } => ExprValue {
                 llvm_type: llvm_type.clone(),
                 value: "zeroinitializer".to_string(),
@@ -2439,6 +2692,32 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
+    fn extract_enum_payload(
+        &mut self,
+        value: &ExprValue,
+        variant: &EnumVariantLayout,
+    ) -> Result<ExprValue, String> {
+        let payload_type = variant
+            .payload_type
+            .clone()
+            .ok_or_else(|| format!("variant `{}` does not carry a payload", variant.name))?;
+        let field_index = variant
+            .field_index
+            .ok_or_else(|| format!("variant `{}` has no payload field index", variant.name))?;
+        let temp = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, {}",
+            temp,
+            value.llvm_type.ir(),
+            value.value,
+            field_index
+        ));
+        Ok(ExprValue {
+            llvm_type: payload_type,
+            value: temp,
+        })
+    }
+
     fn coerce_expr(
         &mut self,
         value: ExprValue,
@@ -2452,6 +2731,14 @@ impl<'a> FunctionCompiler<'a> {
         let temp = self.next_temp();
         let line = match (&value.llvm_type, expected) {
             (LlvmType::Struct(_), LlvmType::Struct(_)) => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
+            (LlvmType::Enum(_), LlvmType::Enum(_)) => {
                 return Err(format!(
                     "type mismatch in {}: expected `{}`, got `{}`",
                     context,
@@ -2679,6 +2966,20 @@ impl<'a> FunctionCompiler<'a> {
                         .unwrap_or(1)
                 })
                 .unwrap_or(8),
+            LlvmType::Enum(name) => self
+                .enums
+                .get(name)
+                .map(|layout| {
+                    layout
+                        .variants
+                        .iter()
+                        .filter_map(|variant| variant.payload_type.as_ref())
+                        .map(|payload_type| self.align_of(payload_type))
+                        .max()
+                        .unwrap_or(4)
+                        .max(4)
+                })
+                .unwrap_or(8),
             LlvmType::Slice { .. } => 8,
             LlvmType::Array { elem_type, .. } => self.align_of(elem_type),
             LlvmType::Void => 1,
@@ -2710,6 +3011,22 @@ impl<'a> FunctionCompiler<'a> {
                     max_align = max_align.max(align);
                     offset = align_up(offset, align);
                     offset += self.size_of(field_type);
+                }
+                align_up(offset, max_align)
+            }
+            LlvmType::Enum(name) => {
+                let Some(layout) = self.enums.get(name) else {
+                    return 8;
+                };
+                let mut offset = 4usize;
+                let mut max_align = 4usize;
+                for variant in &layout.variants {
+                    if let Some(payload_type) = &variant.payload_type {
+                        let align = self.align_of(payload_type);
+                        max_align = max_align.max(align);
+                        offset = align_up(offset, align);
+                        offset += self.size_of(payload_type);
+                    }
                 }
                 align_up(offset, max_align)
             }
@@ -2799,6 +3116,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     };
 
     let structs = collect_struct_layouts(statements)?;
+    let enums = collect_enum_layouts(statements, &structs)?;
     let mut signatures = HashMap::<String, FunctionSignature>::new();
     let mut functions = Vec::<FunctionPlan>::new();
 
@@ -2813,9 +3131,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             } => {
                 let params = parameters
                     .iter()
-                    .map(|(_, ty)| llvm_type(ty, &structs))
+                    .map(|(_, ty)| llvm_type(ty, &structs, &enums))
                     .collect::<Result<Vec<_>, _>>()?;
-                let llvm_return_type = llvm_type(return_type, &structs)?;
+                let llvm_return_type = llvm_type(return_type, &structs, &enums)?;
                 signatures.insert(
                     name.clone(),
                     FunctionSignature {
@@ -2833,6 +3151,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 });
             }
             Node::EOI => {}
+            Node::EnumDeclaration { .. } => {}
             Node::StructDeclaration {
                 name,
                 functions: struct_functions,
@@ -2853,10 +3172,10 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                             if *param_type == Type::SkSelf {
                                 continue;
                             }
-                            parameter_types.push(llvm_type(param_type, &structs)?);
+                            parameter_types.push(llvm_type(param_type, &structs, &enums)?);
                             compile_params.push((param_name.clone(), param_type.clone()));
                         }
-                        let llvm_return_type = llvm_type(return_type, &structs)?;
+                        let llvm_return_type = llvm_type(return_type, &structs, &enums)?;
                         let key = format!("{}::{}", name, method_name);
                         let symbol_name =
                             format!("skunk_{}_{}", sanitize_name(name), sanitize_name(method_name));
@@ -2882,7 +3201,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             }
             other => {
                 return Err(format!(
-                    "LLVM backend currently expects top-level function declarations and struct declarations only, found `{:?}`",
+                    "LLVM backend currently expects top-level function, struct, and enum declarations only, found `{:?}`",
                     other
                 ))
             }
@@ -2900,13 +3219,13 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let mut lambda_counter = 0usize;
 
     for function in &functions {
-        let llvm_return_type = llvm_type(&function.return_type, &structs)?;
+        let llvm_return_type = llvm_type(&function.return_type, &structs, &enums)?;
         let param_defs = if function.is_method {
             let mut defs = vec![format!("ptr %arg0")];
             for (index, (_, ty)) in function.parameters.iter().skip(1).enumerate() {
                 defs.push(format!(
                     "{} %arg{}",
-                    llvm_type(ty, &structs)?.ir(),
+                    llvm_type(ty, &structs, &enums)?.ir(),
                     index + 1
                 ));
             }
@@ -2917,7 +3236,11 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 .iter()
                 .enumerate()
                 .map(|(index, (_, ty))| {
-                    Ok(format!("{} %arg{}", llvm_type(ty, &structs)?.ir(), index))
+                    Ok(format!(
+                        "{} %arg{}",
+                        llvm_type(ty, &structs, &enums)?.ir(),
+                        index
+                    ))
                 })
                 .collect::<Result<Vec<_>, String>>()?
         };
@@ -2926,6 +3249,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             llvm_return_type.clone(),
             &signatures,
             &structs,
+            &enums,
             &mut globals,
             &mut extra_type_decls,
             &mut extra_function_irs,
@@ -2989,8 +3313,10 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         LlvmType::Array { .. } => {
             return Err("LLVM backend does not support `main` returning arrays yet".to_string())
         }
-        LlvmType::Struct(_) => {
-            return Err("LLVM backend does not support `main` returning structs yet".to_string())
+        LlvmType::Struct(_) | LlvmType::Enum(_) => {
+            return Err(
+                "LLVM backend does not support `main` returning structs or enums yet".to_string()
+            )
         }
     };
 
@@ -3022,6 +3348,23 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         );
     }
     if !structs.is_empty() {
+        let _ = writeln!(ir);
+    }
+    for layout in enums.values() {
+        let mut field_types = vec!["i32".to_string()];
+        for variant in &layout.variants {
+            if let Some(payload_type) = &variant.payload_type {
+                field_types.push(payload_type.ir());
+            }
+        }
+        let _ = writeln!(
+            ir,
+            "%enum.{} = type {{ {} }}",
+            sanitize_name(&layout.name),
+            field_types.join(", ")
+        );
+    }
+    if !enums.is_empty() {
         let _ = writeln!(ir);
     }
     for decl in &extra_type_decls {
@@ -3686,6 +4029,111 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "2\n8\n");
+    }
+
+    #[test]
+    fn compiles_generic_enum_to_ir() {
+        let program = ast::parse(
+            r#"
+            enum Option[T] {
+                None;
+                Some(T);
+            }
+
+            function main(): void {
+                value: Option[int] = Option[int]::Some(7);
+                match (value) {
+                    case None: {
+                        print(0);
+                    }
+                    case Some(v): {
+                        print(v);
+                    }
+                }
+            }
+            "#,
+        );
+        let program = monomorphize::prepare_program(&program).unwrap();
+
+        let ir = compile_to_llvm_ir(&program).unwrap();
+        assert!(ir.contains("%enum.Option__int = type { i32, i32 }"));
+        assert!(ir.contains("switch i32"));
+    }
+
+    #[test]
+    fn runs_compiled_generic_enum_match_program() {
+        let stdout = compile_and_run(
+            r#"
+            enum Option[T] {
+                None;
+                Some(T);
+            }
+
+            function unwrap(value: Option[int]): int {
+                match (value) {
+                    case None: {
+                        return 0;
+                    }
+                    case Some(v): {
+                        return v + 1;
+                    }
+                }
+            }
+
+            function main(): void {
+                print(unwrap(Option[int]::None()));
+                print(unwrap(Option[int]::Some(41)));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "0\n42\n");
+    }
+
+    #[test]
+    fn runs_compiled_imported_generic_enum_module_program() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "std/option.skunk",
+                    r#"
+                    module std.option;
+
+                    enum Option[T] {
+                        None;
+                        Some(T);
+                    }
+
+                    function wrap[T](value: T): Option[T] {
+                        return Option[T]::Some(value);
+                    }
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import std.option;
+
+                    function main(): void {
+                        value: Option[int] = wrap(9);
+                        match (value) {
+                            case None: {
+                                print(0);
+                            }
+                            case Some(v): {
+                                print(v);
+                            }
+                        }
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "9\n");
     }
 
     #[test]

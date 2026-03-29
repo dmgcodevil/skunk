@@ -60,7 +60,7 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | import | var_decl_stmt | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block }
+statement         = { module | import | var_decl_stmt | func_decl | struct_decl | enum_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block }
 assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
@@ -74,6 +74,8 @@ param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _typ
 param_type_list   = { (_type ~ ("," ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ generic_params? ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
 struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }
+enum_decl         = { "enum" ~ IDENTIFIER ~ generic_params? ~ "{" ~ enum_variant_decl* ~ "}" }
+enum_variant_decl = { IDENTIFIER ~ ("(" ~ _type ~ ")")? ~ ";" }
 
 lambda_expr       = { "function" ~ static_func_params ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 
@@ -109,9 +111,10 @@ for_expr     = { "for" ~ (for_in | for_classic | for_infinite) ~ "{" ~ statement
 for_in       = { IDENTIFIER ~ "in" ~ expression }
 for_classic  = { "(" ~ for_init ~ ";" ~ for_cond ~ ";" ~ for_update ~ ")" }
 for_infinite = { "(" ~ expression? ~ ")" }
-match_expr   = { "match" ~ "(" ~ expression ~ ")" ~ "{" ~ match_case* ~ "}" }
-
-match_case      = { "case" ~ expression ~ ":" ~ "{" ~ statement* ~ "}" }
+match_expr       = { "match" ~ "(" ~ expression ~ ")" ~ "{" ~ match_case+ ~ "}" }
+match_case       = { "case" ~ match_pattern ~ ":" ~ "{" ~ statement* ~ "}" }
+match_pattern    = { enum_match_pattern }
+enum_match_pattern = { (nominal_type ~ "::")? ~ IDENTIFIER ~ ("(" ~ IDENTIFIER ~ ")")? }
 
 // I/O and Return
 print           = { "print" ~ "(" ~ expression ~ ")" ~ ";" }

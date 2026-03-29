@@ -20,6 +20,13 @@ struct StructTemplate {
 }
 
 #[derive(Clone)]
+struct EnumTemplate {
+    name: String,
+    generic_params: Vec<String>,
+    variants: Vec<ast::EnumVariant>,
+}
+
+#[derive(Clone)]
 struct FunctionSignature {
     parameters: Vec<Type>,
     return_type: Type,
@@ -75,12 +82,17 @@ struct Monomorphizer {
     concrete_functions: HashMap<String, FunctionTemplate>,
     generic_structs: HashMap<String, StructTemplate>,
     concrete_structs: HashMap<String, StructTemplate>,
+    generic_enums: HashMap<String, EnumTemplate>,
+    concrete_enums: HashMap<String, EnumTemplate>,
     generated_functions: HashMap<String, Node>,
     generated_function_order: Vec<String>,
     generated_structs: HashMap<String, Node>,
     generated_struct_order: Vec<String>,
+    generated_enums: HashMap<String, Node>,
+    generated_enum_order: Vec<String>,
     function_stack: HashSet<String>,
     struct_stack: HashSet<String>,
+    enum_stack: HashSet<String>,
     root_statements: Vec<Node>,
 }
 
@@ -90,6 +102,8 @@ impl Monomorphizer {
         let mut concrete_functions = HashMap::new();
         let mut generic_structs = HashMap::new();
         let mut concrete_structs = HashMap::new();
+        let mut generic_enums = HashMap::new();
+        let mut concrete_enums = HashMap::new();
         let mut root_statements = Vec::new();
 
         for statement in statements {
@@ -164,6 +178,31 @@ impl Monomorphizer {
                     );
                     root_statements.push(statement.clone());
                 }
+                Node::GenericEnumDeclaration {
+                    name,
+                    generic_params,
+                    variants,
+                } => {
+                    generic_enums.insert(
+                        name.clone(),
+                        EnumTemplate {
+                            name: name.clone(),
+                            generic_params: generic_params.clone(),
+                            variants: variants.clone(),
+                        },
+                    );
+                }
+                Node::EnumDeclaration { name, variants } => {
+                    concrete_enums.insert(
+                        name.clone(),
+                        EnumTemplate {
+                            name: name.clone(),
+                            generic_params: Vec::new(),
+                            variants: variants.clone(),
+                        },
+                    );
+                    root_statements.push(statement.clone());
+                }
                 Node::Module { .. } | Node::Import { .. } => {}
                 Node::EOI => {}
                 other => root_statements.push(other.clone()),
@@ -175,12 +214,17 @@ impl Monomorphizer {
             concrete_functions,
             generic_structs,
             concrete_structs,
+            generic_enums,
+            concrete_enums,
             generated_functions: HashMap::new(),
             generated_function_order: Vec::new(),
             generated_structs: HashMap::new(),
             generated_struct_order: Vec::new(),
+            generated_enums: HashMap::new(),
+            generated_enum_order: Vec::new(),
             function_stack: HashSet::new(),
             struct_stack: HashSet::new(),
+            enum_stack: HashSet::new(),
             root_statements,
         })
     }
@@ -218,6 +262,9 @@ impl Monomorphizer {
                         None,
                     )?);
                 }
+                Node::EnumDeclaration { name, variants } => {
+                    output.push(self.transform_enum_decl(&name, &variants, &HashMap::new())?);
+                }
                 Node::EOI => {}
                 other => {
                     let mut env = Env::new();
@@ -235,6 +282,11 @@ impl Monomorphizer {
 
         for name in self.generated_struct_order.clone() {
             if let Some(node) = self.generated_structs.get(&name) {
+                output.push(node.clone());
+            }
+        }
+        for name in self.generated_enum_order.clone() {
+            if let Some(node) = self.generated_enums.get(&name) {
                 output.push(node.clone());
             }
         }
@@ -353,6 +405,35 @@ impl Monomorphizer {
             name: name.to_string(),
             fields: output_fields,
             functions: output_functions,
+        })
+    }
+
+    fn transform_enum_decl(
+        &mut self,
+        name: &str,
+        variants: &[ast::EnumVariant],
+        substitutions: &HashMap<String, Type>,
+    ) -> Result<Node, String> {
+        let output_variants = variants
+            .iter()
+            .map(|variant| {
+                Ok(ast::EnumVariant {
+                    name: variant.name.clone(),
+                    payload_type: variant
+                        .payload_type
+                        .as_ref()
+                        .map(|payload_type| {
+                            let substituted = self.apply_substitutions(payload_type, substitutions);
+                            self.concretize_type(&substituted)
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        Ok(Node::EnumDeclaration {
+            name: name.to_string(),
+            variants: output_variants,
         })
     }
 
@@ -528,6 +609,49 @@ impl Monomorphizer {
                         body: output_body,
                         else_if_blocks: output_else_if_blocks,
                         else_block: output_else_block,
+                    },
+                    Some(Type::Void),
+                ))
+            }
+            Node::Match { value, cases } => {
+                let (value, value_type) =
+                    self.transform_expr(value, env, None, substitutions, self_type.clone())?;
+                let mut output_cases = Vec::new();
+                for case in cases {
+                    env.push();
+                    let ast::MatchPattern::EnumVariant { binding, .. } = &case.pattern;
+                    if let Some(binding) = binding {
+                        if let Some(payload_type) =
+                            self.lookup_enum_variant_payload_type(&value_type, &case.pattern)?
+                        {
+                            env.insert(binding.clone(), payload_type);
+                        }
+                    }
+                    let mut output_body = Vec::new();
+                    for statement in &case.body {
+                        let (statement, _) = self.transform_statement(
+                            statement,
+                            env,
+                            expected_return_type,
+                            substitutions,
+                            self_type.clone(),
+                        )?;
+                        output_body.push(statement);
+                    }
+                    env.pop();
+                    output_cases.push(ast::MatchCase {
+                        pattern: self.transform_match_pattern(
+                            &case.pattern,
+                            substitutions,
+                            &value_type,
+                        )?,
+                        body: output_body,
+                    });
+                }
+                Ok((
+                    Node::Match {
+                        value: Box::new(value),
+                        cases: output_cases,
                     },
                     Some(Type::Void),
                 ))
@@ -873,6 +997,40 @@ impl Monomorphizer {
                         Type::Pointer {
                             target_type: Box::new(internal_type.clone()),
                         }
+                    }
+                    Type::Custom(_) | Type::GenericInstance { .. }
+                        if self.lookup_enum_variant(&internal_type, name)?.is_some() =>
+                    {
+                        let payload_type = self.lookup_enum_variant(&internal_type, name)?.unwrap();
+                        match payload_type {
+                            Some(payload_type) => {
+                                if arguments.len() != 1 {
+                                    return Err(format!(
+                                        "enum variant constructor `{}::{}` expects one argument",
+                                        ast::type_to_string(&internal_type),
+                                        name
+                                    ));
+                                }
+                                let (argument, _) = self.transform_expr(
+                                    &arguments[0],
+                                    env,
+                                    Some(&payload_type),
+                                    substitutions,
+                                    self_type.clone(),
+                                )?;
+                                output_args.push(argument);
+                            }
+                            None => {
+                                if !arguments.is_empty() {
+                                    return Err(format!(
+                                        "unit enum variant constructor `{}::{}` expects no arguments",
+                                        ast::type_to_string(&internal_type),
+                                        name
+                                    ));
+                                }
+                            }
+                        }
+                        internal_type.clone()
                     }
                     _ => {
                         return Err(format!(
@@ -1235,6 +1393,7 @@ impl Monomorphizer {
             ),
             Node::Block { .. }
             | Node::If { .. }
+            | Node::Match { .. }
             | Node::For { .. }
             | Node::Return(_)
             | Node::Print(_)
@@ -1245,7 +1404,9 @@ impl Monomorphizer {
             | Node::Import { .. }
             | Node::VariableDeclaration { .. }
             | Node::StructDeclaration { .. }
+            | Node::EnumDeclaration { .. }
             | Node::GenericStructDeclaration { .. }
+            | Node::GenericEnumDeclaration { .. }
             | Node::FunctionDeclaration { .. }
             | Node::GenericFunctionDeclaration { .. }
             | Node::EMPTY
@@ -1256,6 +1417,85 @@ impl Monomorphizer {
             Node::ArrayAccess { .. } | Node::SliceAccess { .. } | Node::MemberAccess { .. } => {
                 Err("access steps should be nested inside `Node::Access`".to_string())
             }
+        }
+    }
+
+    fn transform_match_pattern(
+        &mut self,
+        pattern: &ast::MatchPattern,
+        substitutions: &HashMap<String, Type>,
+        matched_type: &Type,
+    ) -> Result<ast::MatchPattern, String> {
+        match pattern {
+            ast::MatchPattern::EnumVariant {
+                enum_type,
+                variant,
+                binding,
+            } => Ok(ast::MatchPattern::EnumVariant {
+                enum_type: if let Some(enum_type) = enum_type {
+                    Some(self.concretize_type(&self.apply_substitutions(enum_type, substitutions))?)
+                } else {
+                    match matched_type {
+                        Type::GenericInstance { .. } => Some(self.concretize_type(matched_type)?),
+                        _ => None,
+                    }
+                },
+                variant: variant.clone(),
+                binding: binding.clone(),
+            }),
+        }
+    }
+
+    fn lookup_enum_variant(
+        &mut self,
+        enum_type: &Type,
+        variant_name: &str,
+    ) -> Result<Option<Option<Type>>, String> {
+        match enum_type {
+            Type::Custom(name) => Ok(self.concrete_enums.get(name).and_then(|template| {
+                template
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == variant_name)
+                    .map(|variant| variant.payload_type.clone())
+            })),
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => {
+                let template = match self.generic_enums.get(base) {
+                    Some(template) => template,
+                    None => return Ok(None),
+                };
+                let substitutions = template
+                    .generic_params
+                    .iter()
+                    .cloned()
+                    .zip(type_arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                Ok(template
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == variant_name)
+                    .map(|variant| {
+                        variant.payload_type.as_ref().map(|payload_type| {
+                            self.apply_substitutions(payload_type, &substitutions)
+                        })
+                    }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn lookup_enum_variant_payload_type(
+        &mut self,
+        enum_type: &Type,
+        pattern: &ast::MatchPattern,
+    ) -> Result<Option<Type>, String> {
+        match pattern {
+            ast::MatchPattern::EnumVariant { variant, .. } => self
+                .lookup_enum_variant(enum_type, variant)
+                .map(|payload| payload.flatten()),
         }
     }
 
@@ -1612,6 +1852,72 @@ impl Monomorphizer {
         }
     }
 
+    fn ensure_enum_for_type(&mut self, sk_type: &Type) -> Result<String, String> {
+        match sk_type {
+            Type::Custom(name) => Ok(name.clone()),
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => {
+                let template = self
+                    .generic_enums
+                    .get(base)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown generic enum `{}`", base))?;
+                if template.generic_params.len() != type_arguments.len() {
+                    return Err(format!(
+                        "generic enum `{}` expects {} type arguments, got {}",
+                        base,
+                        template.generic_params.len(),
+                        type_arguments.len()
+                    ));
+                }
+                let symbol_name = specialized_struct_name(base, type_arguments);
+                if self.generated_enums.contains_key(&symbol_name) {
+                    return Ok(symbol_name);
+                }
+                if !self.enum_stack.insert(symbol_name.clone()) {
+                    return Ok(symbol_name);
+                }
+                let substitutions = template
+                    .generic_params
+                    .iter()
+                    .cloned()
+                    .zip(type_arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                let node =
+                    self.transform_enum_decl(&symbol_name, &template.variants, &substitutions)?;
+                self.generated_enums.insert(symbol_name.clone(), node);
+                self.generated_enum_order.push(symbol_name.clone());
+                self.enum_stack.remove(&symbol_name);
+                Ok(symbol_name)
+            }
+            other => Err(format!(
+                "expected an enum type, found `{}`",
+                ast::type_to_string(other)
+            )),
+        }
+    }
+
+    fn ensure_nominal_type(&mut self, sk_type: &Type) -> Result<String, String> {
+        match sk_type {
+            Type::Custom(name) => Ok(name.clone()),
+            Type::GenericInstance { base, .. } if self.generic_structs.contains_key(base) => {
+                self.ensure_struct_for_type(sk_type)
+            }
+            Type::GenericInstance { base, .. } if self.generic_enums.contains_key(base) => {
+                self.ensure_enum_for_type(sk_type)
+            }
+            Type::GenericInstance { base, .. } => {
+                Err(format!("unknown generic nominal type `{}`", base))
+            }
+            other => Err(format!(
+                "expected a nominal type, found `{}`",
+                ast::type_to_string(other)
+            )),
+        }
+    }
+
     fn lookup_struct_field_type(
         &mut self,
         sk_type: &Type,
@@ -1799,7 +2105,7 @@ impl Monomorphizer {
                     .collect::<Result<Vec<_>, _>>()?,
                 return_type: Box::new(self.concretize_type(return_type)?),
             }),
-            Type::GenericInstance { .. } => Ok(Type::Custom(self.ensure_struct_for_type(sk_type)?)),
+            Type::GenericInstance { .. } => Ok(Type::Custom(self.ensure_nominal_type(sk_type)?)),
             other => Ok(other.clone()),
         }
     }
@@ -2180,6 +2486,45 @@ mod tests {
             statement,
             Node::FunctionDeclaration { name, body, .. }
                 if name == "wrap__Box__int" && matches!(body.first(), Some(Node::Return(Some(_))))
+        )));
+    }
+
+    #[test]
+    fn monomorphizes_generic_enum_program() {
+        let statements = prepared_statements(
+            r#"
+            enum Option[T] {
+                None;
+                Some(T);
+            }
+
+            function wrap[T](value: T): Option[T] {
+                return Option[T]::Some(value);
+            }
+
+            function main(): void {
+                value: Option[int] = wrap(7);
+                match (value) {
+                    case None: {
+                        print(0);
+                    }
+                    case Some(v): {
+                        print(v);
+                    }
+                }
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::EnumDeclaration { name, variants }
+                if name == "Option__int"
+                    && variants.iter().any(|variant| variant.name == "Some" && variant.payload_type == Some(Type::Int))
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::FunctionDeclaration { name, .. } if name == "wrap__int"
         )));
     }
 }
