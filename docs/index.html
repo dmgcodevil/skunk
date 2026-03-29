@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Skunk Language Reference</title>
+    <meta name="description" content="Skunk Language Reference">
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="app.js"></script>
+</head>
+<body>
+    <div class="site-shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <p class="eyebrow">Experimental Language Docs</p>
+                <h1>Skunk</h1>
+                <p class="brand-subtitle">Language Reference</p>
+            </div>
+
+            <label class="search-label" for="nav-filter">Jump to a section</label>
+            <input id="nav-filter" class="nav-filter" type="search" placeholder="Filter sections">
+
+            <nav id="doc-nav" class="doc-nav" aria-label="Reference navigation">
+                <a href="#overview">Overview</a>
+                <a href="#status">Status</a>
+                <a href="#toolchain">Toolchain</a>
+                <a href="#programs-and-modules">Programs and Modules</a>
+                <a href="#types">Types</a>
+                <a href="#bindings-and-const">Bindings and Const</a>
+                <a href="#functions-and-control-flow">Functions and Control Flow</a>
+                <a href="#arrays-and-slices">Arrays and Slices</a>
+                <a href="#structs-and-methods">Structs and Methods</a>
+                <a href="#pointers-allocators-and-arenas">Pointers, Allocators, and Arenas</a>
+                <a href="#generics">Generics</a>
+                <a href="#enums-and-match">Enums and Match</a>
+                <a href="#traits-and-impls">Traits and Impls</a>
+                <a href="#patterns-and-destructuring">Patterns and Destructuring</a>
+                <a href="#current-limitations">Current Limitations</a>
+                <a href="#design-notes">Design Notes</a>
+            </nav>
+
+            <div class="sidebar-note">
+                <p>Human-designed.</p>
+                <p>AI-implemented.</p>
+                <p>Not for critical software.</p>
+            </div>
+        </aside>
+
+        <main class="content">
+            <header id="overview" class="hero">
+                <span class="badge">LLVM-first</span>
+                <h1>Skunk Language Reference</h1>
+                <p class="lead">
+                    Skunk is a human-designed, AI-implemented experimental programming language.
+                    This reference covers the implemented language surface in the current compiler/runtime.
+                </p>
+
+                <div class="callout-grid">
+                    <div class="callout">
+                        <h2>Project Shape</h2>
+                        <p>Skunk is a language-design project and compiler playground targeting LLVM.</p>
+                    </div>
+                    <div class="callout warning">
+                        <h2>Safety Note</h2>
+                        <p>Skunk is experimental and should not be used for critical, safety-sensitive, or high-reliability software.</p>
+                    </div>
+                </div>
+            </header>
+
+            <section id="status">
+                <h2>Status</h2>
+                <p>The primary execution path is native compilation through LLVM and <code>clang</code>. The repository still contains legacy interpreter code, but the compiler/runtime path is the main focus.</p>
+                <ul>
+                    <li>Source-level syntax is defined in <code>src/grammar.pest</code>.</li>
+                    <li>Implemented behavior is backed by parser, type-checker, source-loader, and compiler tests.</li>
+                    <li>This page documents the currently implemented language surface rather than future ideas.</li>
+                </ul>
+            </section>
+
+            <section id="toolchain">
+                <h2>Toolchain</h2>
+                <p>Build Skunk with Rust, then compile a Skunk entry file into a native executable.</p>
+<pre><code class="language-bash">cargo build
+cargo run -- compile path/to/main.skunk ./out
+./out</code></pre>
+                <p>The legacy interpreter path still exists while the codebase transitions further toward compiler-only execution.</p>
+<pre><code class="language-bash">cargo run -- path/to/main.skunk</code></pre>
+            </section>
+
+            <section id="programs-and-modules">
+                <h2>Programs and Modules</h2>
+                <p>Skunk supports multi-file programs through <code>module</code>, <code>import</code>, and <code>export</code>.</p>
+<pre><code class="language-skunk">module app.math;
+
+function helper(n: int): int {
+    return n + 1;
+}
+
+export function inc(n: int): int {
+    return helper(n);
+}</code></pre>
+<pre><code class="language-skunk">import app.math;
+
+function main(): void {
+    print(inc(41));
+}</code></pre>
+                <ul>
+                    <li><code>import app.math;</code> resolves to <code>app/math.skunk</code> relative to the entry file directory.</li>
+                    <li>Imported files must declare the matching <code>module</code> name.</li>
+                    <li>If a module uses <code>export</code>, only exported top-level declarations are visible to importers.</li>
+                    <li>If a module uses no <code>export</code>, current behavior stays all-public for compatibility.</li>
+                </ul>
+            </section>
+
+            <section id="types">
+                <h2>Types</h2>
+                <p>Skunk currently supports primitive types, fixed arrays, slices, pointers, function types, structs, enums, and generic instantiations.</p>
+                <table class="reference-table">
+                    <thead>
+                        <tr>
+                            <th>Form</th>
+                            <th>Meaning</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>byte</code>, <code>short</code>, <code>int</code>, <code>long</code></td>
+                            <td>Signed integer primitives</td>
+                        </tr>
+                        <tr>
+                            <td><code>float</code>, <code>double</code></td>
+                            <td>Floating-point primitives</td>
+                        </tr>
+                        <tr>
+                            <td><code>boolean</code>, <code>char</code>, <code>string</code>, <code>void</code></td>
+                            <td>Core built-in types</td>
+                        </tr>
+                        <tr>
+                            <td><code>[N]T</code></td>
+                            <td>Fixed-size value array</td>
+                        </tr>
+                        <tr>
+                            <td><code>[]T</code></td>
+                            <td>Slice view over contiguous elements</td>
+                        </tr>
+                        <tr>
+                            <td><code>*T</code></td>
+                            <td>Pointer/reference to one value</td>
+                        </tr>
+                        <tr>
+                            <td><code>*const T</code>, <code>[]const T</code></td>
+                            <td>Read-only pointer or slice view</td>
+                        </tr>
+                        <tr>
+                            <td><code>(A, B) -&gt; C</code></td>
+                            <td>Function type</td>
+                        </tr>
+                        <tr>
+                            <td><code>Box[int]</code></td>
+                            <td>Generic type instantiation</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p><code>Allocator</code> and <code>Arena</code> are built-in runtime types used for explicit memory management.</p>
+            </section>
+
+            <section id="bindings-and-const">
+                <h2>Bindings and Const</h2>
+                <p>Skunk distinguishes between const bindings and const views.</p>
+<pre><code class="language-skunk">const answer: int = 42;
+
+function copy_into(const dst: []int, src: []const int): void {
+    for (i: int = 0; i &lt; src.len; i = i + 1) {
+        dst[i] = src[i];
+    }
+}</code></pre>
+                <ul>
+                    <li><code>const name: T</code> makes the binding non-reassignable.</li>
+                    <li><code>[]const T</code> and <code>*const T</code> make the viewed elements or pointee read-only.</li>
+                    <li><code>[]T</code> is assignable to <code>[]const T</code>, but not the other way around.</li>
+                    <li><code>const dst: []int</code> still allows <code>dst[i] = ...</code> because the binding is const, not the slice contents.</li>
+                </ul>
+            </section>
+
+            <section id="functions-and-control-flow">
+                <h2>Functions and Control Flow</h2>
+                <p>Skunk supports named functions, lambdas, closures, <code>if</code>, <code>for</code>, <code>return</code>, and block scoping.</p>
+<pre><code class="language-skunk">function add(a: int, b: int): int {
+    return a + b;
+}
+
+function main(): void {
+    total: int = add(5, 7);
+
+    if (total &gt; 10) {
+        print(total);
+    }
+
+    counter: () -&gt; int = function(): int {
+        total = total + 1;
+        return total;
+    };
+
+    print(counter());
+}</code></pre>
+                <p>Closures can capture and mutate surrounding locals. Function values can be stored, returned, and passed as arguments.</p>
+            </section>
+
+            <section id="arrays-and-slices">
+                <h2>Arrays and Slices</h2>
+                <p>Fixed arrays use value semantics. Slices are views over contiguous storage.</p>
+<pre><code class="language-skunk">a: [4]int;
+b: [4]int = [4]int::fill(7);
+c: [4]int = [1, 2, 3, 4];
+
+mid: []const int = c[1:3];
+
+print(a[0]);
+print(b.len);
+print(mid[0]);</code></pre>
+                <ul>
+                    <li><code>[N]T</code> without an initializer is zero-initialized.</li>
+                    <li><code>[N]T::fill(value)</code> fills every element with the given value.</li>
+                    <li>Slices support indexing, <code>.len</code>, and range slicing with omitted bounds.</li>
+                    <li>Fixed arrays can be passed and returned by value.</li>
+                </ul>
+            </section>
+
+            <section id="structs-and-methods">
+                <h2>Structs and Methods</h2>
+                <p>Structs are product types with named fields and methods.</p>
+<pre><code class="language-skunk">struct Counter {
+    value: int;
+
+    function bump(mut self): void {
+        self.value = self.value + 1;
+    }
+
+    function get(self): int {
+        return self.value;
+    }
+}</code></pre>
+                <p>Receiver mutability is explicit:</p>
+                <ul>
+                    <li><code>self</code> means the method may read but may not mutate receiver state.</li>
+                    <li><code>mut self</code> means the method may mutate receiver state.</li>
+                    <li><code>*const T</code> may call only read-only <code>self</code> methods.</li>
+                </ul>
+            </section>
+
+            <section id="pointers-allocators-and-arenas">
+                <h2>Pointers, Allocators, and Arenas</h2>
+                <p>Skunk uses explicit allocation. Plain values use value semantics; allocator-backed single objects use <code>*T</code>; allocator-backed buffers use <code>[]T</code>.</p>
+<pre><code class="language-skunk">struct Point {
+    x: int;
+    y: int;
+}
+
+function make_point(alloc: Allocator): *Point {
+    point: *Point = Point::create(alloc);
+    point.x = 3;
+    point.y = 4;
+    return point;
+}
+
+function main(): void {
+    system_alloc: Allocator = System::allocator();
+    arena: Arena = Arena::init(system_alloc);
+    arena_alloc: Allocator = arena.allocator();
+
+    point: *Point = make_point(arena_alloc);
+    values: []int = []int::alloc(arena_alloc, 8);
+
+    print(point.x + values.len);
+
+    arena.deinit();
+}</code></pre>
+                <ul>
+                    <li><code>System::allocator()</code> returns the system allocator handle.</li>
+                    <li><code>T::create(alloc)</code> allocates one object and returns <code>*T</code>.</li>
+                    <li><code>[]T::alloc(alloc, len)</code> allocates a slice buffer.</li>
+                    <li><code>alloc.destroy(ptr)</code> releases a pointer allocation.</li>
+                    <li><code>alloc.free(slice)</code> releases a slice allocation.</li>
+                    <li><code>Arena::init(backing)</code>, <code>arena.allocator()</code>, <code>arena.reset()</code>, and <code>arena.deinit()</code> provide arena-style lifetime management.</li>
+                </ul>
+            </section>
+
+            <section id="generics">
+                <h2>Generics</h2>
+                <p>Skunk supports generic structs, generic functions, and generic enums through monomorphization.</p>
+<pre><code class="language-skunk">struct Box[T] {
+    value: T;
+}
+
+function wrap[T](value: T): Box[T] {
+    return Box[T] { value: value };
+}</code></pre>
+                <ul>
+                    <li>Nested instantiations such as <code>Box[Box[int]]</code> are supported.</li>
+                    <li>Function type argument inference works from call arguments in common cases.</li>
+                    <li>Explicit function call type arguments are not supported yet.</li>
+                </ul>
+            </section>
+
+            <section id="enums-and-match">
+                <h2>Enums and Match</h2>
+                <p>Skunk supports generic enums with unit and single-payload variants, plus exhaustive enum-focused <code>match</code>.</p>
+<pre><code class="language-skunk">enum Option[T] {
+    None;
+    Some(T);
+}
+
+function unwrap(value: Option[int]): int {
+    match (value) {
+        case None: {
+            return 0;
+        }
+        case Some(v): {
+            return v;
+        }
+    }
+}</code></pre>
+                <ul>
+                    <li>Construct variants with forms like <code>Option[int]::None()</code> and <code>Option[int]::Some(7)</code>.</li>
+                    <li><code>match</code> is exhaustiveness-checked for enums.</li>
+                    <li>Enum variants currently carry at most one payload value.</li>
+                </ul>
+            </section>
+
+            <section id="traits-and-impls">
+                <h2>Traits and Impls</h2>
+                <p>Traits are compile-time constraints. They are not runtime interface objects.</p>
+<pre><code class="language-skunk">trait Writer {
+    function write(mut self, value: int): int;
+}
+
+trait Resettable {
+    function reset(mut self): void;
+}
+
+struct Counter {
+    value: int;
+
+    function write(mut self, value: int): int {
+        self.value = self.value + value;
+        return self.value;
+    }
+
+    function reset(mut self): void {
+        self.value = 0;
+    }
+}
+
+impl Writer, Resettable for Counter {}
+
+function use_counter[T: Writer + Resettable](counter: *T): int {
+    counter.reset();
+    return counter.write(41);
+}</code></pre>
+                <ul>
+                    <li>Trait conformance is explicit through <code>impl Trait for Type</code>.</li>
+                    <li><code>impl Writer, Resettable for Counter {}</code> is grouped syntax sugar.</li>
+                    <li>Generic bounds stack with <code>+</code>.</li>
+                    <li>Impl targets are concrete types only in the current version.</li>
+                </ul>
+            </section>
+
+            <section id="patterns-and-destructuring">
+                <h2>Patterns and Destructuring</h2>
+                <p>Skunk currently supports enum patterns in <code>match</code>, struct patterns in <code>match</code>, and standalone struct destructuring statements.</p>
+<pre><code class="language-skunk">struct Point {
+    x: int;
+    y: int;
+}
+
+function sum(point: Point): int {
+    match (point) {
+        case Point { x, y }: {
+            return x + y;
+        }
+    }
+}
+
+function main(): void {
+    point: Point = Point { x: 3, y: 4 };
+    Point { x, y: py } = point;
+    print(sum(point));
+    print(x + py);
+}</code></pre>
+                <ul>
+                    <li>Struct field bindings may use aliases such as <code>y: py</code>.</li>
+                    <li>Destructuring statements introduce local bindings in the current scope.</li>
+                    <li>Struct pattern matching is exact-type and currently supports one case in V1.</li>
+                </ul>
+            </section>
+
+            <section id="current-limitations">
+                <h2>Current Limitations</h2>
+                <ul>
+                    <li>No trait objects or runtime interface values yet.</li>
+                    <li>No generic impl targets yet.</li>
+                    <li>No explicit function call type arguments yet.</li>
+                    <li>No user-defined allocators, raw pointer operations, or <code>unsafe</code> memory layer yet.</li>
+                    <li>No general address-of operator yet.</li>
+                    <li>No const struct fields yet.</li>
+                    <li>Enum variants currently support at most one payload value.</li>
+                    <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
+                </ul>
+            </section>
+
+            <section id="design-notes">
+                <h2>Design Notes</h2>
+                <p>The language reference should stay focused on implemented behavior. For deeper design context, see the supporting notes in this repository.</p>
+                <ul>
+                    <li><a href="pointers-and-allocators.md">Pointer and allocator design</a></li>
+                    <li><a href="language-development.md">Language development contract</a></li>
+                </ul>
+            </section>
+        </main>
+    </div>
+</body>
+</html>
