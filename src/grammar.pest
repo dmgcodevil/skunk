@@ -36,11 +36,12 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
 
 // Types
 size = { INTEGER }
-base_type       = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | IDENTIFIER }
+base_type       = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | "Allocator" | "Arena" | IDENTIFIER }
 legacy_array_dim = { "[" ~ expression ~ "]" }
 legacy_array_type = { base_type ~ legacy_array_dim+ } // legacy syntax: int[3]
 legacy_slice_type = { base_type ~ ("[" ~ "]")+ } // legacy syntax: int[]
-type_prefix     = { "[" ~ expression? ~ "]" }
+pointer_prefix  = { "*" }
+type_prefix     = { pointer_prefix | "[" ~ expression? ~ "]" }
 prefixed_type   = { type_prefix+ ~ (base_type | function_type) } // preferred syntax: [3]int, []int
 function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
 _type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type | "void" }

@@ -1,8 +1,7 @@
 use crate::ast::Type::Void;
 use crate::ast::{
     fits_integer_type, is_integral_type, is_numeric_assignable, is_numeric_type, is_scalar_type,
-    promoted_numeric_type, type_to_string, Literal, Metadata, Node, Operator, Type,
-    UnaryOperator,
+    promoted_numeric_type, type_to_string, Literal, Metadata, Node, Operator, Type, UnaryOperator,
 };
 use std::collections::HashMap;
 use std::fmt::format;
@@ -241,7 +240,10 @@ fn expected_fixed_array_length(sk_type: &Type) -> Option<i64> {
     }
 }
 
-fn resolve_literal_type(literal: &Literal, expected_type_opt: Option<&Type>) -> Result<Type, String> {
+fn resolve_literal_type(
+    literal: &Literal,
+    expected_type_opt: Option<&Type>,
+) -> Result<Type, String> {
     match literal {
         Literal::Integer(value) => {
             if let Some(expected_type) = expected_type_opt {
@@ -328,30 +330,18 @@ fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
 }
 
 fn resolve_subtract(left: &Type, right: &Type) -> Result<Type, String> {
-    promoted_numeric_type(left, right).ok_or_else(|| {
-        format!(
-            "unexpected types for -: {:?} and {:?}",
-            left, right
-        )
-    })
+    promoted_numeric_type(left, right)
+        .ok_or_else(|| format!("unexpected types for -: {:?} and {:?}", left, right))
 }
 
 fn resolve_multiply(left: &Type, right: &Type) -> Result<Type, String> {
-    promoted_numeric_type(left, right).ok_or_else(|| {
-        format!(
-            "unexpected types for *: {:?} and {:?}",
-            left, right
-        )
-    })
+    promoted_numeric_type(left, right)
+        .ok_or_else(|| format!("unexpected types for *: {:?} and {:?}", left, right))
 }
 
 fn resolve_divide(left: &Type, right: &Type) -> Result<Type, String> {
-    promoted_numeric_type(left, right).ok_or_else(|| {
-        format!(
-            "unexpected types for /: {:?} and {:?}",
-            left, right
-        )
-    })
+    promoted_numeric_type(left, right)
+        .ok_or_else(|| format!("unexpected types for /: {:?} and {:?}", left, right))
 }
 
 fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
@@ -385,6 +375,20 @@ fn resolve_access(
 ) -> Result<Type, String> {
     if i == access_nodes.len() {
         return Ok(curr);
+    }
+    if matches!(
+        access_nodes.get(i).unwrap(),
+        Node::MemberAccess { .. } | Node::ArrayAccess { .. } | Node::SliceAccess { .. }
+    ) {
+        if let Type::Pointer { target_type } = curr {
+            return resolve_access(
+                global_scope,
+                symbol_tables,
+                target_type.deref().clone(),
+                i,
+                access_nodes,
+            );
+        }
     }
     match access_nodes.get(i).unwrap() {
         Node::ArrayAccess { coordinates } => match curr {
@@ -422,7 +426,8 @@ fn resolve_access(
         },
         Node::SliceAccess { start, end } => {
             if let Some(start) = start {
-                let start_type = resolve_type(global_scope, symbol_tables, start, Some(&Type::Int))?;
+                let start_type =
+                    resolve_type(global_scope, symbol_tables, start, Some(&Type::Int))?;
                 if !is_integral_type(&start_type.sk_type) {
                     return Err("slice start index must be an integer".to_string());
                 }
@@ -458,18 +463,80 @@ fn resolve_access(
 
         Node::MemberAccess { member, metadata } => match curr {
             Type::Array { .. } | Type::Slice { .. } => match member.deref() {
-                Node::Identifier(field_name) if field_name == "len" => resolve_access(
-                    global_scope,
-                    symbol_tables,
-                    Type::Int,
-                    i + 1,
-                    access_nodes,
-                ),
+                Node::Identifier(field_name) if field_name == "len" => {
+                    resolve_access(global_scope, symbol_tables, Type::Int, i + 1, access_nodes)
+                }
                 Node::Identifier(field_name) => Err(format!(
                     "error {}:{}: no field `{}` on array or slice type",
                     metadata.span.line, metadata.span.start, field_name
                 )),
                 _ => Err("array or slice member access expects an identifier".to_string()),
+            },
+            Type::Allocator => match member.deref() {
+                Node::FunctionCall {
+                    name,
+                    arguments,
+                    metadata,
+                } if name == "destroy" => {
+                    if arguments.len() != 1 || arguments[0].len() != 1 {
+                        return Err(format!(
+                            "error {}:{}: Allocator.destroy expects exactly one pointer argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let ptr_type =
+                        resolve_type(global_scope, symbol_tables, &arguments[0][0], None)?;
+                    if !matches!(ptr_type.sk_type, Type::Pointer { .. }) {
+                        return Err(format!(
+                            "error {}:{}: Allocator.destroy expects a pointer argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    resolve_access(global_scope, symbol_tables, Type::Void, i + 1, access_nodes)
+                }
+                Node::FunctionCall {
+                    name,
+                    arguments,
+                    metadata,
+                } if name == "free" => {
+                    if arguments.len() != 1 || arguments[0].len() != 1 {
+                        return Err(format!(
+                            "error {}:{}: Allocator.free expects exactly one slice argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let slice_type =
+                        resolve_type(global_scope, symbol_tables, &arguments[0][0], None)?;
+                    if !matches!(slice_type.sk_type, Type::Slice { .. }) {
+                        return Err(format!(
+                            "error {}:{}: Allocator.free expects a slice argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    resolve_access(global_scope, symbol_tables, Type::Void, i + 1, access_nodes)
+                }
+                Node::FunctionCall { name, metadata, .. } => Err(format!(
+                    "error {}:{}: no method named `{}` found for Allocator",
+                    metadata.span.line, metadata.span.start, name
+                )),
+                _ => Err("allocator member access expects a function call".to_string()),
+            },
+            Type::Arena => match member.deref() {
+                Node::FunctionCall { name, .. } if name == "allocator" => resolve_access(
+                    global_scope,
+                    symbol_tables,
+                    Type::Allocator,
+                    i + 1,
+                    access_nodes,
+                ),
+                Node::FunctionCall { name, .. } if name == "reset" || name == "deinit" => {
+                    resolve_access(global_scope, symbol_tables, Type::Void, i + 1, access_nodes)
+                }
+                Node::FunctionCall { name, metadata, .. } => Err(format!(
+                    "error {}:{}: no method named `{}` found for Arena",
+                    metadata.span.line, metadata.span.start, name
+                )),
+                _ => Err("arena member access expects a function call".to_string()),
             },
             Type::Custom(struct_name) => {
                 if !global_scope.structs.contains_key(&struct_name) {
@@ -734,13 +801,9 @@ fn resolve_type(
                 sk_type: var_type.clone(),
             });
             if let Some(body) = value {
-                let value_type = resolve_type(
-                    global_scope,
-                    symbol_tables,
-                    &body.deref(),
-                    Some(var_type),
-                )?
-                .sk_type;
+                let value_type =
+                    resolve_type(global_scope, symbol_tables, &body.deref(), Some(var_type))?
+                        .sk_type;
                 if !is_assignable(var_type, &value_type) {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
@@ -831,13 +894,8 @@ fn resolve_type(
         Node::Assignment { var, value, .. } => {
             let var_type =
                 resolve_type(global_scope, symbol_tables, var.deref(), expected_type_opt)?.sk_type;
-            let value_type = resolve_type(
-                global_scope,
-                symbol_tables,
-                value.deref(),
-                Some(&var_type),
-            )?
-            .sk_type;
+            let value_type =
+                resolve_type(global_scope, symbol_tables, value.deref(), Some(&var_type))?.sk_type;
             if !is_assignable(&var_type, &value_type) {
                 // todo include var name, metadata
                 Err(format!(
@@ -896,8 +954,9 @@ fn resolve_type(
                 })),
             }
         }
-        Node::Literal(literal) => resolve_literal_type(literal, expected_type_opt)
-            .map(|t| ResolveResult::new(t)),
+        Node::Literal(literal) => {
+            resolve_literal_type(literal, expected_type_opt).map(|t| ResolveResult::new(t))
+        }
         Node::EOI => Ok(ResolveResult::new(Type::Void)),
         Node::Identifier(name) => {
             let res = symbol_tables
@@ -939,6 +998,33 @@ fn resolve_type(
                 Type::String => {}
                 Type::Boolean => {}
                 Type::Char => {}
+                Type::Allocator => {}
+                Type::Arena => {
+                    if name != "init" {
+                        return Err(format!(
+                            "error {}:{}: Arena does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
+                    if arguments.len() != 1 {
+                        return Err(format!(
+                            "error {}:{}: Arena::init expects one argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let arg_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[0],
+                        Some(&Type::Allocator),
+                    )?;
+                    if arg_type.sk_type != Type::Allocator {
+                        return Err(format!(
+                            "error {}:{}: Arena::init expects Allocator argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                }
                 Type::Array { elem_type, .. } => {
                     if name != "fill" && name != "new" {
                         return Err(format!(
@@ -959,14 +1045,99 @@ fn resolve_type(
                         Some(elem_type.deref()),
                     )?;
                     if !is_assignable(elem_type.deref(), &arg_type.sk_type) {
-                        return Err(format!("error {}:{}: array `{}`. expected arg type is `{:?}` but given `{:?}`",
-                                           metadata.span.line,
-                                           metadata.span.start,
-                                           name, elem_type.deref(), arg_type));
+                        return Err(format!(
+                            "error {}:{}: array `{}`. expected arg type is `{:?}` but given `{:?}`",
+                            metadata.span.line,
+                            metadata.span.start,
+                            name,
+                            elem_type.deref(),
+                            arg_type
+                        ));
                     }
                 }
-                Type::Slice { .. } => {}
-                Type::Custom(_) => {}
+                Type::Slice { elem_type } => {
+                    if name != "alloc" {
+                        return Err(format!(
+                            "error {}:{}: slice type does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
+                    if arguments.len() != 2 {
+                        return Err(format!(
+                            "error {}:{}: slice alloc expects allocator and length",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let allocator_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        arguments.get(0).unwrap(),
+                        Some(&Type::Allocator),
+                    )?;
+                    if allocator_type.sk_type != Type::Allocator {
+                        return Err(format!(
+                            "error {}:{}: slice alloc expects Allocator argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let len_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        arguments.get(1).unwrap(),
+                        Some(&Type::Int),
+                    )?;
+                    if !is_integral_type(&len_type.sk_type) {
+                        return Err(format!(
+                            "error {}:{}: slice alloc length must be an integer",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    if matches!(elem_type.deref(), Type::Void) {
+                        return Err(format!(
+                            "error {}:{}: cannot allocate a slice of void",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                }
+                Type::Pointer { .. } => {}
+                Type::Custom(custom_name) if custom_name == "System" => {
+                    if name != "allocator" || !arguments.is_empty() {
+                        return Err(format!(
+                            "error {}:{}: System only supports System::allocator()",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    return Ok(ResolveResult::new(Type::Allocator));
+                }
+                Type::Custom(_) => {
+                    if name != "create" {
+                        return Err(format!(
+                            "error {}:{}: type does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
+                    if arguments.len() != 1 {
+                        return Err(format!(
+                            "error {}:{}: type create expects one Allocator argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let arg_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[0],
+                        Some(&Type::Allocator),
+                    )?;
+                    if arg_type.sk_type != Type::Allocator {
+                        return Err(format!(
+                            "error {}:{}: type create expects Allocator argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    return Ok(ResolveResult::new(Type::Pointer {
+                        target_type: Box::new(_type.clone()),
+                    }));
+                }
                 Type::Function { .. } => {}
                 Type::SkSelf => {}
             }
@@ -1090,7 +1261,8 @@ fn resolve_type(
         Node::Return(body_opt) => {
             let mut res = ResolveResult::returned(Type::Void);
             if let Some(body) = body_opt {
-                res = resolve_type(global_scope, symbol_tables, body, expected_type_opt)?.to_returned();
+                res = resolve_type(global_scope, symbol_tables, body, expected_type_opt)?
+                    .to_returned();
             }
             if let Some(expected_type) = expected_type_opt {
                 if !is_assignable(expected_type, &res.sk_type) {

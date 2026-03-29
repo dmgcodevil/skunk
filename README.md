@@ -10,11 +10,16 @@
 - **User-Defined Structs**: Define custom types with fields and methods
 - **Control Flow**: `if`, `for` loops, and blocks for scoped variable overrides
 - **Arrays**: Fixed-size arrays with zero initialization, explicit fill initialization, and slice types
+- **Pointers and Allocation**: `*T`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(...)`, `alloc.free(...)`, and `Arena`
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
 - **Type Inference**: Planned for a cleaner developer experience
 - **String Interpolation and Concatenation**: Upcoming for intuitive string operations
 - **Generics**: Upcoming for flexible and reusable data structures
+
+Current design notes:
+
+- [Pointer and Allocator Design](/Users/dmgcodevil/dev/skunk-llvm/skunk/docs/pointers-and-allocators.md)
 
 ## Example Programs
 
@@ -87,6 +92,33 @@ function main(): void {
     print(a[0]); // 0
     print(b[1]); // 7
     print(c[2]); // 3
+}
+```
+
+### Pointers and Allocators
+```skunk
+struct Point {
+    x: int;
+    y: int;
+}
+
+function main(): void {
+    heap: Allocator = System::allocator();
+    arena: Arena = Arena::init(heap);
+    alloc: Allocator = arena.allocator();
+
+    p: *Point = Point::create(alloc);
+    p.x = 4;
+    p.y = 5;
+    print(p.x + p.y);
+    alloc.destroy(p);
+
+    values: []int = []int::alloc(alloc, 3);
+    values[1] = 7;
+    print(values[1]);
+    alloc.free(values);
+
+    arena.deinit();
 }
 ```
 
@@ -294,10 +326,13 @@ Currently supported in `cargo run -- compile ...`:
 - Structs, field access, nested structs, methods, and method chaining that returns callable values
 - Slices: `[]T`, slice literals, `a[lo:hi]`, omitted bounds, `.len`, indexing, and slice parameters
 - Closures and lambdas, including captured locals, recursive lambdas, returned functions, and methods returning closures
+- Pointers and allocation: `*T`, `System::allocator()`, `Arena::init(...)`, `arena.allocator()`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(ptr)`, and `alloc.free(slice)`
 
 Current compiler/runtime trade-off:
 
-- The native compiler currently heap-allocates local storage that needs to outlive a stack frame for arrays, slices, structs, and closures. This keeps closure and slice semantics working while the runtime is still small, but it also means there is no allocator API or memory reclamation yet.
+- The native compiler currently uses a small C runtime for allocator-backed storage and for values that must outlive a stack frame.
+- `Arena` now supports `reset()` and `deinit()`, and allocator-backed pointers/slices can be released with `alloc.destroy(...)` and `alloc.free(...)`.
+- User-defined allocators, raw pointer operations, and an `unsafe` memory layer are still future work.
 
 ## Fibonacci Benchmark
 

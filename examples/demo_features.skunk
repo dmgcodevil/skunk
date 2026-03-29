@@ -1,0 +1,65 @@
+struct Point {
+    x: int;
+    y: int;
+
+    function sum(self): int {
+        return self.x + self.y;
+    }
+}
+
+struct Stats {
+    total: int;
+    first: int;
+    last: int;
+
+    function score(self): int {
+        return self.total + self.first + self.last;
+    }
+}
+
+function sum(values: []int): int {
+    total: int = 0;
+
+    for (i: int = 0; i < values.len; i = i + 1) {
+        total = total + values[i];
+    }
+
+    return total;
+}
+
+function copy_into(dst: []int, src: []int): void {
+    for (i: int = 0; i < src.len; i = i + 1) {
+        dst[i] = src[i];
+    }
+}
+
+function main(): void {
+    fixed: [5]int = [3, 6, 9, 12, 15];
+    middle: []int = fixed[1:4];
+
+    heap: Allocator = System::allocator();
+    arena: Arena = Arena::init(heap);
+    alloc: Allocator = arena.allocator();
+
+    point: *Point = Point::create(alloc);
+    point.x = middle[0];
+    point.y = middle[2];
+
+    heap_values: []int = []int::alloc(alloc, middle.len);
+    copy_into(heap_values, middle);
+
+    stats: Stats = Stats {
+        total: sum(heap_values),
+        first: heap_values[0],
+        last: heap_values[heap_values.len - 1]
+    };
+
+    print(fixed.len);
+    print(middle.len);
+    print(point.sum());
+    print(stats.score());
+
+    alloc.destroy(point);
+    alloc.free(heap_values);
+    arena.deinit();
+}

@@ -158,15 +158,26 @@ pub enum Type {
         elem_type: Box<Type>,
         dimensions: Vec<Node>,
     },
+    Pointer {
+        target_type: Box<Type>,
+    },
     Slice {
         elem_type: Box<Type>,
     },
+    Allocator,
+    Arena,
     Custom(String), // Custom types like structs
     Function {
         parameters: Vec<Type>,
         return_type: Box<Type>,
     },
     SkSelf, // special type for member functions
+}
+
+enum TypePrefix {
+    Pointer,
+    Slice,
+    Array(Node),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -226,9 +237,7 @@ impl PestImpl {
 
     pub fn parse(&self, code: &str) -> Result<Node, String> {
         match SkunkParser::parse(Rule::program, code) {
-            Ok(pairs) => {
-                Ok(self.create_ast(pairs.clone().next().unwrap()))
-            }
+            Ok(pairs) => Ok(self.create_ast(pairs.clone().next().unwrap())),
             Err(e) => Err(format!("parser failed: {}", e)),
         }
     }
@@ -615,16 +624,25 @@ impl PestImpl {
         }
     }
 
-    fn create_type_prefix(&self, pair: Pair<Rule>) -> Option<Node> {
+    fn create_type_prefix(&self, pair: Pair<Rule>) -> TypePrefix {
         assert_eq!(pair.as_rule(), Rule::type_prefix);
-        pair.into_inner().next().map(|p| self.create_ast(p))
+        let mut inner = pair.into_inner();
+        if let Some(inner) = inner.next() {
+            match inner.as_rule() {
+                Rule::pointer_prefix => TypePrefix::Pointer,
+                Rule::expression => TypePrefix::Array(self.create_ast(inner)),
+                _ => TypePrefix::Slice,
+            }
+        } else {
+            TypePrefix::Slice
+        }
     }
 
-    fn apply_type_prefixes(&self, base_type: Type, prefixes: Vec<Option<Node>>) -> Type {
+    fn apply_type_prefixes(&self, base_type: Type, prefixes: Vec<TypePrefix>) -> Type {
         let mut current = base_type;
         for prefix in prefixes.into_iter().rev() {
             match prefix {
-                Some(dimension) => match current {
+                TypePrefix::Array(dimension) => match current {
                     Type::Array {
                         elem_type,
                         mut dimensions,
@@ -642,9 +660,14 @@ impl PestImpl {
                         };
                     }
                 },
-                None => {
+                TypePrefix::Slice => {
                     current = Type::Slice {
                         elem_type: Box::new(current),
+                    };
+                }
+                TypePrefix::Pointer => {
+                    current = Type::Pointer {
+                        target_type: Box::new(current),
                     };
                 }
             }
@@ -953,7 +976,10 @@ pub fn type_to_string(t: &Type) -> String {
                 .collect::<String>();
             format!("{}{}", prefix, type_to_string(elem_type))
         }
+        Type::Pointer { target_type } => format!("*{}", type_to_string(target_type)),
         Type::Slice { elem_type } => format!("[]{}", type_to_string(elem_type)),
+        Type::Allocator => "Allocator".to_string(),
+        Type::Arena => "Arena".to_string(),
         Type::Function {
             parameters,
             return_type,
@@ -1008,6 +1034,8 @@ fn create_base_type_from_str(s: &str) -> Type {
         "string" => Type::String,
         "boolean" | "bool" => Type::Boolean,
         "char" => Type::Char,
+        "Allocator" => Type::Allocator,
+        "Arena" => Type::Arena,
         "void" => Type::Void,
         _ => Type::Custom(s.to_string()),
     }
@@ -2503,6 +2531,29 @@ mod tests {
                             Node::Literal(Literal::Integer(3)),
                         ],
                     })),
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_pointer_type() {
+        let source_code = r#"
+            point_ptr: *Point;
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    name: "point_ptr".to_string(),
+                    var_type: Type::Pointer {
+                        target_type: Box::new(Type::Custom("Point".to_string())),
+                    },
+                    value: None,
                     metadata: Metadata::EMPTY,
                 },
                 Node::EOI,

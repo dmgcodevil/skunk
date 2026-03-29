@@ -5,11 +5,11 @@ use sysinfo::{Pid, System};
 
 use crate::ast;
 use crate::interpreter::Value::StructInstance;
-use ast::{fits_integer_type, is_integral_type, promoted_numeric_type};
 use ast::Literal;
 use ast::Node;
 use ast::Operator;
 use ast::Type;
+use ast::{fits_integer_type, is_integral_type, promoted_numeric_type};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::BufRead;
@@ -399,57 +399,60 @@ fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
             }
         }
         Type::String => {
-            if value_ref.is_match(|v| matches!(v, Value::String(_)) || matches!(v, Value::Undefined)) {
+            if value_ref
+                .is_match(|v| matches!(v, Value::String(_)) || matches!(v, Value::Undefined))
+            {
                 value_ref
             } else {
                 panic!("cannot coerce {:?} to string", value_ref);
             }
         }
         Type::Boolean => {
-            if value_ref.is_match(|v| matches!(v, Value::Boolean(_)) || matches!(v, Value::Undefined)) {
+            if value_ref
+                .is_match(|v| matches!(v, Value::Boolean(_)) || matches!(v, Value::Undefined))
+            {
                 value_ref
             } else {
                 panic!("cannot coerce {:?} to boolean", value_ref);
             }
         }
         Type::Char => {
-            if value_ref.is_match(|v| matches!(v, Value::Char(_)) || matches!(v, Value::Undefined)) {
+            if value_ref.is_match(|v| matches!(v, Value::Char(_)) || matches!(v, Value::Undefined))
+            {
                 value_ref
             } else {
                 panic!("cannot coerce {:?} to char", value_ref);
             }
         }
-        Type::Array { elem_type, .. } | Type::Slice { elem_type } => {
-            match value_ref.get_value() {
-                Value::Array { arr, dimensions } => {
-                    let needs_coercion = arr.iter().any(|elem| {
-                        value_to_type(&elem.get_value())
-                            .map(|elem_type_value| elem_type_value != *elem_type.deref())
-                            .unwrap_or(false)
-                    });
-                    if !needs_coercion {
-                        value_ref
+        Type::Array { elem_type, .. } | Type::Slice { elem_type } => match value_ref.get_value() {
+            Value::Array { arr, dimensions } => {
+                let needs_coercion = arr.iter().any(|elem| {
+                    value_to_type(&elem.get_value())
+                        .map(|elem_type_value| elem_type_value != *elem_type.deref())
+                        .unwrap_or(false)
+                });
+                if !needs_coercion {
+                    value_ref
+                } else {
+                    let returned = value_ref.returned();
+                    let converted = Value::Array {
+                        arr: arr
+                            .into_iter()
+                            .map(|elem| coerce_value_to_type(elem, elem_type.deref()))
+                            .collect(),
+                        dimensions,
+                    };
+                    let value_ref = ValueRef::heap(converted);
+                    if returned {
+                        value_ref.to_returned()
                     } else {
-                        let returned = value_ref.returned();
-                        let converted = Value::Array {
-                            arr: arr
-                                .into_iter()
-                                .map(|elem| coerce_value_to_type(elem, elem_type.deref()))
-                                .collect(),
-                            dimensions,
-                        };
-                        let value_ref = ValueRef::heap(converted);
-                        if returned {
-                            value_ref.to_returned()
-                        } else {
-                            value_ref
-                        }
+                        value_ref
                     }
                 }
-                Value::Undefined => value_ref,
-                other => panic!("cannot coerce {:?} to {:?}", other, target),
             }
-        }
+            Value::Undefined => value_ref,
+            other => panic!("cannot coerce {:?} to {:?}", other, target),
+        },
         Type::Custom(expected_name) => {
             if value_ref.is_match(|v| match v {
                 Value::StructInstance { name, .. } => name == expected_name,
@@ -462,13 +465,20 @@ fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
             }
         }
         Type::Function { .. } => {
-            if value_ref.is_match(|v| matches!(v, Value::Function { .. } | Value::Closure { .. } | Value::Undefined)) {
+            if value_ref.is_match(|v| {
+                matches!(
+                    v,
+                    Value::Function { .. } | Value::Closure { .. } | Value::Undefined
+                )
+            }) {
                 value_ref
             } else {
                 panic!("cannot coerce {:?} to {:?}", value_ref, target);
             }
         }
-        Type::Void | Type::SkSelf => value_ref,
+        Type::Pointer { .. } | Type::Allocator | Type::Arena | Type::Void | Type::SkSelf => {
+            value_ref
+        }
     }
 }
 
@@ -1335,8 +1345,7 @@ fn set_array_ref_element(arr_ref: &ValueRef, coordinates: &Vec<i64>, new_value: 
         }
         ValueRef::Heap { value, .. } => {
             let mut value_ref = value.borrow_mut();
-            let coerced = get_array_element(value_ref.deref(), coordinates)
-                .get_value();
+            let coerced = get_array_element(value_ref.deref(), coordinates).get_value();
             let new_value = if let Some(target_type) = value_to_type(&coerced) {
                 coerce_value_to_type(new_value, &target_type)
             } else {
@@ -1846,7 +1855,10 @@ pub fn evaluate_node(
                     .unwrap_or_else(|| panic!("unknown field `{}` on `{}`", name, struct_def.name));
                 field_values.insert(
                     name.to_string(),
-                    coerce_value_to_type(evaluate_node(node, stack, global_environment), &field_type),
+                    coerce_value_to_type(
+                        evaluate_node(node, stack, global_environment),
+                        &field_type,
+                    ),
                 );
             }
             ValueRef::heap(Value::StructInstance {
@@ -1911,7 +1923,8 @@ pub fn evaluate_node(
                 if name != "fill" && name != "new" {
                     panic!("unsupported array static method `{}`", name);
                 }
-                let int_dimensions = evaluate_array_dimensions(dimensions, stack, global_environment);
+                let int_dimensions =
+                    evaluate_array_dimensions(dimensions, stack, global_environment);
                 let size = int_dimensions
                     .iter()
                     .fold(1usize, |acc, dim| acc.saturating_mul(*dim as usize));

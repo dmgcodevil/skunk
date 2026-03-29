@@ -16,7 +16,12 @@ enum LlvmType {
     Char16,
     I1,
     PtrI8,
+    Allocator,
+    Arena,
     Struct(String),
+    Pointer {
+        target_type: Box<LlvmType>,
+    },
     Function {
         parameters: Vec<LlvmType>,
         return_type: Box<LlvmType>,
@@ -43,7 +48,10 @@ impl LlvmType {
             LlvmType::Char16 => "i16".to_string(),
             LlvmType::I1 => "i1".to_string(),
             LlvmType::PtrI8 => "ptr".to_string(),
+            LlvmType::Allocator => "ptr".to_string(),
+            LlvmType::Arena => "ptr".to_string(),
             LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
+            LlvmType::Pointer { .. } => "ptr".to_string(),
             LlvmType::Function { .. } => "{ ptr, ptr }".to_string(),
             LlvmType::Slice { .. } => "{ ptr, i32 }".to_string(),
             LlvmType::Array { elem_type, len } => format!("[{} x {}]", len, elem_type.ir()),
@@ -133,6 +141,8 @@ fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<
         Type::Boolean => Ok(LlvmType::I1),
         Type::String => Ok(LlvmType::PtrI8),
         Type::Char => Ok(LlvmType::Char16),
+        Type::Allocator => Ok(LlvmType::Allocator),
+        Type::Arena => Ok(LlvmType::Arena),
         Type::Array {
             elem_type,
             dimensions,
@@ -148,6 +158,9 @@ fn llvm_type(sk_type: &Type, structs: &HashMap<String, StructLayout>) -> Result<
         }
         Type::Slice { elem_type } => Ok(LlvmType::Slice {
             elem_type: Box::new(llvm_type(elem_type, structs)?),
+        }),
+        Type::Pointer { target_type } => Ok(LlvmType::Pointer {
+            target_type: Box::new(llvm_type(target_type, structs)?),
         }),
         Type::Function {
             parameters,
@@ -429,7 +442,12 @@ impl<'a> FunctionCompiler<'a> {
                 condition,
                 update,
                 body,
-            } => self.compile_for(init.as_deref(), condition.as_deref(), update.as_deref(), body),
+            } => self.compile_for(
+                init.as_deref(),
+                condition.as_deref(),
+                update.as_deref(),
+                body,
+            ),
             Node::Return(value) => {
                 match value {
                     Some(value) => {
@@ -652,6 +670,9 @@ impl<'a> FunctionCompiler<'a> {
                 ));
                 Ok(())
             }
+            LlvmType::Allocator | LlvmType::Arena | LlvmType::Pointer { .. } => {
+                Err("cannot print a pointer-like value directly".to_string())
+            }
             LlvmType::Struct(_) => Err("cannot print a struct value directly".to_string()),
             LlvmType::Function { .. } => Err("cannot print a function value directly".to_string()),
             LlvmType::Slice { .. } => Err("cannot print a slice value directly".to_string()),
@@ -737,7 +758,9 @@ impl<'a> FunctionCompiler<'a> {
                 match operator {
                     UnaryOperator::Plus => Ok(value),
                     UnaryOperator::Minus => {
-                        if !is_numeric_llvm_type(&value.llvm_type) || value.llvm_type == LlvmType::Char16 {
+                        if !is_numeric_llvm_type(&value.llvm_type)
+                            || value.llvm_type == LlvmType::Char16
+                        {
                             return Err("unary `-` requires a numeric operand".to_string());
                         }
                         let target = if matches!(value.llvm_type, LlvmType::I8 | LlvmType::I16) {
@@ -753,7 +776,11 @@ impl<'a> FunctionCompiler<'a> {
                             "sub"
                         };
                         let zero = if matches!(target, LlvmType::F32 | LlvmType::F64) {
-                            if target == LlvmType::F32 { "0.0" } else { "0.0" }
+                            if target == LlvmType::F32 {
+                                "0.0"
+                            } else {
+                                "0.0"
+                            }
                         } else {
                             "0"
                         };
@@ -805,6 +832,75 @@ impl<'a> FunctionCompiler<'a> {
         arguments: &[Node],
     ) -> Result<ExprValue, String> {
         match sk_type {
+            Type::Custom(system_name) if system_name == "System" && name == "allocator" => {
+                if !arguments.is_empty() {
+                    return Err("System::allocator expects no arguments".to_string());
+                }
+                let temp = self.next_temp();
+                self.emit_line(format!("{} = call ptr @skunk_system_allocator()", temp));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::Allocator,
+                    value: temp,
+                })
+            }
+            Type::Arena if name == "init" => {
+                if arguments.len() != 1 {
+                    return Err("Arena::init expects exactly one argument".to_string());
+                }
+                let allocator =
+                    self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::Allocator))?;
+                let allocator = self.coerce_expr(allocator, &LlvmType::Allocator, "Arena::init")?;
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call ptr @skunk_arena_init(ptr {})",
+                    temp, allocator.value
+                ));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::Arena,
+                    value: temp,
+                })
+            }
+            Type::Slice { .. } if name == "alloc" => {
+                if arguments.len() != 2 {
+                    return Err("slice alloc expects allocator and length".to_string());
+                }
+                let allocator =
+                    self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::Allocator))?;
+                let allocator =
+                    self.coerce_expr(allocator, &LlvmType::Allocator, "slice alloc allocator")?;
+                let len = self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I32))?;
+                let len = self.coerce_expr(len, &LlvmType::I32, "slice alloc length")?;
+                let llvm_slice_type = llvm_type(sk_type, self.structs)?;
+                let elem_type = match &llvm_slice_type {
+                    LlvmType::Slice { elem_type } => elem_type.as_ref().clone(),
+                    _ => unreachable!(),
+                };
+                let elem_size = self.size_of(&elem_type);
+                let data_ptr = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call ptr @skunk_alloc_buffer(ptr {}, i64 {}, i32 {})",
+                    data_ptr, allocator.value, elem_size, len.value
+                ));
+                let with_ptr = self.next_temp();
+                self.emit_line(format!(
+                    "{} = insertvalue {} zeroinitializer, ptr {}, 0",
+                    with_ptr,
+                    llvm_slice_type.ir(),
+                    data_ptr
+                ));
+                let full = self.next_temp();
+                self.emit_line(format!(
+                    "{} = insertvalue {} {}, i32 {}, 1",
+                    full,
+                    llvm_slice_type.ir(),
+                    with_ptr,
+                    len.value
+                ));
+                Ok(ExprValue {
+                    llvm_type: llvm_slice_type,
+                    value: full,
+                })
+            }
             Type::Array { .. } if name == "fill" || name == "new" => {
                 if arguments.len() != 1 {
                     return Err(format!(
@@ -814,6 +910,43 @@ impl<'a> FunctionCompiler<'a> {
                 }
                 let llvm_type = llvm_type(sk_type, self.structs)?;
                 self.compile_array_fill(&llvm_type, &arguments[0])
+            }
+            Type::Custom(_)
+            | Type::Byte
+            | Type::Short
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Boolean
+            | Type::Char
+            | Type::String
+            | Type::Pointer { .. }
+                if name == "create" =>
+            {
+                if arguments.len() != 1 {
+                    return Err(format!(
+                        "{}::create expects exactly one allocator argument",
+                        ast::type_to_string(sk_type)
+                    ));
+                }
+                let allocator =
+                    self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::Allocator))?;
+                let allocator = self.coerce_expr(allocator, &LlvmType::Allocator, "type create")?;
+                let target_type = llvm_type(sk_type, self.structs)?;
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call ptr @skunk_alloc_create(ptr {}, i64 {})",
+                    temp,
+                    allocator.value,
+                    self.size_of(&target_type)
+                ));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::Pointer {
+                        target_type: Box::new(target_type),
+                    },
+                    value: temp,
+                })
             }
             Type::Array { .. } => Err(format!(
                 "array static method `{}` is not supported in LLVM backend",
@@ -846,8 +979,10 @@ impl<'a> FunctionCompiler<'a> {
                     value: "zeroinitializer".to_string(),
                 };
                 for (index, element) in elements.iter().enumerate() {
-                    let element = self.compile_expr_with_expected(element, Some(elem_type.as_ref()))?;
-                    let element = self.coerce_expr(element, elem_type.as_ref(), "array literal element")?;
+                    let element =
+                        self.compile_expr_with_expected(element, Some(elem_type.as_ref()))?;
+                    let element =
+                        self.coerce_expr(element, elem_type.as_ref(), "array literal element")?;
                     let temp = self.next_temp();
                     self.emit_line(format!(
                         "{} = insertvalue {} {}, {} {}, {}",
@@ -942,7 +1077,9 @@ impl<'a> FunctionCompiler<'a> {
         end: Option<&Node>,
     ) -> Result<ExprValue, String> {
         match current_type {
-            LlvmType::Array { .. } => self.build_slice_from_array_ptr(ptr, current_type, start, end),
+            LlvmType::Array { .. } => {
+                self.build_slice_from_array_ptr(ptr, current_type, start, end)
+            }
             LlvmType::Slice { elem_type } => {
                 let slice_value = self.load_from_ptr(ptr, current_type)?;
                 let data_ptr = self.extract_slice_data(&slice_value)?;
@@ -1152,11 +1289,12 @@ impl<'a> FunctionCompiler<'a> {
         };
 
         for (field_name, field_node) in fields {
-            let (index, field_type) = self
-                .struct_field_info(struct_name, field_name)
-                .ok_or_else(|| format!("unknown field `{}` on struct `{}`", field_name, struct_name))?;
-            let field_value =
-                self.compile_expr_with_expected(field_node, Some(&field_type))?;
+            let (index, field_type) =
+                self.struct_field_info(struct_name, field_name)
+                    .ok_or_else(|| {
+                        format!("unknown field `{}` on struct `{}`", field_name, struct_name)
+                    })?;
+            let field_value = self.compile_expr_with_expected(field_node, Some(&field_type))?;
             let field_value = self.coerce_expr(field_value, &field_type, "struct field")?;
             let temp = self.next_temp();
             self.emit_line(format!(
@@ -1198,9 +1336,9 @@ impl<'a> FunctionCompiler<'a> {
     fn try_compile_member_call(&mut self, nodes: &[Node]) -> Result<Option<ExprValue>, String> {
         let (receiver_nodes, method_name, arguments) = match nodes.last() {
             Some(Node::MemberAccess { member, .. }) => match member.as_ref() {
-                Node::FunctionCall { name, arguments, .. } => {
-                    (&nodes[..nodes.len() - 1], name.as_str(), arguments)
-                }
+                Node::FunctionCall {
+                    name, arguments, ..
+                } => (&nodes[..nodes.len() - 1], name.as_str(), arguments),
                 _ => return Ok(None),
             },
             _ => return Ok(None),
@@ -1215,8 +1353,127 @@ impl<'a> FunctionCompiler<'a> {
             .llvm_type
         };
 
+        if receiver_type == LlvmType::Allocator {
+            if arguments.len() != 1 {
+                return Err(format!(
+                    "Allocator method `{}` expects exactly one argument list",
+                    method_name
+                ));
+            }
+            let method_args = &arguments[0];
+            let allocator_value = self.compile_expr(&Node::Access {
+                nodes: receiver_nodes.to_vec(),
+            })?;
+            return match method_name {
+                "destroy" => {
+                    if method_args.len() != 1 {
+                        return Err(
+                            "Allocator.destroy expects exactly one pointer argument".to_string()
+                        );
+                    }
+                    let ptr_value = self.compile_expr(&method_args[0])?;
+                    match ptr_value.llvm_type {
+                        LlvmType::Pointer { .. } => {
+                            self.emit_line(format!(
+                                "call void @skunk_alloc_destroy(ptr {}, ptr {})",
+                                allocator_value.value, ptr_value.value
+                            ));
+                            Ok(Some(ExprValue {
+                                llvm_type: LlvmType::Void,
+                                value: "void".to_string(),
+                            }))
+                        }
+                        other => Err(format!(
+                            "Allocator.destroy expects a pointer argument, found `{}`",
+                            other.ir()
+                        )),
+                    }
+                }
+                "free" => {
+                    if method_args.len() != 1 {
+                        return Err("Allocator.free expects exactly one slice argument".to_string());
+                    }
+                    let slice_value = self.compile_expr(&method_args[0])?;
+                    match slice_value.llvm_type {
+                        LlvmType::Slice { .. } => {
+                            let data_ptr = self.extract_slice_data(&slice_value)?;
+                            self.emit_line(format!(
+                                "call void @skunk_alloc_free(ptr {}, ptr {})",
+                                allocator_value.value, data_ptr
+                            ));
+                            Ok(Some(ExprValue {
+                                llvm_type: LlvmType::Void,
+                                value: "void".to_string(),
+                            }))
+                        }
+                        other => Err(format!(
+                            "Allocator.free expects a slice argument, found `{}`",
+                            other.ir()
+                        )),
+                    }
+                }
+                _ => Err(format!("unknown Allocator method `{}`", method_name)),
+            };
+        }
+
+        if receiver_type == LlvmType::Arena {
+            if arguments.len() != 1 || !arguments[0].is_empty() {
+                return Err(format!(
+                    "Arena method `{}` expects no arguments",
+                    method_name
+                ));
+            }
+            let arena_value = self.compile_expr(&Node::Access {
+                nodes: receiver_nodes.to_vec(),
+            })?;
+            return match method_name {
+                "allocator" => {
+                    let temp = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = call ptr @skunk_arena_allocator(ptr {})",
+                        temp, arena_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Allocator,
+                        value: temp,
+                    }))
+                }
+                "reset" => {
+                    self.emit_line(format!(
+                        "call void @skunk_arena_reset(ptr {})",
+                        arena_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                "deinit" => {
+                    self.emit_line(format!(
+                        "call void @skunk_arena_deinit(ptr {})",
+                        arena_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                _ => Err(format!("unknown Arena method `{}`", method_name)),
+            };
+        }
+
         let struct_name = match receiver_type {
             LlvmType::Struct(name) => name,
+            LlvmType::Pointer { target_type } => match *target_type {
+                LlvmType::Struct(name) => name,
+                other => {
+                    return Err(format!(
+                        "method `{}` requires a struct receiver, found `{}`",
+                        method_name,
+                        other.ir()
+                    ))
+                }
+            },
             other => {
                 return Err(format!(
                     "method `{}` requires a struct receiver, found `{}`",
@@ -1234,7 +1491,10 @@ impl<'a> FunctionCompiler<'a> {
             .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, struct_name))?;
 
         let receiver_ptr = match self.resolve_access_ptr(receiver_nodes) {
-            Ok((ptr, _)) => ptr,
+            Ok((ptr, llvm_type)) => match llvm_type {
+                LlvmType::Pointer { .. } => self.load_from_ptr(&ptr, &llvm_type)?.value,
+                _ => ptr,
+            },
             Err(_) => {
                 let temp_var =
                     self.emit_heap_alloc(LlvmType::Struct(struct_name.clone()), "receiver_tmp");
@@ -1336,6 +1596,14 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn apply_access_type_step(&self, current: LlvmType, node: &Node) -> Result<LlvmType, String> {
+        let current = match (&current, node) {
+            (LlvmType::Pointer { target_type }, Node::MemberAccess { .. })
+            | (LlvmType::Pointer { target_type }, Node::ArrayAccess { .. })
+            | (LlvmType::Pointer { target_type }, Node::SliceAccess { .. }) => {
+                target_type.as_ref().clone()
+            }
+            _ => current,
+        };
         match node {
             Node::ArrayAccess { coordinates } => {
                 let mut current = current;
@@ -1403,12 +1671,27 @@ impl<'a> FunctionCompiler<'a> {
             }
             _ => {
                 return Err(
-                    "LLVM backend currently supports only identifier-rooted access".to_string()
+                    "LLVM backend currently supports only identifier-rooted access".to_string(),
                 )
             }
         };
 
         for node in &nodes[1..] {
+            if matches!(
+                (&current_type, node),
+                (LlvmType::Pointer { .. }, Node::MemberAccess { .. })
+                    | (LlvmType::Pointer { .. }, Node::ArrayAccess { .. })
+                    | (LlvmType::Pointer { .. }, Node::SliceAccess { .. })
+            ) {
+                let loaded = self.load_from_ptr(&ptr, &current_type)?;
+                match current_type.clone() {
+                    LlvmType::Pointer { target_type } => {
+                        ptr = loaded.value;
+                        current_type = *target_type;
+                    }
+                    _ => unreachable!(),
+                }
+            }
             match node {
                 Node::ArrayAccess { coordinates } => {
                     for coordinate in coordinates {
@@ -1465,10 +1748,10 @@ impl<'a> FunctionCompiler<'a> {
                 Node::MemberAccess { member, .. } => match member.as_ref() {
                     Node::Identifier(name) if name == "len" => break,
                     Node::Identifier(name) => match current_type.clone() {
+                        LlvmType::Pointer { .. } => unreachable!(),
                         LlvmType::Struct(struct_name) => {
-                            let (field_index, field_type) = self
-                                .struct_field_info(&struct_name, name)
-                                .ok_or_else(|| {
+                            let (field_index, field_type) =
+                                self.struct_field_info(&struct_name, name).ok_or_else(|| {
                                     format!(
                                         "unknown field `{}` on struct `{}` in LLVM backend",
                                         name, struct_name
@@ -1484,6 +1767,13 @@ impl<'a> FunctionCompiler<'a> {
                             ));
                             ptr = temp;
                             current_type = field_type;
+                        }
+                        other @ LlvmType::Allocator | other @ LlvmType::Arena => {
+                            return Err(format!(
+                                "member `{}` is not a field on `{}` in LLVM backend",
+                                name,
+                                other.ir()
+                            ))
                         }
                         other => {
                             return Err(format!(
@@ -1572,7 +1862,11 @@ impl<'a> FunctionCompiler<'a> {
 
         let lambda_id = *self.lambda_counter;
         *self.lambda_counter += 1;
-        let symbol_name = format!("skunk_lambda_{}_{}", sanitize_name(self.function_name), lambda_id);
+        let symbol_name = format!(
+            "skunk_lambda_{}_{}",
+            sanitize_name(self.function_name),
+            lambda_id
+        );
         let env_type_name = format!("{}_env", symbol_name);
         let env = ClosureEnv {
             type_name: env_type_name.clone(),
@@ -1610,7 +1904,13 @@ impl<'a> FunctionCompiler<'a> {
         let param_defs = parameters
             .iter()
             .enumerate()
-            .map(|(index, (_, ty))| Ok(format!("{} %arg{}", llvm_type(ty, self.structs)?.ir(), index + 1)))
+            .map(|(index, (_, ty))| {
+                Ok(format!(
+                    "{} %arg{}",
+                    llvm_type(ty, self.structs)?.ir(),
+                    index + 1
+                ))
+            })
             .collect::<Result<Vec<_>, String>>()?;
         let mut function_ir = String::new();
         let _ = writeln!(
@@ -1776,11 +2076,7 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         if return_type == LlvmType::Void {
-            self.emit_line(format!(
-                "call void {}({})",
-                fn_ptr,
-                arg_parts.join(", ")
-            ));
+            self.emit_line(format!("call void {}({})", fn_ptr, arg_parts.join(", ")));
             Ok(ExprValue {
                 llvm_type: LlvmType::Void,
                 value: "void".to_string(),
@@ -2096,6 +2392,18 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: LlvmType::PtrI8,
                 value: "null".to_string(),
             },
+            LlvmType::Allocator => ExprValue {
+                llvm_type: LlvmType::Allocator,
+                value: "null".to_string(),
+            },
+            LlvmType::Arena => ExprValue {
+                llvm_type: LlvmType::Arena,
+                value: "null".to_string(),
+            },
+            LlvmType::Pointer { .. } => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "null".to_string(),
+            },
             LlvmType::Struct(_) => ExprValue {
                 llvm_type: llvm_type.clone(),
                 value: "zeroinitializer".to_string(),
@@ -2147,6 +2455,16 @@ impl<'a> FunctionCompiler<'a> {
                     value.llvm_type.ir()
                 ))
             }
+            (LlvmType::Pointer { .. }, LlvmType::Pointer { .. })
+            | (LlvmType::Allocator, LlvmType::Allocator)
+            | (LlvmType::Arena, LlvmType::Arena) => {
+                return Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                ))
+            }
             (LlvmType::Function { .. }, LlvmType::Function { .. }) => {
                 return Err(format!(
                     "type mismatch in {}: expected `{}`, got `{}`",
@@ -2169,22 +2487,50 @@ impl<'a> FunctionCompiler<'a> {
             (LlvmType::I16, LlvmType::I32) => format!("{} = sext i16 {} to i32", temp, value.value),
             (LlvmType::I16, LlvmType::I64) => format!("{} = sext i16 {} to i64", temp, value.value),
             (LlvmType::I32, LlvmType::I64) => format!("{} = sext i32 {} to i64", temp, value.value),
-            (LlvmType::Char16, LlvmType::I32) => format!("{} = zext i16 {} to i32", temp, value.value),
-            (LlvmType::I32, LlvmType::I16) => format!("{} = trunc i32 {} to i16", temp, value.value),
+            (LlvmType::Char16, LlvmType::I32) => {
+                format!("{} = zext i16 {} to i32", temp, value.value)
+            }
+            (LlvmType::I32, LlvmType::I16) => {
+                format!("{} = trunc i32 {} to i16", temp, value.value)
+            }
             (LlvmType::I32, LlvmType::I8) => format!("{} = trunc i32 {} to i8", temp, value.value),
-            (LlvmType::I64, LlvmType::I32) => format!("{} = trunc i64 {} to i32", temp, value.value),
-            (LlvmType::I64, LlvmType::I16) => format!("{} = trunc i64 {} to i16", temp, value.value),
+            (LlvmType::I64, LlvmType::I32) => {
+                format!("{} = trunc i64 {} to i32", temp, value.value)
+            }
+            (LlvmType::I64, LlvmType::I16) => {
+                format!("{} = trunc i64 {} to i16", temp, value.value)
+            }
             (LlvmType::I64, LlvmType::I8) => format!("{} = trunc i64 {} to i8", temp, value.value),
-            (LlvmType::I8, LlvmType::F32) => format!("{} = sitofp i8 {} to float", temp, value.value),
-            (LlvmType::I8, LlvmType::F64) => format!("{} = sitofp i8 {} to double", temp, value.value),
-            (LlvmType::I16, LlvmType::F32) => format!("{} = sitofp i16 {} to float", temp, value.value),
-            (LlvmType::I16, LlvmType::F64) => format!("{} = sitofp i16 {} to double", temp, value.value),
-            (LlvmType::I32, LlvmType::F32) => format!("{} = sitofp i32 {} to float", temp, value.value),
-            (LlvmType::I32, LlvmType::F64) => format!("{} = sitofp i32 {} to double", temp, value.value),
-            (LlvmType::I64, LlvmType::F32) => format!("{} = sitofp i64 {} to float", temp, value.value),
-            (LlvmType::I64, LlvmType::F64) => format!("{} = sitofp i64 {} to double", temp, value.value),
-            (LlvmType::F32, LlvmType::F64) => format!("{} = fpext float {} to double", temp, value.value),
-            (LlvmType::F64, LlvmType::F32) => format!("{} = fptrunc double {} to float", temp, value.value),
+            (LlvmType::I8, LlvmType::F32) => {
+                format!("{} = sitofp i8 {} to float", temp, value.value)
+            }
+            (LlvmType::I8, LlvmType::F64) => {
+                format!("{} = sitofp i8 {} to double", temp, value.value)
+            }
+            (LlvmType::I16, LlvmType::F32) => {
+                format!("{} = sitofp i16 {} to float", temp, value.value)
+            }
+            (LlvmType::I16, LlvmType::F64) => {
+                format!("{} = sitofp i16 {} to double", temp, value.value)
+            }
+            (LlvmType::I32, LlvmType::F32) => {
+                format!("{} = sitofp i32 {} to float", temp, value.value)
+            }
+            (LlvmType::I32, LlvmType::F64) => {
+                format!("{} = sitofp i32 {} to double", temp, value.value)
+            }
+            (LlvmType::I64, LlvmType::F32) => {
+                format!("{} = sitofp i64 {} to float", temp, value.value)
+            }
+            (LlvmType::I64, LlvmType::F64) => {
+                format!("{} = sitofp i64 {} to double", temp, value.value)
+            }
+            (LlvmType::F32, LlvmType::F64) => {
+                format!("{} = fpext float {} to double", temp, value.value)
+            }
+            (LlvmType::F64, LlvmType::F32) => {
+                format!("{} = fptrunc double {} to float", temp, value.value)
+            }
             _ => {
                 return Err(format!(
                     "type mismatch in {}: expected `{}`, got `{}`",
@@ -2209,7 +2555,10 @@ impl<'a> FunctionCompiler<'a> {
             return existing.name.clone();
         }
         let name = format!("{}.{}", prefix, self.globals.len());
-        self.globals.push(GlobalString { name: name.clone(), bytes });
+        self.globals.push(GlobalString {
+            name: name.clone(),
+            bytes,
+        });
         name
     }
 
@@ -2265,7 +2614,12 @@ impl<'a> FunctionCompiler<'a> {
     }
 
     fn next_label(&mut self, prefix: &str) -> String {
-        let label = format!("{}_{}_{}", sanitize_name(self.function_name), prefix, self.label_counter);
+        let label = format!(
+            "{}_{}_{}",
+            sanitize_name(self.function_name),
+            prefix,
+            self.label_counter
+        );
         self.label_counter += 1;
         label
     }
@@ -2294,7 +2648,12 @@ impl<'a> FunctionCompiler<'a> {
             LlvmType::I8 | LlvmType::I1 => 1,
             LlvmType::I16 | LlvmType::Char16 => 2,
             LlvmType::I32 | LlvmType::F32 => 4,
-            LlvmType::I64 | LlvmType::F64 | LlvmType::PtrI8 => 8,
+            LlvmType::I64
+            | LlvmType::F64
+            | LlvmType::PtrI8
+            | LlvmType::Allocator
+            | LlvmType::Arena
+            | LlvmType::Pointer { .. } => 8,
             LlvmType::Function { .. } => 8,
             LlvmType::Struct(name) => self
                 .structs
@@ -2319,7 +2678,12 @@ impl<'a> FunctionCompiler<'a> {
             LlvmType::I8 | LlvmType::I1 => 1,
             LlvmType::I16 | LlvmType::Char16 => 2,
             LlvmType::I32 | LlvmType::F32 => 4,
-            LlvmType::I64 | LlvmType::F64 | LlvmType::PtrI8 => 8,
+            LlvmType::I64
+            | LlvmType::F64
+            | LlvmType::PtrI8
+            | LlvmType::Allocator
+            | LlvmType::Arena
+            | LlvmType::Pointer { .. } => 8,
             LlvmType::Function { .. } => 16,
             LlvmType::Slice { .. } => 16,
             LlvmType::Array { elem_type, len } => self.size_of(elem_type) * len,
@@ -2373,11 +2737,18 @@ pub fn compile_to_executable(
 ) -> Result<CompiledArtifact, String> {
     let llvm_ir = compile_to_llvm_ir(program)?;
     let llvm_ir_path = output_path.with_extension("ll");
-    fs::write(&llvm_ir_path, llvm_ir)
-        .map_err(|err| format!("failed to write LLVM IR to {}: {}", llvm_ir_path.display(), err))?;
+    fs::write(&llvm_ir_path, llvm_ir).map_err(|err| {
+        format!(
+            "failed to write LLVM IR to {}: {}",
+            llvm_ir_path.display(),
+            err
+        )
+    })?;
 
+    let runtime_c_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_runtime.c");
     let status = Command::new("clang")
         .arg(&llvm_ir_path)
+        .arg(&runtime_c_path)
         .arg("-O2")
         .arg("-o")
         .arg(output_path)
@@ -2533,7 +2904,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 .parameters
                 .iter()
                 .enumerate()
-                .map(|(index, (_, ty))| Ok(format!("{} %arg{}", llvm_type(ty, &structs)?.ir(), index)))
+                .map(|(index, (_, ty))| {
+                    Ok(format!("{} %arg{}", llvm_type(ty, &structs)?.ir(), index))
+                })
                 .collect::<Result<Vec<_>, String>>()?
         };
         let compiler = FunctionCompiler::new(
@@ -2564,9 +2937,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         function_irs.push(function_ir);
     }
 
-    let main_signature = signatures
-        .get("main")
-        .expect("validated above");
+    let main_signature = signatures.get("main").expect("validated above");
     if !main_signature.parameters.is_empty() {
         return Err("LLVM backend requires `main` to take no parameters".to_string());
     }
@@ -2594,6 +2965,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         LlvmType::PtrI8 => {
             return Err("LLVM backend does not support `main` returning string yet".to_string())
         }
+        LlvmType::Allocator | LlvmType::Arena | LlvmType::Pointer { .. } => {
+            return Err("LLVM backend does not support `main` returning pointer-like values yet".to_string())
+        }
         LlvmType::Function { .. } => {
             return Err("LLVM backend does not support `main` returning functions yet".to_string())
         }
@@ -2611,6 +2985,15 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let mut ir = String::new();
     let _ = writeln!(ir, "declare i32 @printf(ptr, ...)");
     let _ = writeln!(ir, "declare ptr @malloc(i64)");
+    let _ = writeln!(ir, "declare ptr @skunk_system_allocator()");
+    let _ = writeln!(ir, "declare ptr @skunk_arena_init(ptr)");
+    let _ = writeln!(ir, "declare ptr @skunk_arena_allocator(ptr)");
+    let _ = writeln!(ir, "declare void @skunk_arena_reset(ptr)");
+    let _ = writeln!(ir, "declare void @skunk_arena_deinit(ptr)");
+    let _ = writeln!(ir, "declare ptr @skunk_alloc_create(ptr, i64)");
+    let _ = writeln!(ir, "declare ptr @skunk_alloc_buffer(ptr, i64, i32)");
+    let _ = writeln!(ir, "declare void @skunk_alloc_destroy(ptr, ptr)");
+    let _ = writeln!(ir, "declare void @skunk_alloc_free(ptr, ptr)");
     let _ = writeln!(ir);
     for layout in structs.values() {
         let field_types = layout
@@ -3051,5 +3434,146 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "7\n");
+    }
+
+    #[test]
+    fn runs_compiled_pointer_allocator_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+
+                function sum(self): int {
+                    return self.x + self.y;
+                }
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                arena: Arena = Arena::init(heap);
+                alloc: Allocator = arena.allocator();
+                p: *Point = Point::create(alloc);
+                p.x = 4;
+                p.y = 5;
+                print(p.sum());
+                arena.deinit();
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "9\n");
+    }
+
+    #[test]
+    fn runs_compiled_function_returning_pointer_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            function create_point(alloc: Allocator): *Point {
+                point: *Point = Point::create(alloc);
+                point.x = 11;
+                point.y = 31;
+                return point;
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                point: *Point = create_point(heap);
+                print(point.x);
+                print(point.y);
+                heap.destroy(point);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "11\n31\n");
+    }
+
+    #[test]
+    fn runs_compiled_slice_allocator_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                heap: Allocator = System::allocator();
+                arena: Arena = Arena::init(heap);
+                alloc: Allocator = arena.allocator();
+                values: []int = []int::alloc(alloc, 3);
+                values[1] = 7;
+                print(values.len);
+                print(values[1]);
+                arena.deinit();
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "3\n7\n");
+    }
+
+    #[test]
+    fn runs_compiled_allocator_destroy_and_free_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                p: *Point = Point::create(heap);
+                p.x = 12;
+                print(p.x);
+                heap.destroy(p);
+
+                values: []int = []int::alloc(heap, 2);
+                values[0] = 3;
+                print(values[0]);
+                heap.free(values);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "12\n3\n");
+    }
+
+    #[test]
+    fn runs_compiled_arena_destroy_and_free_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                arena: Arena = Arena::init(heap);
+                alloc: Allocator = arena.allocator();
+
+                p: *Point = Point::create(alloc);
+                p.x = 2;
+                print(p.x);
+                alloc.destroy(p);
+
+                values: []int = []int::alloc(alloc, 2);
+                values[1] = 8;
+                print(values[1]);
+                alloc.free(values);
+
+                arena.reset();
+                arena.deinit();
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "2\n8\n");
     }
 }
