@@ -14,6 +14,7 @@
 - **Modules and Imports**: `module foo.bar;`, `import foo.bar;`, and `export` for multi-file Skunk programs with module APIs
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Enums and Match**: Generic enums with unit and single-payload variants, plus exhaustive enum-focused `match`
+- **Traits**: Compile-time traits with explicit `impl Trait for Type` declarations and generic bounds like `T: Writer + Flushable`
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
 - **Type Inference**: Planned for a cleaner developer experience
 - **String Interpolation and Concatenation**: Upcoming for intuitive string operations
@@ -79,6 +80,7 @@ Modules V1 notes:
 - the module root is the directory containing the entry file you compile
 - if a module uses `export`, only exported top-level declarations remain visible to importers
 - if a module uses no `export`, all top-level declarations stay visible for backward compatibility
+- traits may be exported the same way as other top-level declarations
 
 ### Variables and Control Flow
 ```skunk
@@ -150,6 +152,42 @@ function main(): void {
     print(unwrap(Option[int]::Some(7)));
 }
 ```
+
+### Traits and Bounds
+```skunk
+trait Writer {
+    function write(self, value: int): int;
+}
+
+trait Resettable {
+    function reset(self): void;
+}
+
+struct Counter {
+    value: int;
+
+    function write(self, value: int): int {
+        self.value = self.value + value;
+        return self.value;
+    }
+
+    function reset(self): void {
+        self.value = 0;
+    }
+}
+
+impl Writer, Resettable for Counter {}
+
+function use_counter[T: Writer + Resettable](counter: *T): int {
+    counter.reset();
+    return counter.write(41);
+}
+```
+
+Traits V1 notes:
+- traits are compile-time constraints only; there are no trait objects or runtime interface values yet
+- `impl Writer, Flushable for TextWriter {}` is sugar for multiple explicit impls
+- impl targets are concrete types only for now; generic impl targets are not supported yet
 
 ### Pointers and Allocators
 ```skunk

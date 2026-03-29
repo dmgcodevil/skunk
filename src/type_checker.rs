@@ -205,6 +205,7 @@ impl GlobalScope {
                 self.functions
                     .insert(name.clone(), func_decl_node_to_symbol(node));
             }
+            Node::TraitDeclaration { .. } | Node::ImplDeclaration { .. } => {}
             Node::VariableDeclaration {
                 var_type,
                 name,
@@ -842,7 +843,10 @@ fn resolve_type(
         },
         Node::StructDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
         Node::EnumDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
-        Node::GenericStructDeclaration { .. } | Node::GenericEnumDeclaration { .. } => {
+        Node::GenericStructDeclaration { .. }
+        | Node::GenericEnumDeclaration { .. }
+        | Node::TraitDeclaration { .. }
+        | Node::ImplDeclaration { .. } => {
             Ok(ResolveResult::new(Type::Void))
         }
         Node::Export { declaration } => {

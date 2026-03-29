@@ -304,6 +304,7 @@ impl ModuleNormalizer {
             Node::GenericFunctionDeclaration {
                 name,
                 generic_params,
+                generic_bounds,
                 parameters,
                 return_type,
                 body,
@@ -319,6 +320,7 @@ impl ModuleNormalizer {
                     type_scope.insert(param.clone());
                 }
                 type_scopes.push(type_scope);
+                let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
                 let mut local_scope = HashSet::new();
                 let parameters = parameters
                     .into_iter()
@@ -338,12 +340,55 @@ impl ModuleNormalizer {
                 Node::GenericFunctionDeclaration {
                     name: renamed_name,
                     generic_params,
+                    generic_bounds,
                     parameters,
                     return_type,
                     body,
                     lambda,
                 }
             }
+            Node::TraitDeclaration { name, methods } => {
+                let renamed_name = if top_level && !exported {
+                    self.type_renames.get(&name).cloned().unwrap_or(name.clone())
+                } else {
+                    name.clone()
+                };
+                let methods = methods
+                    .into_iter()
+                    .map(|method| {
+                        Ok(ast::TraitMethodSignature {
+                            name: method.name,
+                            parameters: method
+                                .parameters
+                                .into_iter()
+                                .map(|(param_name, param_type)| {
+                                    self.rename_type(param_type, value_scopes, type_scopes)
+                                        .map(|param_type| (param_name, param_type))
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                            return_type: self.rename_type(
+                                method.return_type,
+                                value_scopes,
+                                type_scopes,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Node::TraitDeclaration {
+                    name: renamed_name,
+                    methods,
+                }
+            }
+            Node::ImplDeclaration {
+                trait_names,
+                target_type,
+            } => Node::ImplDeclaration {
+                trait_names: trait_names
+                    .into_iter()
+                    .map(|name| self.rename_type_name(&name, type_scopes))
+                    .collect(),
+                target_type: self.rename_type(target_type, value_scopes, type_scopes)?,
+            },
             Node::StructDeclaration {
                 name,
                 fields,
@@ -376,6 +421,7 @@ impl ModuleNormalizer {
             Node::GenericStructDeclaration {
                 name,
                 generic_params,
+                generic_bounds,
                 fields,
                 functions,
             } => {
@@ -389,6 +435,7 @@ impl ModuleNormalizer {
                     type_scope.insert(param.clone());
                 }
                 type_scopes.push(type_scope);
+                let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
                 let fields = fields
                     .into_iter()
                     .map(|(field_name, field_type)| {
@@ -406,6 +453,7 @@ impl ModuleNormalizer {
                 Node::GenericStructDeclaration {
                     name: renamed_name,
                     generic_params,
+                    generic_bounds,
                     fields,
                     functions,
                 }
@@ -438,6 +486,7 @@ impl ModuleNormalizer {
             Node::GenericEnumDeclaration {
                 name,
                 generic_params,
+                generic_bounds,
                 variants,
             } => {
                 let renamed_name = if top_level && !exported {
@@ -450,6 +499,7 @@ impl ModuleNormalizer {
                     type_scope.insert(param.clone());
                 }
                 type_scopes.push(type_scope);
+                let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
                 let variants = variants
                     .into_iter()
                     .map(|variant| {
@@ -468,6 +518,7 @@ impl ModuleNormalizer {
                 Node::GenericEnumDeclaration {
                     name: renamed_name,
                     generic_params,
+                    generic_bounds,
                     variants,
                 }
             }
@@ -702,6 +753,8 @@ impl ModuleNormalizer {
             | Node::VariableDeclaration { .. }
             | Node::FunctionDeclaration { .. }
             | Node::GenericFunctionDeclaration { .. }
+            | Node::TraitDeclaration { .. }
+            | Node::ImplDeclaration { .. }
             | Node::StructDeclaration { .. }
             | Node::GenericStructDeclaration { .. }
             | Node::EnumDeclaration { .. }
@@ -735,6 +788,25 @@ impl ModuleNormalizer {
                 binding,
             },
         })
+    }
+
+    fn rename_generic_bounds(
+        &self,
+        generic_bounds: HashMap<String, Vec<String>>,
+        type_scopes: &[HashSet<String>],
+    ) -> Result<HashMap<String, Vec<String>>, String> {
+        Ok(generic_bounds
+            .into_iter()
+            .map(|(param, bounds)| {
+                (
+                    param,
+                    bounds
+                        .into_iter()
+                        .map(|bound| self.rename_type_name(&bound, type_scopes))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect())
     }
 
     fn rename_type(
@@ -824,7 +896,8 @@ fn top_level_decl_name(node: &Node) -> Option<(TopLevelDeclKind, String)> {
         Node::StructDeclaration { name, .. }
         | Node::GenericStructDeclaration { name, .. }
         | Node::EnumDeclaration { name, .. }
-        | Node::GenericEnumDeclaration { name, .. } => Some((TopLevelDeclKind::Type, name.clone())),
+        | Node::GenericEnumDeclaration { name, .. }
+        | Node::TraitDeclaration { name, .. } => Some((TopLevelDeclKind::Type, name.clone())),
         _ => None,
     }
 }
@@ -837,8 +910,12 @@ fn validate_export_target(node: &Node) -> Result<(), String> {
         | Node::StructDeclaration { .. }
         | Node::GenericStructDeclaration { .. }
         | Node::EnumDeclaration { .. }
-        | Node::GenericEnumDeclaration { .. } => Ok(()),
-        _ => Err("`export` supports only top-level variables, functions, structs, and enums".to_string()),
+        | Node::GenericEnumDeclaration { .. }
+        | Node::TraitDeclaration { .. } => Ok(()),
+        _ => Err(
+            "`export` supports only top-level variables, functions, structs, enums, and traits"
+                .to_string(),
+        ),
     }
 }
 

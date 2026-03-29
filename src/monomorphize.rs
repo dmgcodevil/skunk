@@ -6,6 +6,7 @@ use std::ops::Deref;
 struct FunctionTemplate {
     name: String,
     generic_params: Vec<String>,
+    generic_bounds: HashMap<String, Vec<String>>,
     parameters: Vec<(String, Type)>,
     return_type: Type,
     body: Vec<Node>,
@@ -15,6 +16,7 @@ struct FunctionTemplate {
 struct StructTemplate {
     name: String,
     generic_params: Vec<String>,
+    generic_bounds: HashMap<String, Vec<String>>,
     fields: Vec<(String, Type)>,
     functions: Vec<Node>,
 }
@@ -23,7 +25,20 @@ struct StructTemplate {
 struct EnumTemplate {
     name: String,
     generic_params: Vec<String>,
+    generic_bounds: HashMap<String, Vec<String>>,
     variants: Vec<ast::EnumVariant>,
+}
+
+#[derive(Clone)]
+struct TraitTemplate {
+    name: String,
+    methods: Vec<ast::TraitMethodSignature>,
+}
+
+#[derive(Clone)]
+struct ImplTemplate {
+    trait_names: Vec<String>,
+    target_type: Type,
 }
 
 #[derive(Clone)]
@@ -84,6 +99,9 @@ struct Monomorphizer {
     concrete_structs: HashMap<String, StructTemplate>,
     generic_enums: HashMap<String, EnumTemplate>,
     concrete_enums: HashMap<String, EnumTemplate>,
+    traits: HashMap<String, TraitTemplate>,
+    impls: Vec<ImplTemplate>,
+    implemented_traits: HashMap<String, HashSet<String>>,
     generated_functions: HashMap<String, Node>,
     generated_function_order: Vec<String>,
     generated_structs: HashMap<String, Node>,
@@ -104,6 +122,8 @@ impl Monomorphizer {
         let mut concrete_structs = HashMap::new();
         let mut generic_enums = HashMap::new();
         let mut concrete_enums = HashMap::new();
+        let mut traits = HashMap::new();
+        let mut impls = Vec::new();
         let mut root_statements = Vec::new();
 
         for statement in statements {
@@ -115,6 +135,7 @@ impl Monomorphizer {
                 Node::GenericFunctionDeclaration {
                     name,
                     generic_params,
+                    generic_bounds,
                     parameters,
                     return_type,
                     body,
@@ -125,6 +146,7 @@ impl Monomorphizer {
                         FunctionTemplate {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
+                            generic_bounds: generic_bounds.clone(),
                             parameters: parameters.clone(),
                             return_type: return_type.clone(),
                             body: body.clone(),
@@ -143,6 +165,7 @@ impl Monomorphizer {
                         FunctionTemplate {
                             name: name.clone(),
                             generic_params: Vec::new(),
+                            generic_bounds: HashMap::new(),
                             parameters: parameters.clone(),
                             return_type: return_type.clone(),
                             body: body.clone(),
@@ -153,6 +176,7 @@ impl Monomorphizer {
                 Node::GenericStructDeclaration {
                     name,
                     generic_params,
+                    generic_bounds,
                     fields,
                     functions,
                 } => {
@@ -161,6 +185,7 @@ impl Monomorphizer {
                         StructTemplate {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
+                            generic_bounds: generic_bounds.clone(),
                             fields: fields.clone(),
                             functions: functions.clone(),
                         },
@@ -176,6 +201,7 @@ impl Monomorphizer {
                         StructTemplate {
                             name: name.clone(),
                             generic_params: Vec::new(),
+                            generic_bounds: HashMap::new(),
                             fields: fields.clone(),
                             functions: functions.clone(),
                         },
@@ -185,6 +211,7 @@ impl Monomorphizer {
                 Node::GenericEnumDeclaration {
                     name,
                     generic_params,
+                    generic_bounds,
                     variants,
                 } => {
                     generic_enums.insert(
@@ -192,6 +219,7 @@ impl Monomorphizer {
                         EnumTemplate {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
+                            generic_bounds: generic_bounds.clone(),
                             variants: variants.clone(),
                         },
                     );
@@ -202,10 +230,29 @@ impl Monomorphizer {
                         EnumTemplate {
                             name: name.clone(),
                             generic_params: Vec::new(),
+                            generic_bounds: HashMap::new(),
                             variants: variants.clone(),
                         },
                     );
                     root_statements.push(statement.clone());
+                }
+                Node::TraitDeclaration { name, methods } => {
+                    traits.insert(
+                        name.clone(),
+                        TraitTemplate {
+                            name: name.clone(),
+                            methods: methods.clone(),
+                        },
+                    );
+                }
+                Node::ImplDeclaration {
+                    trait_names,
+                    target_type,
+                } => {
+                    impls.push(ImplTemplate {
+                        trait_names: trait_names.clone(),
+                        target_type: target_type.clone(),
+                    });
                 }
                 Node::Module { .. } | Node::Import { .. } => {}
                 Node::EOI => {}
@@ -220,6 +267,9 @@ impl Monomorphizer {
             concrete_structs,
             generic_enums,
             concrete_enums,
+            traits,
+            impls,
+            implemented_traits: HashMap::new(),
             generated_functions: HashMap::new(),
             generated_function_order: Vec::new(),
             generated_structs: HashMap::new(),
@@ -234,6 +284,7 @@ impl Monomorphizer {
     }
 
     fn prepare(&mut self) -> Result<Node, String> {
+        self.validate_impls()?;
         let mut output = Vec::<Node>::new();
         for statement in self.root_statements.clone() {
             match statement {
@@ -301,6 +352,161 @@ impl Monomorphizer {
         }
         output.push(Node::EOI);
         Ok(Node::Program { statements: output })
+    }
+
+    fn validate_impls(&mut self) -> Result<(), String> {
+        let impls = self.impls.clone();
+        for impl_block in impls {
+            self.validate_impl_target_type(&impl_block.target_type)?;
+            let target_key = ast::type_to_string(&impl_block.target_type);
+            for trait_name in impl_block.trait_names {
+                let trait_template = self
+                    .traits
+                    .get(&trait_name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
+                self.validate_trait_implementation(&trait_template, &impl_block.target_type)?;
+                let implemented = self
+                    .implemented_traits
+                    .entry(target_key.clone())
+                    .or_default();
+                if !implemented.insert(trait_name.clone()) {
+                    return Err(format!(
+                        "duplicate impl of trait `{}` for `{}`",
+                        trait_name, target_key
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_impl_target_type(&self, sk_type: &Type) -> Result<(), String> {
+        match sk_type {
+            Type::Void => Err("cannot implement traits for `void`".to_string()),
+            Type::Byte
+            | Type::Short
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::String
+            | Type::Boolean
+            | Type::Char
+            | Type::Allocator
+            | Type::Arena => Ok(()),
+            Type::Custom(name) => {
+                if self.concrete_structs.contains_key(name) || self.concrete_enums.contains_key(name) {
+                    Ok(())
+                } else if self.generic_structs.contains_key(name) || self.generic_enums.contains_key(name) {
+                    Err(format!(
+                        "impl targets must be concrete types; generic type `{}` needs concrete type arguments",
+                        name
+                    ))
+                } else {
+                    Err(format!("unknown impl target type `{}`", name))
+                }
+            }
+            Type::Array { elem_type, .. } => self.validate_impl_target_type(elem_type),
+            Type::Pointer { target_type } => self.validate_impl_target_type(target_type),
+            Type::Slice { elem_type } => self.validate_impl_target_type(elem_type),
+            Type::Function {
+                parameters,
+                return_type,
+            } => {
+                for parameter in parameters {
+                    self.validate_impl_target_type(parameter)?;
+                }
+                self.validate_impl_target_type(return_type)
+            }
+            Type::GenericInstance { base, .. } => Err(format!(
+                "impl targets do not support generic instances yet: `{}`",
+                base
+            )),
+            Type::SkSelf => Err("`self` is not a valid impl target".to_string()),
+        }
+    }
+
+    fn validate_trait_implementation(
+        &mut self,
+        trait_template: &TraitTemplate,
+        target_type: &Type,
+    ) -> Result<(), String> {
+        for method in &trait_template.methods {
+            let first_parameter = method.parameters.first().map(|(_, sk_type)| sk_type);
+            if first_parameter != Some(&Type::SkSelf) {
+                return Err(format!(
+                    "trait `{}` method `{}` must declare `self` as its first parameter",
+                    trait_template.name, method.name
+                ));
+            }
+            let (actual_parameters, actual_return_type) =
+                self.lookup_method_signature(target_type, &method.name).map_err(|_| {
+                    format!(
+                        "type `{}` does not implement required trait method `{}.{}`",
+                        ast::type_to_string(target_type),
+                        trait_template.name,
+                        method.name
+                    )
+                })?;
+            let expected_parameters = method
+                .parameters
+                .iter()
+                .skip(1)
+                .map(|(_, sk_type)| sk_type.clone())
+                .collect::<Vec<_>>();
+            if actual_parameters != expected_parameters || actual_return_type != method.return_type {
+                return Err(format!(
+                    "trait method `{}.{}` expects `({}) -> {}`, but `{}` provides `({}) -> {}`",
+                    trait_template.name,
+                    method.name,
+                    expected_parameters
+                        .iter()
+                        .map(ast::type_to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ast::type_to_string(&method.return_type),
+                    ast::type_to_string(target_type),
+                    actual_parameters
+                        .iter()
+                        .map(ast::type_to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ast::type_to_string(&actual_return_type)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_trait_bounds(
+        &self,
+        generic_bounds: &HashMap<String, Vec<String>>,
+        substitutions: &HashMap<String, Type>,
+        context: &str,
+    ) -> Result<(), String> {
+        for (param, trait_names) in generic_bounds {
+            let actual_type = substitutions
+                .get(param)
+                .ok_or_else(|| format!("missing type argument `{}` for {}", param, context))?;
+            let actual_key = ast::type_to_string(actual_type);
+            for trait_name in trait_names {
+                let implemented = self
+                    .implemented_traits
+                    .get(&actual_key)
+                    .is_some_and(|traits| traits.contains(trait_name));
+                if !implemented {
+                    return Err(format!(
+                        "{} requires `{}` to implement trait `{}`, but `{}` does not",
+                        context,
+                        param,
+                        trait_name,
+                        actual_key
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn transform_named_function(
@@ -744,6 +950,12 @@ impl Monomorphizer {
                 Ok((node, Some(sk_type)))
             }
             Node::Export { .. } => Err("`export` is only allowed at module scope".to_string()),
+            Node::TraitDeclaration { .. } => {
+                Err("`trait` is only allowed at module scope".to_string())
+            }
+            Node::ImplDeclaration { .. } => {
+                Err("`impl` is only allowed at module scope".to_string())
+            }
             Node::FunctionCall { .. }
             | Node::Access { .. }
             | Node::ArrayInit { .. }
@@ -1408,6 +1620,8 @@ impl Monomorphizer {
             | Node::Module { .. }
             | Node::Import { .. }
             | Node::Export { .. }
+            | Node::TraitDeclaration { .. }
+            | Node::ImplDeclaration { .. }
             | Node::VariableDeclaration { .. }
             | Node::StructDeclaration { .. }
             | Node::EnumDeclaration { .. }
@@ -1534,6 +1748,11 @@ impl Monomorphizer {
         if let Some(template) = self.generic_functions.get(name).cloned() {
             let substitutions =
                 self.infer_generic_function_arguments(&template, &argument_types, expected_type)?;
+            self.check_trait_bounds(
+                &template.generic_bounds,
+                &substitutions,
+                &format!("generic function `{}`", template.name),
+            )?;
             let specialized_name = self.ensure_specialized_function(&template, &substitutions)?;
             let base_return_type = self.apply_substitutions(&template.return_type, &substitutions);
             let result_type = apply_call_groups_to_function_signature(
@@ -1783,6 +2002,11 @@ impl Monomorphizer {
         template: &FunctionTemplate,
         substitutions: &HashMap<String, Type>,
     ) -> Result<String, String> {
+        self.check_trait_bounds(
+            &template.generic_bounds,
+            substitutions,
+            &format!("generic function `{}`", template.name),
+        )?;
         let symbol_name =
             specialized_function_name(&template.name, substitutions, &template.generic_params);
         if self.generated_functions.contains_key(&symbol_name) {
@@ -1839,6 +2063,11 @@ impl Monomorphizer {
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
+                self.check_trait_bounds(
+                    &template.generic_bounds,
+                    &substitutions,
+                    &format!("generic struct `{}`", base),
+                )?;
                 let node = self.transform_struct_decl(
                     &symbol_name,
                     &template.fields,
@@ -1891,6 +2120,11 @@ impl Monomorphizer {
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
+                self.check_trait_bounds(
+                    &template.generic_bounds,
+                    &substitutions,
+                    &format!("generic enum `{}`", base),
+                )?;
                 let node =
                     self.transform_enum_decl(&symbol_name, &template.variants, &substitutions)?;
                 self.generated_enums.insert(symbol_name.clone(), node);

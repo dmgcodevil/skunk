@@ -3152,6 +3152,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             }
             Node::EOI => {}
             Node::EnumDeclaration { .. } => {}
+            Node::TraitDeclaration { .. } | Node::ImplDeclaration { .. } => {}
             Node::StructDeclaration {
                 name,
                 functions: struct_functions,
@@ -4134,6 +4135,90 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "9\n");
+    }
+
+    #[test]
+    fn runs_compiled_trait_bound_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(self, value: int): int;
+            }
+
+            trait Resettable {
+                function reset(self): void;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+
+                function reset(self): void {
+                    self.value = 0;
+                }
+            }
+
+            impl Writer, Resettable for Counter {}
+
+            function use_counter[T: Writer + Resettable](counter: *T): int {
+                counter.reset();
+                return counter.write(41);
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                counter: *Counter = Counter::create(heap);
+                counter.value = 9;
+                print(use_counter(counter));
+                heap.destroy(counter);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "41\n");
+    }
+
+    #[test]
+    fn rejects_call_when_trait_bound_is_not_implemented() {
+        let result = compile_and_run(
+            r#"
+            trait Writer {
+                function write(self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            function use_counter[T: Writer](counter: *T): int {
+                return counter.write(41);
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                counter: *Counter = Counter::create(heap);
+                print(use_counter(counter));
+                heap.destroy(counter);
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("generic function `use_counter` requires `T` to implement trait `Writer`")
+        );
     }
 
     #[test]

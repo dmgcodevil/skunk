@@ -3,6 +3,7 @@ use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::Parser;
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -29,6 +30,14 @@ pub enum Node {
         fields: Vec<(String, Type)>,
         functions: Vec<Node>,
     },
+    TraitDeclaration {
+        name: String,
+        methods: Vec<TraitMethodSignature>,
+    },
+    ImplDeclaration {
+        trait_names: Vec<String>,
+        target_type: Type,
+    },
     EnumDeclaration {
         name: String,
         variants: Vec<EnumVariant>,
@@ -36,12 +45,14 @@ pub enum Node {
     GenericStructDeclaration {
         name: String,
         generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
         fields: Vec<(String, Type)>,
         functions: Vec<Node>,
     },
     GenericEnumDeclaration {
         name: String,
         generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
         variants: Vec<EnumVariant>,
     },
     VariableDeclaration {
@@ -60,6 +71,7 @@ pub enum Node {
     GenericFunctionDeclaration {
         name: String,
         generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
         parameters: Vec<(String, Type)>,
         return_type: Type,
         body: Vec<Node>,
@@ -142,6 +154,13 @@ pub enum Node {
 pub struct EnumVariant {
     pub name: String,
     pub payload_type: Option<Type>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct TraitMethodSignature {
+    pub name: String,
+    pub parameters: Vec<(String, Type)>,
+    pub return_type: Type,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -323,6 +342,8 @@ impl PestImpl {
             Rule::assignment => self.create_assignment(pair),
             Rule::struct_decl => self.create_struct_decl(pair),
             Rule::enum_decl => self.create_enum_decl(pair),
+            Rule::trait_decl => self.create_trait_decl(pair),
+            Rule::impl_decl => self.create_impl_decl(pair),
             Rule::var_decl => self.create_var_decl(pair),
             Rule::var_decl_stmt => self.create_var_decl(pair.into_inner().next().unwrap()),
             Rule::func_decl => self.create_func_decl(pair),
@@ -659,6 +680,7 @@ impl PestImpl {
         let mut inner_pairs = pair.into_inner();
         let mut lambda: bool = false;
         let mut generic_params = Vec::<String>::new();
+        let mut generic_bounds = HashMap::<String, Vec<String>>::new();
         let name = match inner_pairs.peek().unwrap().as_rule() {
             Rule::IDENTIFIER => self.create_identifier(inner_pairs.next().unwrap()),
             _ => {
@@ -669,7 +691,8 @@ impl PestImpl {
         if !lambda {
             if let Some(peeked) = inner_pairs.peek() {
                 if peeked.as_rule() == Rule::generic_params {
-                    generic_params = self.create_generic_params(inner_pairs.next().unwrap());
+                    (generic_params, generic_bounds) =
+                        self.create_generic_params(inner_pairs.next().unwrap());
                 }
             }
         }
@@ -701,6 +724,7 @@ impl PestImpl {
                 Node::GenericFunctionDeclaration {
                     name: s,
                     generic_params,
+                    generic_bounds,
                     parameters,
                     return_type,
                     body,
@@ -971,9 +995,11 @@ impl PestImpl {
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut generic_params = Vec::<String>::new();
+        let mut generic_bounds = HashMap::<String, Vec<String>>::new();
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::generic_params {
-                generic_params = self.create_generic_params(inner_pairs.next().unwrap());
+                (generic_params, generic_bounds) =
+                    self.create_generic_params(inner_pairs.next().unwrap());
             }
         }
         let mut fields: Vec<(String, Type)> = Vec::new();
@@ -995,6 +1021,7 @@ impl PestImpl {
             Node::GenericStructDeclaration {
                 name,
                 generic_params,
+                generic_bounds,
                 fields,
                 functions,
             }
@@ -1006,9 +1033,11 @@ impl PestImpl {
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut generic_params = Vec::<String>::new();
+        let mut generic_bounds = HashMap::<String, Vec<String>>::new();
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::generic_params {
-                generic_params = self.create_generic_params(inner_pairs.next().unwrap());
+                (generic_params, generic_bounds) =
+                    self.create_generic_params(inner_pairs.next().unwrap());
             }
         }
         let variants = inner_pairs
@@ -1020,8 +1049,49 @@ impl PestImpl {
             Node::GenericEnumDeclaration {
                 name,
                 generic_params,
+                generic_bounds,
                 variants,
             }
+        }
+    }
+
+    fn create_trait_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::trait_decl);
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let methods = inner_pairs
+            .map(|p| self.create_trait_method_decl(p))
+            .collect::<Vec<_>>();
+        Node::TraitDeclaration { name, methods }
+    }
+
+    fn create_trait_method_decl(&self, pair: Pair<Rule>) -> TraitMethodSignature {
+        assert_eq!(pair.as_rule(), Rule::trait_method_decl);
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let parameters = self.create_param_list(inner_pairs.next().unwrap());
+        let return_type = match inner_pairs.next() {
+            Some(pair) => self.create_type(pair.into_inner().next().unwrap()),
+            None => Type::Void,
+        };
+        TraitMethodSignature {
+            name,
+            parameters,
+            return_type,
+        }
+    }
+
+    fn create_impl_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::impl_decl);
+        let mut inner_pairs = pair.into_inner().collect::<Vec<_>>();
+        let target_type = self.create_type(inner_pairs.pop().unwrap());
+        let trait_names = inner_pairs
+            .into_iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        Node::ImplDeclaration {
+            trait_names,
+            target_type,
         }
     }
 
@@ -1132,9 +1202,20 @@ impl PestImpl {
             .parse(pair.into_inner())
     }
 
-    fn create_generic_params(&self, pair: Pair<Rule>) -> Vec<String> {
+    fn create_generic_params(&self, pair: Pair<Rule>) -> (Vec<String>, HashMap<String, Vec<String>>) {
         assert_eq!(pair.as_rule(), Rule::generic_params);
-        pair.into_inner().map(|p| p.as_str().to_string()).collect()
+        let mut params = Vec::new();
+        let mut bounds = HashMap::new();
+        for param in pair.into_inner() {
+            let mut inner_pairs = param.into_inner();
+            let name = inner_pairs.next().unwrap().as_str().to_string();
+            let trait_bounds = inner_pairs.map(|p| p.as_str().to_string()).collect::<Vec<_>>();
+            if !trait_bounds.is_empty() {
+                bounds.insert(name.clone(), trait_bounds);
+            }
+            params.push(name);
+        }
+        (params, bounds)
     }
 
     fn create_qualified_name(&self, pair: Pair<Rule>) -> String {
@@ -2835,6 +2916,7 @@ mod tests {
                 Node::GenericStructDeclaration {
                     name: "Box".to_string(),
                     generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::new(),
                     fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     functions: vec![],
                 },
@@ -2858,6 +2940,72 @@ mod tests {
                 Node::GenericFunctionDeclaration {
                     name: "id".to_string(),
                     generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::new(),
+                    parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    return_type: Type::Custom("T".to_string()),
+                    body: vec![Node::Return(Some(Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("value".to_string())],
+                    })))],
+                    lambda: false,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_trait_and_impl_declaration() {
+        let source_code = r#"
+            trait Writer {
+                function write(self, value: int): int;
+            }
+
+            impl Writer for TextWriter {}
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::TraitDeclaration {
+                    name: "Writer".to_string(),
+                    methods: vec![TraitMethodSignature {
+                        name: "write".to_string(),
+                        parameters: vec![
+                            ("self".to_string(), Type::SkSelf),
+                            ("value".to_string(), Type::Int),
+                        ],
+                        return_type: Type::Int,
+                    }],
+                },
+                Node::ImplDeclaration {
+                    trait_names: vec!["Writer".to_string()],
+                    target_type: Type::Custom("TextWriter".to_string()),
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_function_bounds() {
+        let source_code = r#"
+            function save[T: Writer + Flushable](value: T): T {
+                return value;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericFunctionDeclaration {
+                    name: "save".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::from([(
+                        "T".to_string(),
+                        vec!["Writer".to_string(), "Flushable".to_string()],
+                    )]),
                     parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     return_type: Type::Custom("T".to_string()),
                     body: vec![Node::Return(Some(Box::new(Node::Access {
