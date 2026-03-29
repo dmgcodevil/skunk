@@ -476,6 +476,9 @@ fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
                 panic!("cannot coerce {:?} to {:?}", value_ref, target);
             }
         }
+        Type::GenericInstance { .. } => {
+            panic!("interpreter does not support unresolved generic instance types")
+        }
         Type::Pointer { .. } | Type::Allocator | Type::Arena | Type::Void | Type::SkSelf => {
             value_ref
         }
@@ -555,6 +558,7 @@ fn default_value_for_type(
                 dimensions: int_dimensions,
             })
         }
+        Type::GenericInstance { .. } => ValueRef::stack(Value::Undefined),
         _ => ValueRef::stack(Value::Undefined),
     }
 }
@@ -569,6 +573,7 @@ fn promote_numeric_value(number: NumericValue, target: &Type) -> NumericValue {
         Type::Long => NumericValue::Long(numeric_to_i64(number)),
         Type::Float => NumericValue::Float(numeric_to_f64(number) as f32),
         Type::Double => NumericValue::Double(numeric_to_f64(number)),
+        Type::GenericInstance { .. } => panic!("invalid numeric promotion target {:?}", target),
         _ => panic!("invalid numeric promotion target {:?}", target),
     }
 }
@@ -1839,7 +1844,14 @@ pub fn evaluate_node(
                 dimensions,
             })
         }
-        Node::StructInitialization { name, fields } => {
+        Node::StructInitialization { _type, fields } => {
+            let name = match _type {
+                Type::Custom(name) => name,
+                other => panic!(
+                    "interpreter currently expects concrete struct literal types, found {:?}",
+                    other
+                ),
+            };
             let struct_def = global_environment
                 .borrow()
                 .get_struct(name)

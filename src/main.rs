@@ -1,6 +1,7 @@
 mod ast;
 mod compiler;
 mod interpreter;
+mod monomorphize;
 mod parser;
 mod type_checker;
 use colored::*;
@@ -70,6 +71,13 @@ fn main() -> io::Result<()> {
     };
     let contents = fs::read_to_string(file_path)?;
     let node = ast::parse(&contents);
+    let node = match monomorphize::prepare_program(&node) {
+        Ok(node) => node,
+        Err(err) => {
+            eprintln!("Error: {}", err.red());
+            std::process::exit(1);
+        }
+    };
     if type_checker_enabled {
         match type_checker::check(&node) {
             Ok(_) => (),

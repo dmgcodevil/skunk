@@ -735,13 +735,16 @@ fn resolve_type(
             }
             Ok(ResolveResult::new(Type::Void))
         }
-        Node::StructInitialization { name, .. } => {
-            if !global_scope.structs.contains_key(name) {
-                Err("struct doesn't exist".to_string())
-            } else {
-                Ok(ResolveResult::new(Type::Custom(name.clone())))
+        Node::StructInitialization { _type, .. } => match _type {
+            Type::Custom(name) => {
+                if !global_scope.structs.contains_key(name) {
+                    Err("struct doesn't exist".to_string())
+                } else {
+                    Ok(ResolveResult::new(Type::Custom(name.clone())))
+                }
             }
-        }
+            other => Ok(ResolveResult::new(other.clone())),
+        },
         Node::StructDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
         Node::FunctionDeclaration {
             name,
@@ -1109,7 +1112,7 @@ fn resolve_type(
                     }
                     return Ok(ResolveResult::new(Type::Allocator));
                 }
-                Type::Custom(_) => {
+                Type::Custom(_) | Type::GenericInstance { .. } => {
                     if name != "create" {
                         return Err(format!(
                             "error {}:{}: type does not support static method `{}`",

@@ -23,6 +23,12 @@ pub enum Node {
         fields: Vec<(String, Type)>,
         functions: Vec<Node>,
     },
+    GenericStructDeclaration {
+        name: String,
+        generic_params: Vec<String>,
+        fields: Vec<(String, Type)>,
+        functions: Vec<Node>,
+    },
     VariableDeclaration {
         var_type: Type,
         name: String,
@@ -34,6 +40,14 @@ pub enum Node {
         parameters: Vec<(String, Type)>,
         return_type: Type,
         body: Vec<Node>, // The function body is a list of nodes (statements or expressions)
+        lambda: bool,
+    },
+    GenericFunctionDeclaration {
+        name: String,
+        generic_params: Vec<String>,
+        parameters: Vec<(String, Type)>,
+        return_type: Type,
+        body: Vec<Node>,
         lambda: bool,
     },
     Assignment {
@@ -92,7 +106,7 @@ pub enum Node {
         nodes: Vec<Node>,
     },
     StructInitialization {
-        name: String,
+        _type: Type,
         fields: Vec<(String, Node)>, // List of field initializations (name, value)
     },
     StaticFunctionCall {
@@ -166,6 +180,10 @@ pub enum Type {
     },
     Allocator,
     Arena,
+    GenericInstance {
+        base: String,
+        type_arguments: Vec<Type>,
+    },
     Custom(String), // Custom types like structs
     Function {
         parameters: Vec<Type>,
@@ -525,8 +543,7 @@ impl PestImpl {
 
     fn create_struct_init(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
-        let name_pair = inner_pairs.next().unwrap();
-        let name = self.create_identifier(name_pair);
+        let struct_type = self.create_type(inner_pairs.next().unwrap());
         let mut fields: Vec<(String, Node)> = Vec::new();
         if let Some(mut init_field_list) = inner_pairs.next().map(|p| p.into_inner()) {
             while let Some(p) = init_field_list.next() {
@@ -542,10 +559,9 @@ impl PestImpl {
             }
         }
 
-        if let Identifier(s) = name {
-            StructInitialization { name: s, fields } // todo
-        } else {
-            unreachable!()
+        StructInitialization {
+            _type: struct_type,
+            fields,
         }
     }
 
@@ -588,6 +604,7 @@ impl PestImpl {
     fn create_func_decl(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
         let mut lambda: bool = false;
+        let mut generic_params = Vec::<String>::new();
         let name = match inner_pairs.peek().unwrap().as_rule() {
             Rule::IDENTIFIER => self.create_identifier(inner_pairs.next().unwrap()),
             _ => {
@@ -595,6 +612,13 @@ impl PestImpl {
                 Node::Identifier("anonymous".to_string())
             }
         };
+        if !lambda {
+            if let Some(peeked) = inner_pairs.peek() {
+                if peeked.as_rule() == Rule::generic_params {
+                    generic_params = self.create_generic_params(inner_pairs.next().unwrap());
+                }
+            }
+        }
         let parameters = self.create_param_list(inner_pairs.next().unwrap());
         let return_type = match inner_pairs.peek() {
             Some(p) => {
@@ -611,13 +635,23 @@ impl PestImpl {
             body.push(self.create_ast(statement))
         }
         if let Identifier(s) = name {
-            // todo
-            Node::FunctionDeclaration {
-                name: s,
-                parameters,
-                return_type,
-                body,
-                lambda,
+            if generic_params.is_empty() {
+                Node::FunctionDeclaration {
+                    name: s,
+                    parameters,
+                    return_type,
+                    body,
+                    lambda,
+                }
+            } else {
+                Node::GenericFunctionDeclaration {
+                    name: s,
+                    generic_params,
+                    parameters,
+                    return_type,
+                    body,
+                    lambda,
+                }
             }
         } else {
             unreachable!()
@@ -677,7 +711,9 @@ impl PestImpl {
 
     fn create_type(&self, pair: Pair<Rule>) -> Type {
         match pair.as_rule() {
-            Rule::base_type => create_base_type_from_str(pair.as_str()),
+            Rule::base_type => self.create_type(pair.into_inner().next().unwrap()),
+            Rule::builtin_type => create_base_type_from_str(pair.as_str()),
+            Rule::nominal_type => self.create_nominal_type(pair),
             Rule::function_type => {
                 let mut params: Vec<Type> = Vec::new();
                 let mut inner_pairs = pair.into_inner();
@@ -834,6 +870,12 @@ impl PestImpl {
     fn create_struct_decl(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
+        let mut generic_params = Vec::<String>::new();
+        if let Some(peeked) = inner_pairs.peek() {
+            if peeked.as_rule() == Rule::generic_params {
+                generic_params = self.create_generic_params(inner_pairs.next().unwrap());
+            }
+        }
         let mut fields: Vec<(String, Type)> = Vec::new();
         let mut functions = Vec::new();
         while let Some(p) = inner_pairs.next() {
@@ -843,10 +885,19 @@ impl PestImpl {
                 _ => panic!("unsupported rule {}", p),
             }
         }
-        Node::StructDeclaration {
-            name,
-            fields,
-            functions,
+        if generic_params.is_empty() {
+            Node::StructDeclaration {
+                name,
+                fields,
+                functions,
+            }
+        } else {
+            Node::GenericStructDeclaration {
+                name,
+                generic_params,
+                fields,
+                functions,
+            }
         }
     }
 
@@ -948,6 +999,26 @@ impl PestImpl {
             })
             .parse(pair.into_inner())
     }
+
+    fn create_generic_params(&self, pair: Pair<Rule>) -> Vec<String> {
+        assert_eq!(pair.as_rule(), Rule::generic_params);
+        pair.into_inner().map(|p| p.as_str().to_string()).collect()
+    }
+
+    fn create_nominal_type(&self, pair: Pair<Rule>) -> Type {
+        assert_eq!(pair.as_rule(), Rule::nominal_type);
+        let mut inner_pairs = pair.into_inner();
+        let base = inner_pairs.next().unwrap().as_str().to_string();
+        let type_arguments = inner_pairs.map(|p| self.create_type(p)).collect::<Vec<_>>();
+        if type_arguments.is_empty() {
+            Type::Custom(base)
+        } else {
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            }
+        }
+    }
 }
 
 pub fn parse(input: &str) -> Node {
@@ -980,6 +1051,18 @@ pub fn type_to_string(t: &Type) -> String {
         Type::Slice { elem_type } => format!("[]{}", type_to_string(elem_type)),
         Type::Allocator => "Allocator".to_string(),
         Type::Arena => "Arena".to_string(),
+        Type::GenericInstance {
+            base,
+            type_arguments,
+        } => format!(
+            "{}[{}]",
+            base,
+            type_arguments
+                .iter()
+                .map(type_to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Type::Function {
             parameters,
             return_type,
@@ -1100,6 +1183,42 @@ pub fn fits_integer_type(value: i64, target: &Type) -> bool {
         Type::Long => true,
         _ => false,
     }
+}
+
+pub fn parse_string_literal(literal: &str) -> Result<String, String> {
+    let inner = literal
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| format!("invalid string literal `{}`", literal))?;
+
+    let mut output = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        let escaped = chars
+            .next()
+            .ok_or_else(|| format!("unterminated escape sequence in `{}`", literal))?;
+        match escaped {
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            '0' => output.push('\0'),
+            '"' => output.push('"'),
+            '\\' => output.push('\\'),
+            other => {
+                return Err(format!(
+                    "unsupported escape sequence `\\{}` in `{}`",
+                    other, literal
+                ))
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 fn parse_char_literal(literal: &str) -> Result<char, String> {
@@ -2226,7 +2345,7 @@ mod tests {
                         var_type: Type::Custom("Foo".to_string()),
                         name: "f".to_string(),
                         value: Some(Box::new(Node::StructInitialization {
-                            name: "Foo".to_string(),
+                            _type: Type::Custom("Foo".to_string()),
                             fields: Vec::from([])
                         })),
                         metadata: Metadata::EMPTY
@@ -2258,7 +2377,7 @@ mod tests {
                         var_type: Type::Custom("Point".to_string()),
                         name: "p".to_string(),
                         value: Some(Box::new(Node::StructInitialization {
-                            name: "Point".to_string(),
+                            _type: Type::Custom("Point".to_string()),
                             fields: Vec::from([
                                 ("x".to_string(), Node::Literal(Literal::Integer(0))),
                                 ("y".to_string(), Node::Literal(Literal::Integer(1)))
@@ -2554,6 +2673,84 @@ mod tests {
                         target_type: Box::new(Type::Custom("Point".to_string())),
                     },
                     value: None,
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_struct_declaration() {
+        let source_code = r#"
+            struct Box[T] {
+                value: T;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericStructDeclaration {
+                    name: "Box".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    functions: vec![],
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_function_declaration() {
+        let source_code = r#"
+            function id[T](value: T): T {
+                return value;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericFunctionDeclaration {
+                    name: "id".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    return_type: Type::Custom("T".to_string()),
+                    body: vec![Node::Return(Some(Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("value".to_string())],
+                    })))],
+                    lambda: false,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_type_and_struct_init() {
+        let source_code = r#"
+            box: Box[int] = Box[int] { value: 7 };
+        "#;
+
+        let expected_type = Type::GenericInstance {
+            base: "Box".to_string(),
+            type_arguments: vec![Type::Int],
+        };
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    var_type: expected_type.clone(),
+                    name: "box".to_string(),
+                    value: Some(Box::new(Node::StructInitialization {
+                        _type: expected_type,
+                        fields: vec![("value".to_string(), Node::Literal(Literal::Integer(7)))],
+                    })),
                     metadata: Metadata::EMPTY,
                 },
                 Node::EOI,

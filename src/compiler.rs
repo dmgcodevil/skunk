@@ -716,7 +716,8 @@ impl<'a> FunctionCompiler<'a> {
                 value: (*value as u32 as u16).to_string(),
             }),
             Node::Literal(Literal::StringLiteral(value)) => {
-                let global = self.global_c_string("str", value);
+                let parsed = ast::parse_string_literal(value)?;
+                let global = self.global_c_string("str", &parsed);
                 Ok(ExprValue {
                     llvm_type: LlvmType::PtrI8,
                     value: self.string_ptr(&global),
@@ -733,13 +734,22 @@ impl<'a> FunctionCompiler<'a> {
                     _ => self.compile_array_literal(elements, expected),
                 }
             }
-            Node::StructInitialization { name, fields } => match expected {
-                Some(expected) => self.compile_struct_literal(name, fields, expected),
-                None => {
-                    let inferred = LlvmType::Struct(name.clone());
-                    self.compile_struct_literal(name, fields, &inferred)
+            Node::StructInitialization { _type, fields } => {
+                let struct_name = match _type {
+                    Type::Custom(name) => name.as_str(),
+                    other => return Err(format!(
+                        "LLVM backend currently requires concrete struct literal types, found `{}`",
+                        ast::type_to_string(other)
+                    )),
+                };
+                match expected {
+                    Some(expected) => self.compile_struct_literal(struct_name, fields, expected),
+                    None => {
+                        let inferred = LlvmType::Struct(struct_name.to_string());
+                        self.compile_struct_literal(struct_name, fields, &inferred)
+                    }
                 }
-            },
+            }
             Node::StaticFunctionCall {
                 _type,
                 name,
@@ -3040,6 +3050,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monomorphize;
     use crate::type_checker;
     use std::env;
     use std::process::Command;
@@ -3047,6 +3058,7 @@ mod tests {
 
     fn compile_and_run(source: &str) -> Result<String, String> {
         let program = ast::parse(source);
+        let program = monomorphize::prepare_program(&program)?;
         type_checker::check(&program)?;
 
         let id = Uuid::new_v4().to_string();
@@ -3494,6 +3506,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "11\n31\n");
+    }
+
+    #[test]
+    fn runs_compiled_generic_struct_and_function_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Box[T] {
+                value: T;
+
+                function get(self): T {
+                    return self.value;
+                }
+            }
+
+            function wrap[T](value: T): Box[T] {
+                return Box[T] { value: value };
+            }
+
+            function unwrap[T](box: Box[T]): T {
+                return box.get();
+            }
+
+            function main(): void {
+                int_box: Box[int] = wrap(41);
+                string_box: Box[string] = wrap("done");
+                print(unwrap(int_box) + 1);
+                print(unwrap(string_box));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "42\ndone\n");
+    }
+
+    #[test]
+    fn runs_compiled_nested_generic_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Box[T] {
+                value: T;
+            }
+
+            function wrap[T](value: T): Box[T] {
+                return Box[T] { value: value };
+            }
+
+            function main(): void {
+                inner: Box[int] = wrap(7);
+                outer: Box[Box[int]] = wrap(inner);
+                print(outer.value.value);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n");
     }
 
     #[test]

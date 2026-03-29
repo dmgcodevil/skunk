@@ -36,7 +36,10 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
 
 // Types
 size = { INTEGER }
-base_type       = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | "Allocator" | "Arena" | IDENTIFIER }
+builtin_type    = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | "Allocator" | "Arena" | "void" }
+generic_params  = { "[" ~ IDENTIFIER ~ ("," ~ IDENTIFIER)* ~ "]" }
+nominal_type    = { IDENTIFIER ~ ("[" ~ _type ~ ("," ~ _type)* ~ "]")? }
+base_type       = { builtin_type | nominal_type }
 legacy_array_dim = { "[" ~ expression ~ "]" }
 legacy_array_type = { base_type ~ legacy_array_dim+ } // legacy syntax: int[3]
 legacy_slice_type = { base_type ~ ("[" ~ "]")+ } // legacy syntax: int[]
@@ -44,7 +47,7 @@ pointer_prefix  = { "*" }
 type_prefix     = { pointer_prefix | "[" ~ expression? ~ "]" }
 prefixed_type   = { type_prefix+ ~ (base_type | function_type) } // preferred syntax: [3]int, []int
 function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
-_type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type | "void" }
+_type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type }
 
 _self               = { "self" }
 member_func_params  = { "(" ~ _self ~ ("," ~ param_list )? ~ ")" }
@@ -63,17 +66,17 @@ empty_params      = { "(" ~WHITESPACE*~ ")" }
 module            = { "module" ~ IDENTIFIER ~ ";"}
 var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ( "=" ~ ( lambda_expr | expression | func_call ) )? }
 var_decl_stmt     = { var_decl ~ ";"? }
-func_decl         = { "function" ~ IDENTIFIER ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
+func_decl         = { "function" ~ IDENTIFIER ~ generic_params? ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
 param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
 param_type_list   = { (_type ~ ("," ~ _type)*) }
-struct_decl       = { "struct" ~ IDENTIFIER ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
+struct_decl       = { "struct" ~ IDENTIFIER ~ generic_params? ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
 struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }
 
 lambda_expr       = { "function" ~ static_func_params ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 
 // Struct Initialization
-struct_init        = { IDENTIFIER ~ "{" ~ init_field_list? ~ "}" }
+struct_init        = { nominal_type ~ "{" ~ init_field_list? ~ "}" }
 init_field_list    = { init_field ~ ("," ~ init_field)* }
 init_field         = { IDENTIFIER ~ ":" ~ expression }
 
