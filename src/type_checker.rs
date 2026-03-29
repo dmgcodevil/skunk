@@ -149,6 +149,7 @@ impl GlobalScope {
 
     fn add(&mut self, node: &Node) {
         match node {
+            Node::Export { declaration } => self.add(declaration),
             Node::StructDeclaration {
                 name,
                 fields,
@@ -843,6 +844,9 @@ fn resolve_type(
         Node::EnumDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
         Node::GenericStructDeclaration { .. } | Node::GenericEnumDeclaration { .. } => {
             Ok(ResolveResult::new(Type::Void))
+        }
+        Node::Export { declaration } => {
+            resolve_type(global_scope, symbol_tables, declaration, expected_type_opt)
         }
         Node::FunctionDeclaration {
             name,

@@ -107,6 +107,10 @@ impl Monomorphizer {
         let mut root_statements = Vec::new();
 
         for statement in statements {
+            let statement = match statement {
+                Node::Export { declaration } => declaration.as_ref(),
+                other => other,
+            };
             match statement {
                 Node::GenericFunctionDeclaration {
                     name,
@@ -739,6 +743,7 @@ impl Monomorphizer {
                 )?;
                 Ok((node, Some(sk_type)))
             }
+            Node::Export { .. } => Err("`export` is only allowed at module scope".to_string()),
             Node::FunctionCall { .. }
             | Node::Access { .. }
             | Node::ArrayInit { .. }
@@ -1402,6 +1407,7 @@ impl Monomorphizer {
             | Node::Program { .. }
             | Node::Module { .. }
             | Node::Import { .. }
+            | Node::Export { .. }
             | Node::VariableDeclaration { .. }
             | Node::StructDeclaration { .. }
             | Node::EnumDeclaration { .. }

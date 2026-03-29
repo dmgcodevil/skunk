@@ -11,7 +11,7 @@
 - **Control Flow**: `if`, `for` loops, and blocks for scoped variable overrides
 - **Arrays**: Fixed-size arrays with zero initialization, explicit fill initialization, and slice types
 - **Pointers and Allocation**: `*T`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(...)`, `alloc.free(...)`, and `Arena`
-- **Modules and Imports**: `module foo.bar;` and `import foo.bar;` for multi-file Skunk programs
+- **Modules and Imports**: `module foo.bar;`, `import foo.bar;`, and `export` for multi-file Skunk programs with module APIs
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Enums and Match**: Generic enums with unit and single-payload variants, plus exhaustive enum-focused `match`
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
@@ -55,8 +55,12 @@ function main(): void {
 // std/math.skunk
 module std.math;
 
-function inc(n: int): int {
+function helper(n: int): int {
     return n + 1;
+}
+
+export function inc(n: int): int {
+    return helper(n);
 }
 ```
 
@@ -73,6 +77,8 @@ Modules V1 notes:
 - `import std.math;` resolves to `std/math.skunk`
 - imported files should declare a matching `module std.math;`
 - the module root is the directory containing the entry file you compile
+- if a module uses `export`, only exported top-level declarations remain visible to importers
+- if a module uses no `export`, all top-level declarations stay visible for backward compatibility
 
 ### Variables and Control Flow
 ```skunk

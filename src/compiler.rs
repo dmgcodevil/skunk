@@ -4137,6 +4137,78 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_imported_module_with_exported_api_and_private_helper_program() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "std/math.skunk",
+                    r#"
+                    module std.math;
+
+                    function helper(n: int): int {
+                        return n + 1;
+                    }
+
+                    export function inc(n: int): int {
+                        return helper(n);
+                    }
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import std.math;
+
+                    function main(): void {
+                        print(inc(41));
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "42\n");
+    }
+
+    #[test]
+    fn rejects_private_imported_module_symbols() {
+        let result = compile_project_and_run(
+            &[
+                (
+                    "std/math.skunk",
+                    r#"
+                    module std.math;
+
+                    function helper(n: int): int {
+                        return n + 1;
+                    }
+
+                    export function inc(n: int): int {
+                        return helper(n);
+                    }
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import std.math;
+
+                    function main(): void {
+                        print(helper(41));
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown function `helper`"));
+    }
+
+    #[test]
     fn runs_compiled_imported_module_program() {
         let stdout = compile_project_and_run(
             &[

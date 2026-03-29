@@ -16,6 +16,9 @@ pub enum Node {
     Import {
         name: String,
     },
+    Export {
+        declaration: Box<Node>,
+    },
     Block {
         statements: Vec<Node>,
         // metadata: Metadata,
@@ -309,6 +312,7 @@ impl PestImpl {
             }
             Rule::module => self.create_module(pair),
             Rule::import => self.create_import(pair),
+            Rule::export_decl => self.create_export(pair),
             Rule::statement => {
                 let mut pairs = pair.into_inner();
                 let inner = pairs.next().unwrap();
@@ -426,6 +430,13 @@ impl PestImpl {
         let mut inner_pairs = pair.into_inner();
         Node::Import {
             name: self.create_qualified_name(inner_pairs.next().unwrap()),
+        }
+    }
+
+    fn create_export(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        Node::Export {
+            declaration: Box::new(self.create_ast(inner_pairs.next().unwrap())),
         }
     }
 
