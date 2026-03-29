@@ -13,6 +13,9 @@ pub enum Node {
     Module {
         name: String,
     },
+    Import {
+        name: String,
+    },
     Block {
         statements: Vec<Node>,
         // metadata: Metadata,
@@ -271,6 +274,7 @@ impl PestImpl {
                 Node::Program { statements }
             }
             Rule::module => self.create_module(pair),
+            Rule::import => self.create_import(pair),
             Rule::statement => {
                 let mut pairs = pair.into_inner();
                 let inner = pairs.next().unwrap();
@@ -377,12 +381,15 @@ impl PestImpl {
 
     fn create_module(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
-        if let Identifier(name) = self.create_identifier(inner_pairs.next().unwrap()) {
-            Node::Module {
-                name: name.to_string(),
-            }
-        } else {
-            unreachable!()
+        Node::Module {
+            name: self.create_qualified_name(inner_pairs.next().unwrap()),
+        }
+    }
+
+    fn create_import(&self, pair: Pair<Rule>) -> Node {
+        let mut inner_pairs = pair.into_inner();
+        Node::Import {
+            name: self.create_qualified_name(inner_pairs.next().unwrap()),
         }
     }
 
@@ -1003,6 +1010,14 @@ impl PestImpl {
     fn create_generic_params(&self, pair: Pair<Rule>) -> Vec<String> {
         assert_eq!(pair.as_rule(), Rule::generic_params);
         pair.into_inner().map(|p| p.as_str().to_string()).collect()
+    }
+
+    fn create_qualified_name(&self, pair: Pair<Rule>) -> String {
+        assert_eq!(pair.as_rule(), Rule::qualified_name);
+        pair.into_inner()
+            .map(|p| p.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(".")
     }
 
     fn create_nominal_type(&self, pair: Pair<Rule>) -> Type {
@@ -3241,13 +3256,31 @@ mod tests {
     #[test]
     fn test_module() {
         let source_code = r#"
-            module A;
+            module std.math;
         "#;
         assert_eq!(
             Node::Program {
                 statements: vec![
                     Node::Module {
-                        name: "A".to_string()
+                        name: "std.math".to_string()
+                    },
+                    Node::EOI
+                ]
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
+    fn test_import() {
+        let source_code = r#"
+            import std.math;
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::Import {
+                        name: "std.math".to_string()
                     },
                     Node::EOI
                 ]

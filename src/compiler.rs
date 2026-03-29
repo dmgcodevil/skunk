@@ -737,10 +737,12 @@ impl<'a> FunctionCompiler<'a> {
             Node::StructInitialization { _type, fields } => {
                 let struct_name = match _type {
                     Type::Custom(name) => name.as_str(),
-                    other => return Err(format!(
+                    other => {
+                        return Err(format!(
                         "LLVM backend currently requires concrete struct literal types, found `{}`",
                         ast::type_to_string(other)
-                    )),
+                    ))
+                    }
                 };
                 match expected {
                     Some(expected) => self.compile_struct_literal(struct_name, fields, expected),
@@ -3051,8 +3053,10 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::monomorphize;
+    use crate::source;
     use crate::type_checker;
     use std::env;
+    use std::path::Path;
     use std::process::Command;
     use uuid::Uuid;
 
@@ -3075,6 +3079,44 @@ mod tests {
         let _ = fs::remove_file(&source_path);
         let _ = fs::remove_file(&artifact.llvm_ir_path);
         let _ = fs::remove_file(&artifact.binary_path);
+
+        if !output.status.success() {
+            return Err(format!(
+                "compiled program exited with status {}",
+                output.status
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn compile_project_and_run(files: &[(&str, &str)], entry: &str) -> Result<String, String> {
+        let root = env::temp_dir().join(format!("skunk_compiler_project_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)
+            .map_err(|err| format!("failed to create test project root: {}", err))?;
+
+        for (relative_path, contents) in files {
+            let path = root.join(relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("failed to create `{}`: {}", parent.display(), err))?;
+            }
+            fs::write(&path, contents)
+                .map_err(|err| format!("failed to write `{}`: {}", path.display(), err))?;
+        }
+
+        let entry_path = root.join(entry);
+        let program = source::load_program(&entry_path)?;
+        let program = monomorphize::prepare_program(&program)?;
+        type_checker::check(&program)?;
+
+        let output_path = root.join("app_out");
+        let artifact = compile_to_executable(&program, Path::new(&entry_path), &output_path)?;
+        let output = Command::new(&artifact.binary_path)
+            .output()
+            .map_err(|err| format!("failed to run compiled test binary: {}", err))?;
+
+        let _ = fs::remove_dir_all(&root);
 
         if !output.status.success() {
             return Err(format!(
@@ -3644,5 +3686,74 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "2\n8\n");
+    }
+
+    #[test]
+    fn runs_compiled_imported_module_program() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "std/math.skunk",
+                    r#"
+                    module std.math;
+
+                    function inc(n: int): int {
+                        return n + 1;
+                    }
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import std.math;
+
+                    function main(): void {
+                        print(inc(41));
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "42\n");
+    }
+
+    #[test]
+    fn runs_compiled_imported_generic_module_program() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "std/box.skunk",
+                    r#"
+                    module std.box;
+
+                    struct Box[T] {
+                        value: T;
+                    }
+
+                    function wrap[T](value: T): Box[T] {
+                        return Box[T] { value: value };
+                    }
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import std.box;
+
+                    function main(): void {
+                        value: Box[int] = wrap(7);
+                        print(value.value);
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n");
     }
 }

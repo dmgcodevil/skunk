@@ -164,6 +164,7 @@ impl Monomorphizer {
                     );
                     root_statements.push(statement.clone());
                 }
+                Node::Module { .. } | Node::Import { .. } => {}
                 Node::EOI => {}
                 other => root_statements.push(other.clone()),
             }
@@ -1052,12 +1053,14 @@ impl Monomorphizer {
                                             output_args.push(vec![argument]);
                                             Type::Void
                                         }
-                                        _ => return Err(format!(
+                                        _ => {
+                                            return Err(format!(
                                             "error {}:{}: no method named `{}` found for Allocator",
                                             call_metadata.span.line,
                                             call_metadata.span.start,
                                             method_name
-                                        )),
+                                        ))
+                                        }
                                     };
                                     current_type = return_type;
                                     output_nodes.push(Node::MemberAccess {
@@ -1239,6 +1242,7 @@ impl Monomorphizer {
             | Node::EOI
             | Node::Program { .. }
             | Node::Module { .. }
+            | Node::Import { .. }
             | Node::VariableDeclaration { .. }
             | Node::StructDeclaration { .. }
             | Node::GenericStructDeclaration { .. }

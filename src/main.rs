@@ -3,10 +3,10 @@ mod compiler;
 mod interpreter;
 mod monomorphize;
 mod parser;
+mod source;
 mod type_checker;
 use colored::*;
 use std::env;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -69,8 +69,13 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
-    let contents = fs::read_to_string(file_path)?;
-    let node = ast::parse(&contents);
+    let node = match source::load_program(Path::new(file_path)) {
+        Ok(node) => node,
+        Err(err) => {
+            eprintln!("Error: {}", err.red());
+            std::process::exit(1);
+        }
+    };
     let node = match monomorphize::prepare_program(&node) {
         Ok(node) => node,
         Err(err) => {

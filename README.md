@@ -11,11 +11,12 @@
 - **Control Flow**: `if`, `for` loops, and blocks for scoped variable overrides
 - **Arrays**: Fixed-size arrays with zero initialization, explicit fill initialization, and slice types
 - **Pointers and Allocation**: `*T`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(...)`, `alloc.free(...)`, and `Arena`
+- **Modules and Imports**: `module foo.bar;` and `import foo.bar;` for multi-file Skunk programs
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
 - **Type Inference**: Planned for a cleaner developer experience
 - **String Interpolation and Concatenation**: Upcoming for intuitive string operations
-- **Generics**: Upcoming for flexible and reusable data structures
+- **Generics**: Generic structs and functions via monomorphization
 
 Current design notes:
 
@@ -47,6 +48,30 @@ function main(): void {
     print("Hello, World!");
 }
 ```
+
+### Modules and Imports
+```skunk
+// std/math.skunk
+module std.math;
+
+function inc(n: int): int {
+    return n + 1;
+}
+```
+
+```skunk
+// main.skunk
+import std.math;
+
+function main(): void {
+    print(inc(41));
+}
+```
+
+Modules V1 notes:
+- `import std.math;` resolves to `std/math.skunk`
+- imported files should declare a matching `module std.math;`
+- the module root is the directory containing the entry file you compile
 
 ### Variables and Control Flow
 ```skunk

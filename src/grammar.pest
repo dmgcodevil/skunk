@@ -60,10 +60,12 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | var_decl_stmt | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block }
+statement         = { module | import | var_decl_stmt | func_decl | struct_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block }
 assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
-module            = { "module" ~ IDENTIFIER ~ ";"}
+qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
+module            = { "module" ~ qualified_name ~ ";"}
+import            = { "import" ~ qualified_name ~ ";"}
 var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ( "=" ~ ( lambda_expr | expression | func_call ) )? }
 var_decl_stmt     = { var_decl ~ ";"? }
 func_decl         = { "function" ~ IDENTIFIER ~ generic_params? ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
