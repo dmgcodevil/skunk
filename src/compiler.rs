@@ -517,6 +517,23 @@ impl<'a> FunctionCompiler<'a> {
                 self.emit_store(&local.ptr, &expr);
                 Ok(())
             }
+            Node::StructDestructure {
+                struct_type,
+                fields,
+                value,
+                ..
+            } => {
+                let expected = llvm_type(struct_type, self.structs, self.enums)?;
+                let value = self.compile_expr_with_expected(value, Some(&expected))?;
+                let value = self.coerce_expr(value, &expected, "struct destructure")?;
+                let LlvmType::Struct(struct_name) = &value.llvm_type else {
+                    return Err(
+                        "struct destructure expects a struct value in LLVM backend".to_string()
+                    );
+                };
+                self.bind_struct_pattern_fields(struct_name, &value, fields)?;
+                Ok(())
+            }
             Node::Block { statements } => {
                 self.push_scope();
                 self.compile_statements(statements)?;
@@ -635,94 +652,118 @@ impl<'a> FunctionCompiler<'a> {
 
     fn compile_match(&mut self, value: &Node, cases: &[ast::MatchCase]) -> Result<(), String> {
         let matched = self.compile_expr(value)?;
-        let LlvmType::Enum(enum_name) = &matched.llvm_type else {
-            return Err("match expects an enum value in LLVM backend".to_string());
-        };
-        let enum_layout = self
-            .enums
-            .get(enum_name)
-            .ok_or_else(|| format!("unknown enum `{}` in LLVM backend", enum_name))?;
-        let tag = self.next_temp();
-        self.emit_line(format!(
-            "{} = extractvalue {} {}, 0",
-            tag,
-            matched.llvm_type.ir(),
-            matched.value
-        ));
+        match &matched.llvm_type {
+            LlvmType::Enum(enum_name) => {
+                let enum_layout = self
+                    .enums
+                    .get(enum_name)
+                    .ok_or_else(|| format!("unknown enum `{}` in LLVM backend", enum_name))?;
+                let tag = self.next_temp();
+                self.emit_line(format!(
+                    "{} = extractvalue {} {}, 0",
+                    tag,
+                    matched.llvm_type.ir(),
+                    matched.value
+                ));
 
-        let after_label = self.next_label("match_end");
-        let default_label = self.next_label("match_default");
-        let case_labels = cases
-            .iter()
-            .map(|_| self.next_label("match_case"))
-            .collect::<Vec<_>>();
-        let targets = cases
-            .iter()
-            .zip(case_labels.iter())
-            .map(|(case, label)| {
-                let ast::MatchPattern::EnumVariant { variant, .. } = &case.pattern;
-                let variant_layout = enum_layout
-                    .variants
+                let after_label = self.next_label("match_end");
+                let default_label = self.next_label("match_default");
+                let case_labels = cases
                     .iter()
-                    .find(|candidate| candidate.name == *variant)
-                    .ok_or_else(|| {
-                        format!("unknown variant `{}` on enum `{}`", variant, enum_name)
-                    })?;
-                Ok(format!("i32 {}, label %{}", variant_layout.tag, label))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        self.emit_line(format!(
-            "switch i32 {}, label %{} [ {} ]",
-            tag,
-            default_label,
-            targets.join(" ")
-        ));
-
-        let mut all_terminated = true;
-        for ((case, label), index) in cases.iter().zip(case_labels.iter()).zip(0..) {
-            self.emit_label(label);
-            self.push_scope();
-            let ast::MatchPattern::EnumVariant {
-                variant, binding, ..
-            } = &case.pattern;
-            if let Some(binding) = binding {
-                let variant_layout = enum_layout
-                    .variants
+                    .map(|_| self.next_label("match_case"))
+                    .collect::<Vec<_>>();
+                let targets = cases
                     .iter()
-                    .find(|candidate| candidate.name == *variant)
-                    .ok_or_else(|| {
-                        format!("unknown variant `{}` on enum `{}`", variant, enum_name)
-                    })?;
-                let payload_type = variant_layout
-                    .payload_type
-                    .clone()
-                    .ok_or_else(|| format!("variant `{}` does not carry a payload", variant))?;
-                let payload_value = self.extract_enum_payload(&matched, variant_layout)?;
-                let payload_ptr = self.emit_heap_alloc(payload_type.clone(), binding);
-                self.emit_store(&payload_ptr, &payload_value);
-                self.declare_local(binding.clone(), payload_ptr, payload_type);
-            }
-            self.compile_statements(&case.body)?;
-            self.pop_scope();
-            if !self.terminated {
-                all_terminated = false;
-                self.emit_line(format!("br label %{}", after_label));
-            }
-            if index + 1 < cases.len() {
-                self.terminated = false;
-            }
-        }
+                    .zip(case_labels.iter())
+                    .map(|(case, label)| {
+                        let ast::MatchPattern::EnumVariant { variant, .. } = &case.pattern else {
+                            return Err("enum match case expected enum pattern".to_string());
+                        };
+                        let variant_layout = enum_layout
+                            .variants
+                            .iter()
+                            .find(|candidate| candidate.name == *variant)
+                            .ok_or_else(|| {
+                                format!("unknown variant `{}` on enum `{}`", variant, enum_name)
+                            })?;
+                        Ok(format!("i32 {}, label %{}", variant_layout.tag, label))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                self.emit_line(format!(
+                    "switch i32 {}, label %{} [ {} ]",
+                    tag,
+                    default_label,
+                    targets.join(" ")
+                ));
 
-        self.emit_label(&default_label);
-        self.emit_line("unreachable".to_string());
+                let mut all_terminated = true;
+                for ((case, label), index) in cases.iter().zip(case_labels.iter()).zip(0..) {
+                    self.emit_label(label);
+                    self.push_scope();
+                    let ast::MatchPattern::EnumVariant {
+                        variant, binding, ..
+                    } = &case.pattern
+                    else {
+                        return Err("enum match case expected enum pattern".to_string());
+                    };
+                    if let Some(binding) = binding {
+                        let variant_layout = enum_layout
+                            .variants
+                            .iter()
+                            .find(|candidate| candidate.name == *variant)
+                            .ok_or_else(|| {
+                                format!("unknown variant `{}` on enum `{}`", variant, enum_name)
+                            })?;
+                        let payload_type =
+                            variant_layout.payload_type.clone().ok_or_else(|| {
+                                format!("variant `{}` does not carry a payload", variant)
+                            })?;
+                        let payload_value = self.extract_enum_payload(&matched, variant_layout)?;
+                        let payload_ptr = self.emit_heap_alloc(payload_type.clone(), binding);
+                        self.emit_store(&payload_ptr, &payload_value);
+                        self.declare_local(binding.clone(), payload_ptr, payload_type);
+                    }
+                    self.compile_statements(&case.body)?;
+                    self.pop_scope();
+                    if !self.terminated {
+                        all_terminated = false;
+                        self.emit_line(format!("br label %{}", after_label));
+                    }
+                    if index + 1 < cases.len() {
+                        self.terminated = false;
+                    }
+                }
 
-        if all_terminated {
-            self.terminated = true;
-        } else {
-            self.emit_label(&after_label);
-            self.terminated = false;
+                self.emit_label(&default_label);
+                self.emit_line("unreachable".to_string());
+
+                if all_terminated {
+                    self.terminated = true;
+                } else {
+                    self.emit_label(&after_label);
+                    self.terminated = false;
+                }
+                Ok(())
+            }
+            LlvmType::Struct(struct_name) => {
+                if cases.len() != 1 {
+                    return Err(format!(
+                        "match on struct `{}` expects exactly one case in LLVM backend",
+                        struct_name
+                    ));
+                }
+                let case = &cases[0];
+                let ast::MatchPattern::Struct { fields, .. } = &case.pattern else {
+                    return Err("struct match case expected struct pattern".to_string());
+                };
+                self.push_scope();
+                self.bind_struct_pattern_fields(struct_name, &matched, fields)?;
+                self.compile_statements(&case.body)?;
+                self.pop_scope();
+                Ok(())
+            }
+            _ => Err("match expects an enum or struct value in LLVM backend".to_string()),
         }
-        Ok(())
     }
 
     fn compile_for(
@@ -2719,6 +2760,50 @@ impl<'a> FunctionCompiler<'a> {
         })
     }
 
+    fn extract_struct_field_value(
+        &mut self,
+        value: &ExprValue,
+        field_index: usize,
+        field_type: LlvmType,
+    ) -> Result<ExprValue, String> {
+        let temp = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, {}",
+            temp,
+            value.llvm_type.ir(),
+            value.value,
+            field_index
+        ));
+        Ok(ExprValue {
+            llvm_type: field_type,
+            value: temp,
+        })
+    }
+
+    fn bind_struct_pattern_fields(
+        &mut self,
+        struct_name: &str,
+        value: &ExprValue,
+        fields: &[ast::StructPatternField],
+    ) -> Result<(), String> {
+        for field in fields {
+            let (field_index, field_type) = self
+                .struct_field_info(struct_name, &field.field_name)
+                .ok_or_else(|| {
+                    format!(
+                        "unknown field `{}` on struct `{}`",
+                        field.field_name, struct_name
+                    )
+                })?;
+            let field_value =
+                self.extract_struct_field_value(value, field_index, field_type.clone())?;
+            let field_ptr = self.emit_heap_alloc(field_type.clone(), &field.binding);
+            self.emit_store(&field_ptr, &field_value);
+            self.declare_local(field.binding.clone(), field_ptr, field_type);
+        }
+        Ok(())
+    }
+
     fn coerce_expr(
         &mut self,
         value: ExprValue,
@@ -3732,6 +3817,56 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "10\n");
+    }
+
+    #[test]
+    fn runs_compiled_struct_destructure_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            function main(): void {
+                point: Point = Point { x: 5, y: 8 };
+                Point { x, y: py } = point;
+                print(x);
+                print(py);
+                print(x + py);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "5\n8\n13\n");
+    }
+
+    #[test]
+    fn runs_compiled_struct_match_pattern_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            function sum(point: Point): int {
+                match (point) {
+                    case Point { x, y }: {
+                        return x + y;
+                    }
+                }
+            }
+
+            function main(): void {
+                print(sum(Point { x: 2, y: 9 }));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "11\n");
     }
 
     #[test]

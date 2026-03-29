@@ -242,6 +242,27 @@ impl ModuleNormalizer {
                     metadata,
                 }
             }
+            Node::StructDestructure {
+                struct_type,
+                fields,
+                value,
+                metadata,
+            } => {
+                let struct_type = self.rename_type(struct_type, value_scopes, type_scopes)?;
+                let value = Box::new(self.rename_expr(*value, value_scopes, type_scopes)?);
+                if !top_level {
+                    let scope = value_scopes.last_mut().expect("local scope exists");
+                    for field in &fields {
+                        scope.insert(field.binding.clone());
+                    }
+                }
+                Node::StructDestructure {
+                    struct_type,
+                    fields,
+                    value,
+                    metadata,
+                }
+            }
             Node::FunctionDeclaration {
                 name,
                 parameters,
@@ -572,15 +593,20 @@ impl ModuleNormalizer {
                         let pattern =
                             self.rename_match_pattern(case.pattern, value_scopes, type_scopes)?;
                         value_scopes.push(HashSet::new());
-                        if let ast::MatchPattern::EnumVariant {
-                            binding: Some(binding),
-                            ..
-                        } = &pattern
-                        {
-                            value_scopes
-                                .last_mut()
-                                .expect("case scope exists")
-                                .insert(binding.clone());
+                        let scope = value_scopes.last_mut().expect("case scope exists");
+                        match &pattern {
+                            ast::MatchPattern::EnumVariant {
+                                binding: Some(binding),
+                                ..
+                            } => {
+                                scope.insert(binding.clone());
+                            }
+                            ast::MatchPattern::Struct { fields, .. } => {
+                                for field in fields {
+                                    scope.insert(field.binding.clone());
+                                }
+                            }
+                            _ => {}
                         }
                         let body = self.rename_statement_list(
                             case.body,
@@ -813,6 +839,7 @@ impl ModuleNormalizer {
             | Node::For { .. }
             | Node::Return(_)
             | Node::Print(_)
+            | Node::StructDestructure { .. }
             | Node::VariableDeclaration { .. }
             | Node::FunctionDeclaration { .. }
             | Node::GenericFunctionDeclaration { .. }
@@ -849,6 +876,13 @@ impl ModuleNormalizer {
                     .transpose()?,
                 variant,
                 binding,
+            },
+            ast::MatchPattern::Struct {
+                struct_type,
+                fields,
+            } => ast::MatchPattern::Struct {
+                struct_type: self.rename_type(struct_type, value_scopes, type_scopes)?,
+                fields,
             },
         })
     }

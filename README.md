@@ -15,6 +15,7 @@
 - **Modules and Imports**: `module foo.bar;`, `import foo.bar;`, and `export` for multi-file Skunk programs with module APIs
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Enums and Match**: Generic enums with unit and single-payload variants, plus exhaustive enum-focused `match`
+- **Struct Patterns and Destructuring**: Struct field binding in `match` and statements like `Point { x, y } = point;`
 - **Traits**: Compile-time traits with explicit `impl Trait for Type` declarations and generic bounds like `T: Writer + Flushable`
 - **Receiver Mutability**: Methods and trait requirements distinguish read-only `self` from mutating `mut self`
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
@@ -115,6 +116,29 @@ function main(): void {
     p: Point = Point { x: 0, y: 0 };
     p.set_x(10);
     print(p.get_x());
+}
+```
+
+### Struct Patterns and Destructuring
+```skunk
+struct Point {
+    x: int;
+    y: int;
+}
+
+function sum(point: Point): int {
+    match (point) {
+        case Point { x, y }: {
+            return x + y;
+        }
+    }
+}
+
+function main(): void {
+    point: Point = Point { x: 3, y: 4 };
+    Point { x, y: py } = point;
+    print(sum(point));
+    print(x + py);
 }
 ```
 

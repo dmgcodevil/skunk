@@ -328,24 +328,44 @@ fn enum_symbol_for_type<'a>(
     }
 }
 
+fn struct_symbol_for_type<'a>(
+    global_scope: &'a GlobalScope,
+    sk_type: &Type,
+) -> Option<&'a StructSymbol> {
+    match unwrap_binding_const(unwrap_const_view(sk_type)) {
+        Type::Custom(name) => global_scope.structs.get(name),
+        _ => None,
+    }
+}
+
+enum MatchPatternResolution {
+    Enum {
+        case_key: String,
+        binding: Option<(String, Type)>,
+    },
+    Struct {
+        bindings: Vec<(String, Type)>,
+    },
+}
+
 fn resolve_match_pattern(
     global_scope: &GlobalScope,
     matched_type: &Type,
     pattern: &crate::ast::MatchPattern,
-) -> Result<(String, Option<Type>), String> {
-    let enum_symbol = enum_symbol_for_type(global_scope, matched_type).ok_or_else(|| {
-        format!(
-            "match expects an enum value, found `{}`",
-            type_to_string(matched_type)
-        )
-    })?;
-
+) -> Result<MatchPatternResolution, String> {
     match pattern {
         crate::ast::MatchPattern::EnumVariant {
             enum_type,
             variant,
             binding,
         } => {
+            let enum_symbol =
+                enum_symbol_for_type(global_scope, matched_type).ok_or_else(|| {
+                    format!(
+                        "match expects an enum value, found `{}`",
+                        type_to_string(matched_type)
+                    )
+                })?;
             if let Some(enum_type) = enum_type {
                 if enum_type != matched_type {
                     return Err(format!(
@@ -373,7 +393,48 @@ fn resolve_match_pattern(
                 }
                 _ => {}
             }
-            Ok((variant.clone(), variant_symbol.payload_type.clone()))
+            Ok(MatchPatternResolution::Enum {
+                case_key: variant.clone(),
+                binding: binding.clone().zip(variant_symbol.payload_type.clone()),
+            })
+        }
+        crate::ast::MatchPattern::Struct {
+            struct_type,
+            fields,
+        } => {
+            if struct_type != matched_type {
+                return Err(format!(
+                    "match pattern expects `{}`, but value has type `{}`",
+                    type_to_string(struct_type),
+                    type_to_string(matched_type)
+                ));
+            }
+            let struct_symbol =
+                struct_symbol_for_type(global_scope, matched_type).ok_or_else(|| {
+                    format!(
+                        "match expects a struct value, found `{}`",
+                        type_to_string(matched_type)
+                    )
+                })?;
+            let mut bindings = Vec::new();
+            let mut seen_fields = HashMap::<String, bool>::new();
+            for field in fields {
+                if seen_fields.insert(field.field_name.clone(), true).is_some() {
+                    return Err(format!(
+                        "duplicate field `{}` in struct pattern",
+                        field.field_name
+                    ));
+                }
+                let field_symbol =
+                    struct_symbol.fields.get(&field.field_name).ok_or_else(|| {
+                        format!(
+                            "struct `{}` does not contain field `{}`",
+                            struct_symbol.name, field.field_name
+                        )
+                    })?;
+                bindings.push((field.binding.clone(), field_symbol.sk_type.clone()));
+            }
+            Ok(MatchPatternResolution::Struct { bindings })
         }
     }
 }
@@ -1371,6 +1432,55 @@ fn resolve_type(
                 }
             }
         }
+        Node::StructDestructure {
+            struct_type,
+            fields,
+            value,
+            metadata: _,
+        } => {
+            let value_type = resolve_type(
+                global_scope,
+                symbol_tables,
+                value.deref(),
+                Some(struct_type),
+            )?
+            .sk_type;
+            if !is_assignable(struct_type, &value_type) {
+                return Err(format!(
+                    "struct destructure type mismatch. expected `{}`, actual `{}`",
+                    type_to_string(struct_type),
+                    type_to_string(&value_type)
+                ));
+            }
+            let struct_symbol =
+                struct_symbol_for_type(global_scope, struct_type).ok_or_else(|| {
+                    format!(
+                        "struct destructure requires a struct type, found `{}`",
+                        type_to_string(struct_type)
+                    )
+                })?;
+            let mut seen_fields = HashMap::<String, bool>::new();
+            for field in fields {
+                if seen_fields.insert(field.field_name.clone(), true).is_some() {
+                    return Err(format!(
+                        "duplicate field `{}` in struct destructure",
+                        field.field_name
+                    ));
+                }
+                let field_symbol =
+                    struct_symbol.fields.get(&field.field_name).ok_or_else(|| {
+                        format!(
+                            "struct `{}` does not contain field `{}`",
+                            struct_symbol.name, field.field_name
+                        )
+                    })?;
+                symbol_tables.get_mut().add(Symbol {
+                    name: field.binding.clone(),
+                    sk_type: field_symbol.sk_type.clone(),
+                });
+            }
+            Ok(ResolveResult::new(Type::Void))
+        }
         Node::FunctionCall {
             name, arguments, ..
         } => {
@@ -1806,34 +1916,54 @@ fn resolve_type(
         Node::Match { value, cases } => {
             let matched_type =
                 resolve_type(global_scope, symbol_tables, value, expected_type_opt)?.sk_type;
-            let enum_symbol =
-                enum_symbol_for_type(global_scope, &matched_type).ok_or_else(|| {
-                    format!(
-                        "match expects an enum value, found `{}`",
-                        type_to_string(&matched_type)
-                    )
-                })?;
+            let enum_symbol = enum_symbol_for_type(global_scope, &matched_type);
+            let struct_symbol = struct_symbol_for_type(global_scope, &matched_type);
+            if enum_symbol.is_none() && struct_symbol.is_none() {
+                return Err(format!(
+                    "match expects an enum or struct value, found `{}`",
+                    type_to_string(&matched_type)
+                ));
+            }
             let mut seen_variants = HashMap::<String, bool>::new();
             let mut returned = true;
             let mut result = Type::Void;
 
             for case in cases {
-                let (variant_name, payload_type) =
-                    resolve_match_pattern(global_scope, &matched_type, &case.pattern)?;
-                if seen_variants.insert(variant_name.clone(), true).is_some() {
-                    return Err(format!(
-                        "duplicate match case for variant `{}`",
-                        variant_name
-                    ));
+                let resolution = resolve_match_pattern(global_scope, &matched_type, &case.pattern)?;
+                match &resolution {
+                    MatchPatternResolution::Enum { case_key, .. } => {
+                        if seen_variants.insert(case_key.clone(), true).is_some() {
+                            return Err(format!("duplicate match case for variant `{}`", case_key));
+                        }
+                    }
+                    MatchPatternResolution::Struct { .. } => {
+                        if cases.len() != 1 {
+                            return Err(format!(
+                                "match on struct `{}` supports exactly one case in V1",
+                                type_to_string(&matched_type)
+                            ));
+                        }
+                    }
                 }
                 let var_table = symbol_tables.get().clone();
                 symbol_tables.add(var_table);
-                let crate::ast::MatchPattern::EnumVariant { binding, .. } = &case.pattern;
-                if let (Some(binding), Some(payload_type)) = (binding, payload_type) {
-                    symbol_tables.get_mut().add(Symbol {
-                        name: binding.clone(),
-                        sk_type: payload_type,
-                    });
+                match resolution {
+                    MatchPatternResolution::Enum { binding, .. } => {
+                        if let Some((binding, payload_type)) = binding {
+                            symbol_tables.get_mut().add(Symbol {
+                                name: binding,
+                                sk_type: payload_type,
+                            });
+                        }
+                    }
+                    MatchPatternResolution::Struct { bindings } => {
+                        for (binding, binding_type) in bindings {
+                            symbol_tables.get_mut().add(Symbol {
+                                name: binding,
+                                sk_type: binding_type,
+                            });
+                        }
+                    }
                 }
                 let mut case_returned = false;
                 let mut case_result = Type::Void;
@@ -1853,11 +1983,13 @@ fn resolve_type(
                 }
             }
 
-            if seen_variants.len() != enum_symbol.variants.len() {
-                return Err(format!(
-                    "match on `{}` is not exhaustive",
-                    type_to_string(&matched_type)
-                ));
+            if let Some(enum_symbol) = enum_symbol {
+                if seen_variants.len() != enum_symbol.variants.len() {
+                    return Err(format!(
+                        "match on `{}` is not exhaustive",
+                        type_to_string(&matched_type)
+                    ));
+                }
             }
 
             if returned {
@@ -2669,6 +2801,64 @@ mod tests {
         function main(): void {
             const counter: Counter = Counter { value: 0 };
             counter.bump();
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_struct_destructure_binds_locals() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+            y: int;
+        }
+
+        function main(): void {
+            point: Point = Point { x: 3, y: 4 };
+            Point { x, y: py } = point;
+            total: int = x + py;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_struct_match_pattern_binds_fields() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+            y: int;
+        }
+
+        function sum(point: Point): int {
+            match (point) {
+                case Point { x, y: py }: {
+                    return x + py;
+                }
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_struct_pattern_rejects_unknown_field() {
+        let source_code = r#"
+        struct Point {
+            x: int;
+            y: int;
+        }
+
+        function sum(point: Point): int {
+            match (point) {
+                case Point { z }: {
+                    return z;
+                }
+            }
         }
         "#;
         let program = ast::parse(source_code);

@@ -717,6 +717,43 @@ impl Monomorphizer {
                     Some(internal_type),
                 ))
             }
+            Node::StructDestructure {
+                struct_type,
+                fields,
+                value,
+                metadata,
+            } => {
+                let internal_type = self.apply_substitutions(struct_type, substitutions);
+                let output_type = self.concretize_type(&internal_type)?;
+                let (value, _) = self.transform_expr(
+                    value,
+                    env,
+                    Some(&internal_type),
+                    substitutions,
+                    self_type.clone(),
+                )?;
+                for field in fields {
+                    let field_type = self
+                        .lookup_struct_field_type(&internal_type, &field.field_name)?
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown field `{}` on `{}`",
+                                field.field_name,
+                                ast::type_to_string(&internal_type)
+                            )
+                        })?;
+                    env.insert(field.binding.clone(), field_type);
+                }
+                Ok((
+                    Node::StructDestructure {
+                        struct_type: output_type,
+                        fields: fields.clone(),
+                        value: Box::new(value),
+                        metadata: metadata.clone(),
+                    },
+                    Some(Type::Void),
+                ))
+            }
             Node::Assignment {
                 var,
                 value,
@@ -850,12 +887,22 @@ impl Monomorphizer {
                 let mut output_cases = Vec::new();
                 for case in cases {
                     env.push();
-                    let ast::MatchPattern::EnumVariant { binding, .. } = &case.pattern;
-                    if let Some(binding) = binding {
-                        if let Some(payload_type) =
-                            self.lookup_enum_variant_payload_type(&value_type, &case.pattern)?
-                        {
-                            env.insert(binding.clone(), payload_type);
+                    match &case.pattern {
+                        ast::MatchPattern::EnumVariant { binding, .. } => {
+                            if let Some(binding) = binding {
+                                if let Some(payload_type) = self
+                                    .lookup_enum_variant_payload_type(&value_type, &case.pattern)?
+                                {
+                                    env.insert(binding.clone(), payload_type);
+                                }
+                            }
+                        }
+                        ast::MatchPattern::Struct { .. } => {
+                            for (binding, binding_type) in
+                                self.lookup_struct_pattern_bindings(&value_type, &case.pattern)?
+                            {
+                                env.insert(binding, binding_type);
+                            }
                         }
                     }
                     let mut output_body = Vec::new();
@@ -1662,6 +1709,7 @@ impl Monomorphizer {
             | Node::TraitDeclaration { .. }
             | Node::ImplDeclaration { .. }
             | Node::VariableDeclaration { .. }
+            | Node::StructDestructure { .. }
             | Node::StructDeclaration { .. }
             | Node::EnumDeclaration { .. }
             | Node::GenericStructDeclaration { .. }
@@ -1701,6 +1749,14 @@ impl Monomorphizer {
                 },
                 variant: variant.clone(),
                 binding: binding.clone(),
+            }),
+            ast::MatchPattern::Struct {
+                struct_type,
+                fields,
+            } => Ok(ast::MatchPattern::Struct {
+                struct_type: self
+                    .concretize_type(&self.apply_substitutions(struct_type, substitutions))?,
+                fields: fields.clone(),
             }),
         }
     }
@@ -1755,6 +1811,33 @@ impl Monomorphizer {
             ast::MatchPattern::EnumVariant { variant, .. } => self
                 .lookup_enum_variant(enum_type, variant)
                 .map(|payload| payload.flatten()),
+            ast::MatchPattern::Struct { .. } => Ok(None),
+        }
+    }
+
+    fn lookup_struct_pattern_bindings(
+        &mut self,
+        struct_type: &Type,
+        pattern: &ast::MatchPattern,
+    ) -> Result<Vec<(String, Type)>, String> {
+        match pattern {
+            ast::MatchPattern::Struct { fields, .. } => {
+                let mut bindings = Vec::new();
+                for field in fields {
+                    let field_type = self
+                        .lookup_struct_field_type(struct_type, &field.field_name)?
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown field `{}` on `{}`",
+                                field.field_name,
+                                ast::type_to_string(struct_type)
+                            )
+                        })?;
+                    bindings.push((field.binding.clone(), field_type));
+                }
+                Ok(bindings)
+            }
+            _ => Ok(Vec::new()),
         }
     }
 

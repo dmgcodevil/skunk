@@ -82,6 +82,12 @@ pub enum Node {
         value: Box<Node>,
         metadata: Metadata,
     },
+    StructDestructure {
+        struct_type: Type,
+        fields: Vec<StructPatternField>,
+        value: Box<Node>,
+        metadata: Metadata,
+    },
     ArrayInit {
         elements: Vec<Node>,
     },
@@ -170,11 +176,21 @@ pub struct MatchCase {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct StructPatternField {
+    pub field_name: String,
+    pub binding: String,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum MatchPattern {
     EnumVariant {
         enum_type: Option<Type>,
         variant: String,
         binding: Option<String>,
+    },
+    Struct {
+        struct_type: Type,
+        fields: Vec<StructPatternField>,
     },
 }
 
@@ -353,6 +369,10 @@ impl PestImpl {
             Rule::impl_decl => self.create_impl_decl(pair),
             Rule::var_decl => self.create_var_decl(pair),
             Rule::var_decl_stmt => self.create_var_decl(pair.into_inner().next().unwrap()),
+            Rule::struct_destructure => self.create_struct_destructure(pair),
+            Rule::struct_destructure_stmt => {
+                self.create_struct_destructure(pair.into_inner().next().unwrap())
+            }
             Rule::func_decl => self.create_func_decl(pair),
             Rule::lambda_expr => self.create_func_decl(pair),
             Rule::literal => self.create_literal(pair),
@@ -942,7 +962,12 @@ impl PestImpl {
 
     fn create_match_pattern(&self, pair: Pair<Rule>) -> MatchPattern {
         assert_eq!(pair.as_rule(), Rule::match_pattern);
-        self.create_enum_match_pattern(pair.into_inner().next().unwrap())
+        let inner = pair.into_inner().next().unwrap();
+        match inner.as_rule() {
+            Rule::enum_match_pattern => self.create_enum_match_pattern(inner),
+            Rule::struct_match_pattern => self.create_struct_match_pattern(inner),
+            other => panic!("unexpected match pattern rule {:?}", other),
+        }
     }
 
     fn create_enum_match_pattern(&self, pair: Pair<Rule>) -> MatchPattern {
@@ -962,6 +987,50 @@ impl PestImpl {
             enum_type,
             variant,
             binding,
+        }
+    }
+
+    fn create_struct_pattern_fields(&self, pair: Pair<Rule>) -> Vec<StructPatternField> {
+        assert_eq!(pair.as_rule(), Rule::struct_pattern_fields);
+        pair.into_inner()
+            .map(|field| {
+                let mut inner = field.into_inner();
+                let field_name = inner.next().unwrap().as_str().to_string();
+                let binding = inner
+                    .next()
+                    .map(|pair| pair.as_str().to_string())
+                    .unwrap_or_else(|| field_name.clone());
+                StructPatternField {
+                    field_name,
+                    binding,
+                }
+            })
+            .collect()
+    }
+
+    fn create_struct_match_pattern(&self, pair: Pair<Rule>) -> MatchPattern {
+        assert_eq!(pair.as_rule(), Rule::struct_match_pattern);
+        let mut inner = pair.into_inner();
+        let struct_type = self.create_nominal_type(inner.next().unwrap());
+        let fields = self.create_struct_pattern_fields(inner.next().unwrap());
+        MatchPattern::Struct {
+            struct_type,
+            fields,
+        }
+    }
+
+    fn create_struct_destructure(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::struct_destructure);
+        let metadata = (self.metadata_creator)(&pair);
+        let mut inner = pair.into_inner();
+        let struct_type = self.create_nominal_type(inner.next().unwrap());
+        let fields = self.create_struct_pattern_fields(inner.next().unwrap());
+        let value = Box::new(self.create_ast(inner.next().unwrap()));
+        Node::StructDestructure {
+            struct_type,
+            fields,
+            value,
+            metadata,
         }
     }
 
@@ -3108,6 +3177,80 @@ mod tests {
                     return_type: Type::Void,
                     body: vec![],
                     lambda: false,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_struct_destructure_statement() {
+        let source_code = r#"
+            Point { x, y: py } = point;
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::StructDestructure {
+                    struct_type: Type::Custom("Point".to_string()),
+                    fields: vec![
+                        StructPatternField {
+                            field_name: "x".to_string(),
+                            binding: "x".to_string(),
+                        },
+                        StructPatternField {
+                            field_name: "y".to_string(),
+                            binding: "py".to_string(),
+                        },
+                    ],
+                    value: Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("point".to_string())],
+                    }),
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_struct_match_pattern() {
+        let source_code = r#"
+            match (point) {
+                case Point { x, y: py }: {
+                    print(x);
+                }
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::Match {
+                    value: Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("point".to_string())],
+                    }),
+                    cases: vec![MatchCase {
+                        pattern: MatchPattern::Struct {
+                            struct_type: Type::Custom("Point".to_string()),
+                            fields: vec![
+                                StructPatternField {
+                                    field_name: "x".to_string(),
+                                    binding: "x".to_string(),
+                                },
+                                StructPatternField {
+                                    field_name: "y".to_string(),
+                                    binding: "py".to_string(),
+                                },
+                            ],
+                        },
+                        body: vec![Node::Print(Box::new(Node::Access {
+                            nodes: vec![Node::Identifier("x".to_string())],
+                        }))],
+                    }],
                 },
                 Node::EOI,
             ],
