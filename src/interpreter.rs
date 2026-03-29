@@ -386,6 +386,9 @@ fn numeric_to_f64(number: NumericValue) -> f64 {
 
 fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
     match target {
+        Type::Const { inner } | Type::BindingConst { inner } => {
+            coerce_value_to_type(value_ref, inner)
+        }
         Type::Byte | Type::Short | Type::Int | Type::Long | Type::Float | Type::Double => {
             let returned = value_ref.returned();
             let numeric = value_ref

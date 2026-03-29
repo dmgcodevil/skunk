@@ -37,6 +37,7 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
 // Types
 size = { INTEGER }
 builtin_type    = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | "Allocator" | "Arena" | "void" }
+const_kw        = { "const" }
 trait_bound     = { IDENTIFIER }
 generic_param   = { IDENTIFIER ~ (":" ~ trait_bound ~ ("+" ~ trait_bound)*)? }
 generic_params  = { "[" ~ generic_param ~ ("," ~ generic_param)* ~ "]" }
@@ -47,11 +48,11 @@ legacy_array_type = { base_type ~ legacy_array_dim+ } // legacy syntax: int[3]
 legacy_slice_type = { base_type ~ ("[" ~ "]")+ } // legacy syntax: int[]
 pointer_prefix  = { "*" }
 type_prefix     = { pointer_prefix | "[" ~ expression? ~ "]" }
-prefixed_type   = { type_prefix+ ~ (base_type | function_type) } // preferred syntax: [3]int, []int
+prefixed_type   = { type_prefix+ ~ const_kw? ~ (base_type | function_type) } // preferred syntax: [3]int, []int, *const Foo
 function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
 _type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type }
 
-_self               = { "self" }
+_self               = { const_kw? ~ "self" }
 member_func_params  = { "(" ~ _self ~ ("," ~ param_list )? ~ ")" }
 static_func_params  = { "(" ~ param_list ~ ")" | empty_params }
 
@@ -69,14 +70,15 @@ qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
 module            = { "module" ~ qualified_name ~ ";"}
 import            = { "import" ~ qualified_name ~ ";"}
 export_decl       = { "export" ~ (var_decl_stmt | func_decl | struct_decl | enum_decl | trait_decl) }
-var_decl          = { IDENTIFIER ~ ":" ~ _type ~ ( "=" ~ ( lambda_expr | expression | func_call ) )? }
+param_decl        = { const_kw? ~ IDENTIFIER ~ ":" ~ _type }
+var_decl          = { const_kw? ~ IDENTIFIER ~ ":" ~ _type ~ ( "=" ~ ( lambda_expr | expression | func_call ) )? }
 var_decl_stmt     = { var_decl ~ ";"? }
 func_decl         = { "function" ~ IDENTIFIER ~ generic_params? ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 trait_method_decl = { "function" ~ IDENTIFIER ~ member_func_params ~ optional_return_type ~ ";" }
 trait_decl        = { "trait" ~ IDENTIFIER ~ "{" ~ trait_method_decl* ~ "}" }
 impl_decl         = { "impl" ~ IDENTIFIER ~ ("," ~ IDENTIFIER)* ~ "for" ~ _type ~ "{" ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
-param_list        = { (IDENTIFIER ~ ":" ~ _type ~ ("," ~ IDENTIFIER ~ ":" ~ _type)*) }
+param_list        = { (param_decl ~ ("," ~ param_decl)*) }
 param_type_list   = { (_type ~ ("," ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ generic_params? ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
 struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }

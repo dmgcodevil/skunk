@@ -382,7 +382,10 @@ impl Monomorphizer {
     }
 
     fn validate_impl_target_type(&self, sk_type: &Type) -> Result<(), String> {
+        let sk_type = ast::unwrap_binding_const(sk_type);
         match sk_type {
+            Type::BindingConst { inner } => self.validate_impl_target_type(inner),
+            Type::Const { inner } => self.validate_impl_target_type(inner),
             Type::Void => Err("cannot implement traits for `void`".to_string()),
             Type::Byte
             | Type::Short
@@ -396,9 +399,13 @@ impl Monomorphizer {
             | Type::Allocator
             | Type::Arena => Ok(()),
             Type::Custom(name) => {
-                if self.concrete_structs.contains_key(name) || self.concrete_enums.contains_key(name) {
+                if self.concrete_structs.contains_key(name)
+                    || self.concrete_enums.contains_key(name)
+                {
                     Ok(())
-                } else if self.generic_structs.contains_key(name) || self.generic_enums.contains_key(name) {
+                } else if self.generic_structs.contains_key(name)
+                    || self.generic_enums.contains_key(name)
+                {
                     Err(format!(
                         "impl targets must be concrete types; generic type `{}` needs concrete type arguments",
                         name
@@ -433,15 +440,19 @@ impl Monomorphizer {
         target_type: &Type,
     ) -> Result<(), String> {
         for method in &trait_template.methods {
-            let first_parameter = method.parameters.first().map(|(_, sk_type)| sk_type);
+            let first_parameter = method
+                .parameters
+                .first()
+                .map(|(_, sk_type)| ast::unwrap_binding_const(sk_type));
             if first_parameter != Some(&Type::SkSelf) {
                 return Err(format!(
                     "trait `{}` method `{}` must declare `self` as its first parameter",
                     trait_template.name, method.name
                 ));
             }
-            let (actual_parameters, actual_return_type) =
-                self.lookup_method_signature(target_type, &method.name).map_err(|_| {
+            let (actual_parameters, actual_return_type) = self
+                .lookup_method_signature(target_type, &method.name)
+                .map_err(|_| {
                     format!(
                         "type `{}` does not implement required trait method `{}.{}`",
                         ast::type_to_string(target_type),
@@ -455,7 +466,8 @@ impl Monomorphizer {
                 .skip(1)
                 .map(|(_, sk_type)| sk_type.clone())
                 .collect::<Vec<_>>();
-            if actual_parameters != expected_parameters || actual_return_type != method.return_type {
+            if actual_parameters != expected_parameters || actual_return_type != method.return_type
+            {
                 return Err(format!(
                     "trait method `{}.{}` expects `({}) -> {}`, but `{}` provides `({}) -> {}`",
                     trait_template.name,
@@ -498,10 +510,7 @@ impl Monomorphizer {
                 if !implemented {
                     return Err(format!(
                         "{} requires `{}` to implement trait `{}`, but `{}` does not",
-                        context,
-                        param,
-                        trait_name,
-                        actual_key
+                        context, param, trait_name, actual_key
                     ));
                 }
             }
@@ -521,18 +530,25 @@ impl Monomorphizer {
         let mut env = Env::new();
         let mut output_parameters = Vec::new();
         for (param_name, param_type) in parameters {
-            let internal_type = if *param_type == Type::SkSelf {
-                self_type
+            let internal_type = if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                let resolved_self_type = self_type
                     .clone()
-                    .ok_or_else(|| "self parameter requires a receiver type".to_string())?
+                    .ok_or_else(|| "self parameter requires a receiver type".to_string())?;
+                if ast::is_binding_const(param_type) {
+                    Type::BindingConst {
+                        inner: Box::new(resolved_self_type),
+                    }
+                } else {
+                    resolved_self_type
+                }
             } else {
                 self.apply_substitutions(param_type, substitutions)
             };
             env.insert(param_name.clone(), internal_type.clone());
             output_parameters.push((
                 param_name.clone(),
-                if *param_type == Type::SkSelf {
-                    Type::SkSelf
+                if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                    param_type.clone()
                 } else {
                     self.concretize_type(&internal_type)?
                 },
@@ -992,19 +1008,26 @@ impl Monomorphizer {
         let mut output_parameters = Vec::new();
         let mut function_parameters = Vec::new();
         for (param_name, param_type) in parameters {
-            let internal_type = if *param_type == Type::SkSelf {
-                self_type
+            let internal_type = if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                let resolved_self_type = self_type
                     .clone()
-                    .ok_or_else(|| "self parameter requires a receiver type".to_string())?
+                    .ok_or_else(|| "self parameter requires a receiver type".to_string())?;
+                if ast::is_binding_const(param_type) {
+                    Type::BindingConst {
+                        inner: Box::new(resolved_self_type),
+                    }
+                } else {
+                    resolved_self_type
+                }
             } else {
                 self.apply_substitutions(param_type, substitutions)
             };
             env.insert(param_name.clone(), internal_type.clone());
-            function_parameters.push(internal_type.clone());
+            function_parameters.push(ast::strip_binding_const(&internal_type));
             output_parameters.push((
                 param_name.clone(),
-                if *param_type == Type::SkSelf {
-                    Type::SkSelf
+                if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                    param_type.clone()
                 } else {
                     self.concretize_type(&internal_type)?
                 },
@@ -1051,7 +1074,10 @@ impl Monomorphizer {
             }
             Node::Identifier(name) => {
                 if let Some(sk_type) = env.get(name) {
-                    return Ok((Node::Identifier(name.clone()), sk_type));
+                    return Ok((
+                        Node::Identifier(name.clone()),
+                        ast::strip_binding_const(&sk_type),
+                    ));
                 }
                 if let Some(function) = self.concrete_functions.get(name) {
                     return Ok((
@@ -1293,8 +1319,16 @@ impl Monomorphizer {
                             | Node::ArrayAccess { .. }
                             | Node::SliceAccess { .. }
                     ) {
-                        if let Type::Pointer { target_type } = current_type.clone() {
-                            current_type = target_type.deref().clone();
+                        loop {
+                            match current_type.clone() {
+                                Type::Const { inner } => {
+                                    current_type = inner.deref().clone();
+                                }
+                                Type::Pointer { target_type } => {
+                                    current_type = target_type.deref().clone();
+                                }
+                                _ => break,
+                            }
                         }
                     }
 
@@ -1771,7 +1805,7 @@ impl Monomorphizer {
         }
 
         let signature = if let Some(local_type) = env.get(name) {
-            local_type
+            ast::strip_binding_const(&local_type)
         } else if let Some(function) = self.concrete_functions.get(name) {
             Type::Function {
                 parameters: function
@@ -1849,6 +1883,18 @@ impl Monomorphizer {
         substitutions: &mut HashMap<String, Type>,
     ) -> Result<(), String> {
         match pattern {
+            Type::BindingConst { inner } => self.unify_generic_type(
+                inner,
+                ast::unwrap_binding_const(actual),
+                generic_params,
+                substitutions,
+            ),
+            Type::Const { inner } => self.unify_generic_type(
+                inner,
+                ast::unwrap_const_view(actual),
+                generic_params,
+                substitutions,
+            ),
             Type::Custom(name) if generic_params.iter().any(|param| param == name) => {
                 if let Some(existing) = substitutions.get(name) {
                     if existing != actual {
@@ -2227,7 +2273,7 @@ impl Monomorphizer {
                     function
                         .0
                         .into_iter()
-                        .filter(|(_, sk_type)| *sk_type != Type::SkSelf)
+                        .filter(|(_, sk_type)| ast::unwrap_binding_const(sk_type) != &Type::SkSelf)
                         .map(|(_, sk_type)| sk_type)
                         .collect(),
                     function.1,
@@ -2264,7 +2310,7 @@ impl Monomorphizer {
                     function
                         .0
                         .into_iter()
-                        .filter(|(_, sk_type)| *sk_type != Type::SkSelf)
+                        .filter(|(_, sk_type)| ast::unwrap_binding_const(sk_type) != &Type::SkSelf)
                         .map(|(_, sk_type)| self.apply_substitutions(&sk_type, &substitutions))
                         .collect(),
                     self.apply_substitutions(&function.1, &substitutions),
@@ -2279,6 +2325,12 @@ impl Monomorphizer {
 
     fn apply_substitutions(&self, sk_type: &Type, substitutions: &HashMap<String, Type>) -> Type {
         match sk_type {
+            Type::Const { inner } => Type::Const {
+                inner: Box::new(self.apply_substitutions(inner, substitutions)),
+            },
+            Type::BindingConst { inner } => Type::BindingConst {
+                inner: Box::new(self.apply_substitutions(inner, substitutions)),
+            },
             Type::Custom(name) => substitutions
                 .get(name)
                 .cloned()
@@ -2322,6 +2374,12 @@ impl Monomorphizer {
 
     fn concretize_type(&mut self, sk_type: &Type) -> Result<Type, String> {
         match sk_type {
+            Type::Const { inner } => Ok(Type::Const {
+                inner: Box::new(self.concretize_type(inner)?),
+            }),
+            Type::BindingConst { inner } => Ok(Type::BindingConst {
+                inner: Box::new(self.concretize_type(inner)?),
+            }),
             Type::Array {
                 elem_type,
                 dimensions,
@@ -2408,10 +2466,10 @@ fn array_item_type(sk_type: &Type) -> Option<Type> {
                     dimensions: dimensions[1..].to_vec(),
                 })
             } else {
-                Some(elem_type.as_ref().clone())
+                Some(ast::strip_const_view(elem_type.as_ref()))
             }
         }
-        Type::Slice { elem_type } => Some(elem_type.as_ref().clone()),
+        Type::Slice { elem_type } => Some(ast::strip_const_view(elem_type.as_ref())),
         _ => None,
     }
 }
@@ -2582,6 +2640,8 @@ fn type_mangle(sk_type: &Type) -> String {
         Type::String => "string".to_string(),
         Type::Boolean => "boolean".to_string(),
         Type::Char => "char".to_string(),
+        Type::Const { inner } => format!("const_{}", type_mangle(inner)),
+        Type::BindingConst { inner } => type_mangle(inner),
         Type::Allocator => "Allocator".to_string(),
         Type::Arena => "Arena".to_string(),
         Type::Custom(name) => sanitize_mangle(name),

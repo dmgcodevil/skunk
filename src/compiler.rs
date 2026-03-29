@@ -152,6 +152,7 @@ fn llvm_type(
     enums: &HashMap<String, EnumLayout>,
 ) -> Result<LlvmType, String> {
     match sk_type {
+        Type::Const { inner } | Type::BindingConst { inner } => llvm_type(inner, structs, enums),
         Type::Byte => Ok(LlvmType::I8),
         Type::Short => Ok(LlvmType::I16),
         Type::Int => Ok(LlvmType::I32),
@@ -3170,7 +3171,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                         let mut parameter_types = Vec::new();
                         let mut compile_params = Vec::new();
                         for (param_name, param_type) in parameters {
-                            if *param_type == Type::SkSelf {
+                            if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
                                 continue;
                             }
                             parameter_types.push(llvm_type(param_type, &structs, &enums)?);
@@ -4000,6 +4001,123 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_const_slice_copy_program() {
+        let stdout = compile_and_run(
+            r#"
+            function copy_into(const dst: []int, src: []const int): void {
+                for (i: int = 0; i < src.len; i = i + 1) {
+                    dst[i] = src[i];
+                }
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                dst: []int = []int::alloc(heap, 2);
+                src: []int = []int::alloc(heap, 2);
+                src[0] = 7;
+                src[1] = 11;
+                copy_into(dst, src);
+                print(dst[0]);
+                print(dst[1]);
+                heap.free(dst);
+                heap.free(src);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n11\n");
+    }
+
+    #[test]
+    fn rejects_reassigning_const_variable() {
+        let result = compile_and_run(
+            r#"
+            function main(): void {
+                const answer: int = 41;
+                answer = 42;
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot assign to const binding `answer`"));
+    }
+
+    #[test]
+    fn rejects_reassigning_const_parameter() {
+        let result = compile_and_run(
+            r#"
+            function bump(const n: int): int {
+                n = n + 1;
+                return n;
+            }
+
+            function main(): void {
+                print(bump(1));
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot assign to const binding `n`"));
+    }
+
+    #[test]
+    fn rejects_writing_through_const_slice() {
+        let result = compile_and_run(
+            r#"
+            function overwrite(values: []const int): void {
+                values[0] = 7;
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                values: []int = []int::alloc(heap, 1);
+                overwrite(values);
+                heap.free(values);
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot assign through const-qualified target `int`"));
+    }
+
+    #[test]
+    fn rejects_writing_through_const_pointer() {
+        let result = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+            }
+
+            function set_x(point: *const Point): void {
+                point.x = 9;
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                point: *Point = Point::create(heap);
+                set_x(point);
+                heap.destroy(point);
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot assign through const-qualified target `int`"));
+    }
+
+    #[test]
     fn runs_compiled_arena_destroy_and_free_program() {
         let stdout = compile_and_run(
             r#"
@@ -4214,11 +4332,9 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("generic function `use_counter` requires `T` to implement trait `Writer`")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("generic function `use_counter` requires `T` to implement trait `Writer`"));
     }
 
     #[test]

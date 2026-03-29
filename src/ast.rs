@@ -227,6 +227,12 @@ pub enum Type {
     String,
     Boolean,
     Char,
+    Const {
+        inner: Box<Type>,
+    },
+    BindingConst {
+        inner: Box<Type>,
+    },
     Array {
         elem_type: Box<Type>,
         dimensions: Vec<Node>,
@@ -819,7 +825,17 @@ impl PestImpl {
             }
             Rule::prefixed_type => {
                 let mut inner_pairs: Vec<Pair<Rule>> = pair.into_inner().collect();
-                let base_type = self.create_type(inner_pairs.pop().unwrap());
+                let base_pair = inner_pairs.pop().unwrap();
+                let mut base_type = self.create_type(base_pair);
+                if inner_pairs
+                    .last()
+                    .is_some_and(|p| p.as_rule() == Rule::const_kw)
+                {
+                    inner_pairs.pop();
+                    base_type = Type::Const {
+                        inner: Box::new(base_type),
+                    };
+                }
                 let prefixes = inner_pairs
                     .into_iter()
                     .map(|p| self.create_type_prefix(p))
@@ -1113,8 +1129,21 @@ impl PestImpl {
     fn create_var_decl(&self, pair: Pair<Rule>) -> Node {
         let metadata = (self.metadata_creator)(&pair);
         let mut inner_pairs = pair.into_inner();
+        let mut is_const = false;
+        if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::const_kw)
+        {
+            inner_pairs.next();
+            is_const = true;
+        }
         let var_name = inner_pairs.next().unwrap().as_str().to_string();
-        let var_type = self.create_type(inner_pairs.next().unwrap());
+        let mut var_type = self.create_type(inner_pairs.next().unwrap());
+        if is_const {
+            var_type = Type::BindingConst {
+                inner: Box::new(var_type),
+            };
+        }
 
         let body = if let Some(body_pair) = inner_pairs.next() {
             Some(Box::new(self.create_ast(body_pair)))
@@ -1132,18 +1161,41 @@ impl PestImpl {
 
     fn _create_param_list(&self, pair: Pair<Rule>) -> Vec<(String, Type)> {
         match pair.as_rule() {
-            Rule::_self => Vec::from([("self".to_string(), Type::SkSelf)]),
+            Rule::_self => {
+                let mut inner_pairs = pair.into_inner();
+                let mut self_type = Type::SkSelf;
+                if inner_pairs
+                    .next()
+                    .is_some_and(|pair| pair.as_rule() == Rule::const_kw)
+                {
+                    self_type = Type::BindingConst {
+                        inner: Box::new(self_type),
+                    };
+                }
+                Vec::from([("self".to_string(), self_type)])
+            }
             Rule::empty_params => Vec::new(),
             Rule::param_list => {
                 let mut result: Vec<(String, Type)> = Vec::new();
-                let pairs: Vec<Pair<Rule>> = pair.into_inner().collect();
-                assert_eq!(pairs.len() % 2, 0);
-                pairs.chunks(2).for_each(|chunk| {
-                    result.push((
-                        chunk[0].as_str().to_string(),
-                        self.create_type(chunk[1].clone()),
-                    ));
-                });
+                for param in pair.into_inner() {
+                    let mut inner_pairs = param.into_inner();
+                    let mut is_const = false;
+                    if inner_pairs
+                        .peek()
+                        .is_some_and(|pair| pair.as_rule() == Rule::const_kw)
+                    {
+                        inner_pairs.next();
+                        is_const = true;
+                    }
+                    let name = inner_pairs.next().unwrap().as_str().to_string();
+                    let mut param_type = self.create_type(inner_pairs.next().unwrap());
+                    if is_const {
+                        param_type = Type::BindingConst {
+                            inner: Box::new(param_type),
+                        };
+                    }
+                    result.push((name, param_type));
+                }
                 result
             }
             _ => panic!("unexpected  rule {}", pair),
@@ -1202,14 +1254,19 @@ impl PestImpl {
             .parse(pair.into_inner())
     }
 
-    fn create_generic_params(&self, pair: Pair<Rule>) -> (Vec<String>, HashMap<String, Vec<String>>) {
+    fn create_generic_params(
+        &self,
+        pair: Pair<Rule>,
+    ) -> (Vec<String>, HashMap<String, Vec<String>>) {
         assert_eq!(pair.as_rule(), Rule::generic_params);
         let mut params = Vec::new();
         let mut bounds = HashMap::new();
         for param in pair.into_inner() {
             let mut inner_pairs = param.into_inner();
             let name = inner_pairs.next().unwrap().as_str().to_string();
-            let trait_bounds = inner_pairs.map(|p| p.as_str().to_string()).collect::<Vec<_>>();
+            let trait_bounds = inner_pairs
+                .map(|p| p.as_str().to_string())
+                .collect::<Vec<_>>();
             if !trait_bounds.is_empty() {
                 bounds.insert(name.clone(), trait_bounds);
             }
@@ -1258,6 +1315,8 @@ pub fn type_to_string(t: &Type) -> String {
         Type::String => "string".to_string(),
         Type::Boolean => "boolean".to_string(),
         Type::Char => "char".to_string(),
+        Type::Const { inner } => format!("const {}", type_to_string(inner)),
+        Type::BindingConst { inner } => format!("const {}", type_to_string(inner)),
         Type::Array {
             elem_type,
             dimensions,
@@ -1346,10 +1405,12 @@ fn create_base_type_from_str(s: &str) -> Type {
 }
 
 pub fn is_integral_type(t: &Type) -> bool {
+    let t = unwrap_binding_const(unwrap_const_view(t));
     matches!(t, Type::Byte | Type::Short | Type::Int | Type::Long)
 }
 
 pub fn is_floating_type(t: &Type) -> bool {
+    let t = unwrap_binding_const(unwrap_const_view(t));
     matches!(t, Type::Float | Type::Double)
 }
 
@@ -1362,6 +1423,7 @@ pub fn is_scalar_type(t: &Type) -> bool {
 }
 
 pub fn numeric_rank(t: &Type) -> Option<u8> {
+    let t = unwrap_binding_const(unwrap_const_view(t));
     match t {
         Type::Byte => Some(0),
         Type::Short => Some(1),
@@ -1397,12 +1459,49 @@ pub fn promoted_numeric_type(left: &Type, right: &Type) -> Option<Type> {
 }
 
 pub fn fits_integer_type(value: i64, target: &Type) -> bool {
+    let target = unwrap_binding_const(unwrap_const_view(target));
     match target {
         Type::Byte => i8::try_from(value).is_ok(),
         Type::Short => i16::try_from(value).is_ok(),
         Type::Int => i32::try_from(value).is_ok(),
         Type::Long => true,
         _ => false,
+    }
+}
+
+pub fn is_binding_const(t: &Type) -> bool {
+    matches!(t, Type::BindingConst { .. })
+}
+
+pub fn is_const_view(t: &Type) -> bool {
+    matches!(t, Type::Const { .. })
+}
+
+pub fn unwrap_binding_const(t: &Type) -> &Type {
+    match t {
+        Type::BindingConst { inner } => inner,
+        other => other,
+    }
+}
+
+pub fn unwrap_const_view(t: &Type) -> &Type {
+    match t {
+        Type::Const { inner } => inner,
+        other => other,
+    }
+}
+
+pub fn strip_binding_const(t: &Type) -> Type {
+    match t {
+        Type::BindingConst { inner } => inner.as_ref().clone(),
+        other => other.clone(),
+    }
+}
+
+pub fn strip_const_view(t: &Type) -> Type {
+    match t {
+        Type::Const { inner } => inner.as_ref().clone(),
+        other => other.clone(),
     }
 }
 
@@ -2895,6 +2994,76 @@ mod tests {
                     },
                     value: None,
                     metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_const_variable_declaration() {
+        let source_code = r#"
+            const answer: int = 42;
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    name: "answer".to_string(),
+                    var_type: Type::BindingConst {
+                        inner: Box::new(Type::Int),
+                    },
+                    value: Some(Box::new(Node::Literal(Literal::Integer(42)))),
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_const_parameter_and_const_view_types() {
+        let source_code = r#"
+            function copy_into(const dst: []int, src: []const int, ptr: *const Point): void {}
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::FunctionDeclaration {
+                    name: "copy_into".to_string(),
+                    parameters: vec![
+                        (
+                            "dst".to_string(),
+                            Type::BindingConst {
+                                inner: Box::new(Type::Slice {
+                                    elem_type: Box::new(Type::Int),
+                                }),
+                            },
+                        ),
+                        (
+                            "src".to_string(),
+                            Type::Slice {
+                                elem_type: Box::new(Type::Const {
+                                    inner: Box::new(Type::Int),
+                                }),
+                            },
+                        ),
+                        (
+                            "ptr".to_string(),
+                            Type::Pointer {
+                                target_type: Box::new(Type::Const {
+                                    inner: Box::new(Type::Custom("Point".to_string())),
+                                }),
+                            },
+                        ),
+                    ],
+                    return_type: Type::Void,
+                    body: vec![],
+                    lambda: false,
                 },
                 Node::EOI,
             ],

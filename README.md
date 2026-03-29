@@ -10,6 +10,7 @@
 - **User-Defined Structs**: Define custom types with fields and methods
 - **Control Flow**: `if`, `for` loops, and blocks for scoped variable overrides
 - **Arrays**: Fixed-size arrays with zero initialization, explicit fill initialization, and slice types
+- **Const**: Const bindings and read-only pointer/slice views via `const x: T`, `*const T`, and `[]const T`
 - **Pointers and Allocation**: `*T`, `T::create(alloc)`, `[]T::alloc(alloc, len)`, `alloc.destroy(...)`, `alloc.free(...)`, and `Arena`
 - **Modules and Imports**: `module foo.bar;`, `import foo.bar;`, and `export` for multi-file Skunk programs with module APIs
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
@@ -128,6 +129,28 @@ function main(): void {
     print(c[2]); // 3
 }
 ```
+
+### Const Bindings and Read-Only Views
+```skunk
+function copy_into(const dst: []int, src: []const int): void {
+    for (i: int = 0; i < src.len; i = i + 1) {
+        dst[i] = src[i];
+    }
+}
+
+function main(): void {
+    const answer: int = 42;
+    print(answer);
+}
+```
+
+Const V1 notes:
+- `const name: T` makes the binding non-reassignable
+- `*const T` and `[]const T` make the pointee or slice elements read-only
+- `[]T` is assignable to `[]const T`, but not the other way around
+- `const dst: []int` still allows `dst[i] = ...` because the binding is const, not the slice contents
+- method calls through const-qualified receivers are not supported yet
+- const struct fields are not supported yet
 
 ### Generic Enums and Match
 ```skunk

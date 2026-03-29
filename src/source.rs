@@ -222,7 +222,10 @@ impl ModuleNormalizer {
                     })
                     .transpose()?;
                 let renamed_name = if top_level && !exported {
-                    self.value_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.value_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -272,7 +275,10 @@ impl ModuleNormalizer {
                     }
                 } else {
                     let renamed_name = if top_level && !exported {
-                        self.value_renames.get(&name).cloned().unwrap_or(name.clone())
+                        self.value_renames
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or(name.clone())
                     } else {
                         name.clone()
                     };
@@ -311,7 +317,10 @@ impl ModuleNormalizer {
                 lambda,
             } => {
                 let renamed_name = if top_level && !exported {
-                    self.value_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.value_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -349,7 +358,10 @@ impl ModuleNormalizer {
             }
             Node::TraitDeclaration { name, methods } => {
                 let renamed_name = if top_level && !exported {
-                    self.type_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -395,7 +407,10 @@ impl ModuleNormalizer {
                 functions,
             } => {
                 let renamed_name = if top_level && !exported {
-                    self.type_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -426,7 +441,10 @@ impl ModuleNormalizer {
                 functions,
             } => {
                 let renamed_name = if top_level && !exported {
-                    self.type_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -460,7 +478,10 @@ impl ModuleNormalizer {
             }
             Node::EnumDeclaration { name, variants } => {
                 let renamed_name = if top_level && !exported {
-                    self.type_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -490,7 +511,10 @@ impl ModuleNormalizer {
                 variants,
             } => {
                 let renamed_name = if top_level && !exported {
-                    self.type_renames.get(&name).cloned().unwrap_or(name.clone())
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
                 } else {
                     name.clone()
                 };
@@ -532,7 +556,9 @@ impl ModuleNormalizer {
                 body: self.rename_statement_list(body, value_scopes, type_scopes, false)?,
                 else_if_blocks: else_if_blocks
                     .into_iter()
-                    .map(|block| self.rename_statement(block, value_scopes, type_scopes, false, false))
+                    .map(|block| {
+                        self.rename_statement(block, value_scopes, type_scopes, false, false)
+                    })
                     .collect::<Result<Vec<_>, String>>()?,
                 else_block: else_block
                     .map(|body| self.rename_statement_list(body, value_scopes, type_scopes, false))
@@ -543,7 +569,8 @@ impl ModuleNormalizer {
                 let cases = cases
                     .into_iter()
                     .map(|case| {
-                        let pattern = self.rename_match_pattern(case.pattern, value_scopes, type_scopes)?;
+                        let pattern =
+                            self.rename_match_pattern(case.pattern, value_scopes, type_scopes)?;
                         value_scopes.push(HashSet::new());
                         if let ast::MatchPattern::EnumVariant {
                             binding: Some(binding),
@@ -555,7 +582,12 @@ impl ModuleNormalizer {
                                 .expect("case scope exists")
                                 .insert(binding.clone());
                         }
-                        let body = self.rename_statement_list(case.body, value_scopes, type_scopes, false)?;
+                        let body = self.rename_statement_list(
+                            case.body,
+                            value_scopes,
+                            type_scopes,
+                            false,
+                        )?;
                         value_scopes.pop();
                         Ok(ast::MatchCase { pattern, body })
                     })
@@ -598,14 +630,23 @@ impl ModuleNormalizer {
             }
             Node::Return(value) => Node::Return(
                 value
-                    .map(|value| self.rename_expr(*value, value_scopes, type_scopes).map(Box::new))
+                    .map(|value| {
+                        self.rename_expr(*value, value_scopes, type_scopes)
+                            .map(Box::new)
+                    })
                     .transpose()?,
             ),
-            Node::Print(value) => {
-                Node::Print(Box::new(self.rename_expr(*value, value_scopes, type_scopes)?))
-            }
+            Node::Print(value) => Node::Print(Box::new(self.rename_expr(
+                *value,
+                value_scopes,
+                type_scopes,
+            )?)),
             Node::Input | Node::Literal(_) | Node::EMPTY => node,
-            Node::Assignment { var, value, metadata } => Node::Assignment {
+            Node::Assignment {
+                var,
+                value,
+                metadata,
+            } => Node::Assignment {
                 var: Box::new(self.rename_expr(*var, value_scopes, type_scopes)?),
                 value: Box::new(self.rename_expr(*value, value_scopes, type_scopes)?),
                 metadata,
@@ -623,7 +664,13 @@ impl ModuleNormalizer {
     ) -> Result<Vec<Node>, String> {
         let mut output = Vec::new();
         for statement in statements {
-            output.push(self.rename_statement(statement, value_scopes, type_scopes, top_level, false)?);
+            output.push(self.rename_statement(
+                statement,
+                value_scopes,
+                type_scopes,
+                top_level,
+                false,
+            )?);
         }
         Ok(output)
     }
@@ -637,7 +684,11 @@ impl ModuleNormalizer {
         Ok(match node {
             Node::Identifier(name) => Node::Identifier(self.rename_value_name(&name, value_scopes)),
             Node::Literal(_) | Node::Input | Node::EOI | Node::EMPTY => node,
-            Node::BinaryOp { left, operator, right } => Node::BinaryOp {
+            Node::BinaryOp {
+                left,
+                operator,
+                right,
+            } => Node::BinaryOp {
                 left: Box::new(self.rename_expr(*left, value_scopes, type_scopes)?),
                 operator,
                 right: Box::new(self.rename_expr(*right, value_scopes, type_scopes)?),
@@ -655,7 +706,8 @@ impl ModuleNormalizer {
                 arguments: arguments
                     .into_iter()
                     .map(|group| {
-                        group.into_iter()
+                        group
+                            .into_iter()
                             .map(|arg| self.rename_expr(arg, value_scopes, type_scopes))
                             .collect::<Result<Vec<_>, String>>()
                     })
@@ -670,10 +722,16 @@ impl ModuleNormalizer {
             },
             Node::SliceAccess { start, end } => Node::SliceAccess {
                 start: start
-                    .map(|node| self.rename_expr(*node, value_scopes, type_scopes).map(Box::new))
+                    .map(|node| {
+                        self.rename_expr(*node, value_scopes, type_scopes)
+                            .map(Box::new)
+                    })
                     .transpose()?,
                 end: end
-                    .map(|node| self.rename_expr(*node, value_scopes, type_scopes).map(Box::new))
+                    .map(|node| {
+                        self.rename_expr(*node, value_scopes, type_scopes)
+                            .map(Box::new)
+                    })
                     .transpose()?,
             },
             Node::MemberAccess { member, metadata } => Node::MemberAccess {
@@ -687,7 +745,8 @@ impl ModuleNormalizer {
                         arguments: arguments
                             .into_iter()
                             .map(|group| {
-                                group.into_iter()
+                                group
+                                    .into_iter()
                                     .map(|arg| self.rename_expr(arg, value_scopes, type_scopes))
                                     .collect::<Result<Vec<_>, String>>()
                             })
@@ -703,11 +762,15 @@ impl ModuleNormalizer {
                 let mut output = Vec::new();
                 for (index, node) in nodes.into_iter().enumerate() {
                     let renamed = match node {
-                        Node::MemberAccess { .. } => self.rename_expr(node, value_scopes, type_scopes)?,
+                        Node::MemberAccess { .. } => {
+                            self.rename_expr(node, value_scopes, type_scopes)?
+                        }
                         Node::ArrayAccess { .. } | Node::SliceAccess { .. } => {
                             self.rename_expr(node, value_scopes, type_scopes)?
                         }
-                        other if index == 0 => self.rename_expr(other, value_scopes, type_scopes)?,
+                        other if index == 0 => {
+                            self.rename_expr(other, value_scopes, type_scopes)?
+                        }
                         other => other,
                     };
                     output.push(renamed);
@@ -832,6 +895,12 @@ impl ModuleNormalizer {
             ast::Type::Slice { elem_type } => ast::Type::Slice {
                 elem_type: Box::new(self.rename_type(*elem_type, value_scopes, type_scopes)?),
             },
+            ast::Type::Const { inner } => ast::Type::Const {
+                inner: Box::new(self.rename_type(*inner, value_scopes, type_scopes)?),
+            },
+            ast::Type::BindingConst { inner } => ast::Type::BindingConst {
+                inner: Box::new(self.rename_type(*inner, value_scopes, type_scopes)?),
+            },
             ast::Type::GenericInstance {
                 base,
                 type_arguments,
@@ -889,10 +958,16 @@ enum TopLevelDeclKind {
 fn top_level_decl_name(node: &Node) -> Option<(TopLevelDeclKind, String)> {
     match node {
         Node::VariableDeclaration { name, .. }
-        | Node::FunctionDeclaration { name, lambda: false, .. }
-        | Node::GenericFunctionDeclaration { name, lambda: false, .. } => {
-            Some((TopLevelDeclKind::Value, name.clone()))
+        | Node::FunctionDeclaration {
+            name,
+            lambda: false,
+            ..
         }
+        | Node::GenericFunctionDeclaration {
+            name,
+            lambda: false,
+            ..
+        } => Some((TopLevelDeclKind::Value, name.clone())),
         Node::StructDeclaration { name, .. }
         | Node::GenericStructDeclaration { name, .. }
         | Node::EnumDeclaration { name, .. }

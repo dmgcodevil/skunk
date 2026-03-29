@@ -1,7 +1,9 @@
 use crate::ast::Type::Void;
 use crate::ast::{
-    fits_integer_type, is_integral_type, is_numeric_assignable, is_numeric_type, is_scalar_type,
-    promoted_numeric_type, type_to_string, Literal, Metadata, Node, Operator, Type, UnaryOperator,
+    fits_integer_type, is_binding_const, is_const_view, is_integral_type, is_numeric_assignable,
+    is_numeric_type, is_scalar_type, promoted_numeric_type, strip_binding_const, strip_const_view,
+    type_to_string, unwrap_binding_const, unwrap_const_view, Literal, Metadata, Node, Operator,
+    Type, UnaryOperator,
 };
 use std::collections::HashMap;
 use std::fmt::format;
@@ -226,7 +228,47 @@ impl GlobalScope {
 }
 
 fn is_assignable(expected: &Type, actual: &Type) -> bool {
-    expected == actual || is_numeric_assignable(expected, actual)
+    let expected = unwrap_binding_const(expected);
+    let actual = unwrap_binding_const(actual);
+    if expected == actual || is_numeric_assignable(expected, actual) {
+        return true;
+    }
+
+    match (expected, actual) {
+        (
+            Type::Const {
+                inner: expected_inner,
+            },
+            _,
+        ) => is_assignable(expected_inner, actual),
+        (
+            Type::Pointer {
+                target_type: expected_target,
+            },
+            Type::Pointer {
+                target_type: actual_target,
+            },
+        ) => is_assignable(expected_target, actual_target),
+        (
+            Type::Slice {
+                elem_type: expected_elem,
+            },
+            Type::Slice {
+                elem_type: actual_elem,
+            },
+        ) => is_assignable(expected_elem, actual_elem),
+        (
+            Type::Array {
+                elem_type: expected_elem,
+                dimensions: expected_dimensions,
+            },
+            Type::Array {
+                elem_type: actual_elem,
+                dimensions: actual_dimensions,
+            },
+        ) => expected_dimensions == actual_dimensions && is_assignable(expected_elem, actual_elem),
+        _ => false,
+    }
 }
 
 fn is_zero_initializable_type(sk_type: &Type) -> bool {
@@ -246,7 +288,7 @@ fn is_zero_initializable_type(sk_type: &Type) -> bool {
 }
 
 fn array_item_type(sk_type: &Type) -> Option<Type> {
-    match sk_type {
+    match unwrap_binding_const(unwrap_const_view(sk_type)) {
         Type::Array {
             elem_type,
             dimensions,
@@ -257,16 +299,16 @@ fn array_item_type(sk_type: &Type) -> Option<Type> {
                     dimensions: dimensions[1..].to_vec(),
                 })
             } else {
-                Some(elem_type.deref().clone())
+                Some(strip_const_view(elem_type.deref()))
             }
         }
-        Type::Slice { elem_type } => Some(elem_type.deref().clone()),
+        Type::Slice { elem_type } => Some(strip_const_view(elem_type.deref())),
         _ => None,
     }
 }
 
 fn expected_fixed_array_length(sk_type: &Type) -> Option<i64> {
-    match sk_type {
+    match unwrap_binding_const(unwrap_const_view(sk_type)) {
         Type::Array { dimensions, .. } => match dimensions.first() {
             Some(Node::Literal(Literal::Integer(value))) => Some(*value),
             Some(Node::Literal(Literal::Long(value))) => Some(*value),
@@ -280,7 +322,7 @@ fn enum_symbol_for_type<'a>(
     global_scope: &'a GlobalScope,
     sk_type: &Type,
 ) -> Option<&'a EnumSymbol> {
-    match sk_type {
+    match unwrap_binding_const(unwrap_const_view(sk_type)) {
         Type::Custom(name) => global_scope.enums.get(name),
         _ => None,
     }
@@ -340,6 +382,7 @@ fn resolve_literal_type(
     literal: &Literal,
     expected_type_opt: Option<&Type>,
 ) -> Result<Type, String> {
+    let expected_type_opt = expected_type_opt.map(unwrap_binding_const);
     match literal {
         Literal::Integer(value) => {
             if let Some(expected_type) = expected_type_opt {
@@ -380,6 +423,8 @@ fn resolve_literal_type(
 }
 
 fn resolve_cmp(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     if promoted_numeric_type(left, right).is_some() || (*left == Type::Char && *right == Type::Char)
     {
         Ok(Type::Boolean)
@@ -392,6 +437,8 @@ fn resolve_cmp(left: &Type, right: &Type) -> Result<Type, String> {
 }
 
 fn resolve_eq(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     if promoted_numeric_type(left, right).is_some()
         || (*left == Type::String && *right == Type::String)
         || (*left == Type::Boolean && *right == Type::Boolean)
@@ -411,6 +458,8 @@ fn resolve_not_eq(left: &Type, right: &Type) -> Result<Type, String> {
 }
 
 fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     if let Some(promoted) = promoted_numeric_type(left, right) {
         Ok(promoted)
     } else if (*left == Type::String && is_scalar_type(right))
@@ -426,21 +475,29 @@ fn resolve_add(left: &Type, right: &Type) -> Result<Type, String> {
 }
 
 fn resolve_subtract(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     promoted_numeric_type(left, right)
         .ok_or_else(|| format!("unexpected types for -: {:?} and {:?}", left, right))
 }
 
 fn resolve_multiply(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     promoted_numeric_type(left, right)
         .ok_or_else(|| format!("unexpected types for *: {:?} and {:?}", left, right))
 }
 
 fn resolve_divide(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     promoted_numeric_type(left, right)
         .ok_or_else(|| format!("unexpected types for /: {:?} and {:?}", left, right))
 }
 
 fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     if is_integral_type(left) && is_integral_type(right) {
         Ok(promoted_numeric_type(left, right).unwrap())
     } else {
@@ -452,6 +509,8 @@ fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
 }
 
 fn resolve_logical(left: &Type, right: &Type) -> Result<Type, String> {
+    let left = unwrap_binding_const(unwrap_const_view(left));
+    let right = unwrap_binding_const(unwrap_const_view(right));
     if *left == Type::Boolean && *right == Type::Boolean {
         Ok(Type::Boolean)
     } else {
@@ -476,6 +535,23 @@ fn resolve_access(
         access_nodes.get(i).unwrap(),
         Node::MemberAccess { .. } | Node::ArrayAccess { .. } | Node::SliceAccess { .. }
     ) {
+        if let Type::Const { inner } = curr.clone() {
+            if let Node::MemberAccess { member, metadata } = access_nodes.get(i).unwrap() {
+                if matches!(member.deref(), Node::FunctionCall { .. }) {
+                    return Err(format!(
+                        "error {}:{}: cannot call methods through a const-qualified receiver yet",
+                        metadata.span.line, metadata.span.start
+                    ));
+                }
+            }
+            return resolve_access(
+                global_scope,
+                symbol_tables,
+                inner.deref().clone(),
+                i,
+                access_nodes,
+            );
+        }
         if let Type::Pointer { target_type } = curr {
             return resolve_access(
                 global_scope,
@@ -497,7 +573,7 @@ fn resolve_access(
                 }
                 let remaining_dimensions = dimensions[coordinates.len()..].to_vec();
                 let next_type = if remaining_dimensions.is_empty() {
-                    elem_type.deref().clone()
+                    strip_const_view(elem_type.deref())
                 } else {
                     Type::Array {
                         elem_type,
@@ -513,7 +589,7 @@ fn resolve_access(
                 resolve_access(
                     global_scope,
                     symbol_tables,
-                    elem_type.deref().clone(),
+                    strip_const_view(elem_type.deref()),
                     i + 1,
                     access_nodes,
                 )
@@ -706,6 +782,155 @@ fn resolve_access(
     }
 }
 
+fn lookup_value_symbol<'a>(
+    global_scope: &'a GlobalScope,
+    symbol_tables: &'a SymbolTables,
+    name: &str,
+) -> Option<&'a Symbol> {
+    symbol_tables
+        .get_symbol(name)
+        .or_else(|| global_scope.variables.get(name))
+}
+
+fn binding_allows_indirect_mutation(sk_type: &Type) -> bool {
+    matches!(
+        unwrap_binding_const(sk_type),
+        Type::Pointer { .. } | Type::Slice { .. }
+    )
+}
+
+fn assert_assignment_target_mutable(
+    global_scope: &GlobalScope,
+    symbol_tables: &SymbolTables,
+    target: &Node,
+) -> Result<(), String> {
+    let Node::Access { nodes } = target else {
+        return Err("assignment target must be an access expression".to_string());
+    };
+    let Some(Node::Identifier(name)) = nodes.first() else {
+        return Err("assignment target must start with an identifier".to_string());
+    };
+    let symbol = lookup_value_symbol(global_scope, symbol_tables, name)
+        .ok_or_else(|| format!("unknown variable '{}'", name))?;
+    let mut current = strip_binding_const(&symbol.sk_type);
+    let mut writable =
+        !is_binding_const(&symbol.sk_type) || binding_allows_indirect_mutation(&symbol.sk_type);
+
+    if nodes.len() == 1 {
+        if !writable {
+            return Err(format!("cannot assign to const binding `{}`", name));
+        }
+        return Ok(());
+    }
+
+    for step in nodes.iter().skip(1) {
+        if matches!(
+            step,
+            Node::MemberAccess { .. } | Node::ArrayAccess { .. } | Node::SliceAccess { .. }
+        ) {
+            loop {
+                match current {
+                    Type::Const { inner } => {
+                        writable = false;
+                        current = inner.deref().clone();
+                    }
+                    Type::Pointer { target_type } => {
+                        current = target_type.deref().clone();
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        match step {
+            Node::ArrayAccess { coordinates } => match current {
+                Type::Array {
+                    elem_type,
+                    dimensions,
+                } => {
+                    if coordinates.len() > dimensions.len() {
+                        return Err("too many indices for array access".to_string());
+                    }
+                    let remaining_dimensions = dimensions[coordinates.len()..].to_vec();
+                    current = if remaining_dimensions.is_empty() {
+                        elem_type.deref().clone()
+                    } else {
+                        Type::Array {
+                            elem_type,
+                            dimensions: remaining_dimensions,
+                        }
+                    };
+                }
+                Type::Slice { elem_type } => {
+                    if coordinates.len() != 1 {
+                        return Err("slice access expects exactly one index".to_string());
+                    }
+                    current = elem_type.deref().clone();
+                }
+                _ => return Err("array access to not array variable".to_string()),
+            },
+            Node::SliceAccess { .. } => {
+                return Err("cannot assign to a slice expression".to_string());
+            }
+            Node::MemberAccess { member, metadata } => match member.deref() {
+                Node::Identifier(field_name) => match &current {
+                    Type::Array { .. } | Type::Slice { .. } if field_name == "len" => {
+                        return Err(format!(
+                            "error {}:{}: cannot assign to array or slice length",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    Type::Custom(struct_name) => {
+                        let struct_symbol = global_scope
+                            .structs
+                            .get(struct_name)
+                            .ok_or_else(|| "error: struct doesn't exist".to_string())?;
+                        current = struct_symbol
+                            .fields
+                            .get(field_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "error {}:{}: no field `{}` on type `{}`",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    field_name,
+                                    struct_name
+                                )
+                            })?
+                            .sk_type
+                            .clone();
+                    }
+                    _ => {
+                        return Err(format!(
+                            "cannot assign through member access on `{}`",
+                            type_to_string(&current)
+                        ))
+                    }
+                },
+                Node::FunctionCall { .. } => {
+                    return Err("cannot assign to a method call".to_string());
+                }
+                _ => {
+                    return Err("expected identifier member access in assignment target".to_string())
+                }
+            },
+            Node::Identifier(_) => {
+                return Err("unexpected identifier in assignment target".to_string());
+            }
+            other => return Err(format!("unsupported assignment target step `{:?}`", other)),
+        }
+    }
+
+    if is_const_view(&current) || !writable {
+        return Err(format!(
+            "cannot assign through const-qualified target `{}`",
+            type_to_string(&strip_const_view(&current))
+        ));
+    }
+
+    Ok(())
+}
+
 fn resolve_function_call(
     global_scope: &GlobalScope,
     symbol_tables: &mut SymbolTables,
@@ -728,7 +953,9 @@ fn resolve_function_call(
                     ..
                 } => {
                     let mut parameters = &parameters[0..];
-                    if parameters.len() > 0 && *parameters.first().unwrap() == Type::SkSelf {
+                    if parameters.len() > 0
+                        && unwrap_binding_const(parameters.first().unwrap()) == &Type::SkSelf
+                    {
                         parameters = &parameters[1..];
                     }
                     if args.len() != parameters.len() {
@@ -745,7 +972,7 @@ fn resolve_function_call(
                             global_scope,
                             symbol_tables,
                             &args[i],
-                            Some(&parameters[i]),
+                            Some(unwrap_binding_const(&parameters[i])),
                         )?);
                     }
                     for i in 0..argument_types.len() {
@@ -846,9 +1073,7 @@ fn resolve_type(
         Node::GenericStructDeclaration { .. }
         | Node::GenericEnumDeclaration { .. }
         | Node::TraitDeclaration { .. }
-        | Node::ImplDeclaration { .. } => {
-            Ok(ResolveResult::new(Type::Void))
-        }
+        | Node::ImplDeclaration { .. } => Ok(ResolveResult::new(Type::Void)),
         Node::Export { declaration } => {
             resolve_type(global_scope, symbol_tables, declaration, expected_type_opt)
         }
@@ -910,9 +1135,13 @@ fn resolve_type(
                 sk_type: var_type.clone(),
             });
             if let Some(body) = value {
-                let value_type =
-                    resolve_type(global_scope, symbol_tables, &body.deref(), Some(var_type))?
-                        .sk_type;
+                let value_type = resolve_type(
+                    global_scope,
+                    symbol_tables,
+                    &body.deref(),
+                    Some(unwrap_binding_const(var_type)),
+                )?
+                .sk_type;
                 if !is_assignable(var_type, &value_type) {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
@@ -926,7 +1155,10 @@ fn resolve_type(
                     Ok(ResolveResult::new(var_type.clone()))
                 }
             } else {
-                match var_type {
+                if is_binding_const(var_type) {
+                    Err(format!("const variable `{}` requires an initializer", name))
+                } else {
+                    match unwrap_binding_const(var_type) {
                     Type::Array { elem_type, .. } if is_zero_initializable_type(elem_type) => {
                         Ok(ResolveResult::new(var_type.clone()))
                     }
@@ -938,6 +1170,7 @@ fn resolve_type(
                         "variable `{}` requires an initializer; only fixed arrays may omit one",
                         name
                     )),
+                    }
                 }
             }
         }
@@ -1001,6 +1234,7 @@ fn resolve_type(
             }
         }
         Node::Assignment { var, value, .. } => {
+            assert_assignment_target_mutable(global_scope, symbol_tables, var.deref())?;
             let var_type =
                 resolve_type(global_scope, symbol_tables, var.deref(), expected_type_opt)?.sk_type;
             let value_type =
@@ -1070,11 +1304,11 @@ fn resolve_type(
         Node::Identifier(name) => {
             let res = symbol_tables
                 .get_symbol(name)
-                .map(|v| ResolveResult::new(v.sk_type.clone()))
+                .map(|v| ResolveResult::new(strip_binding_const(&v.sk_type)))
                 .or(global_scope
                     .variables
                     .get(name)
-                    .map(|v| ResolveResult::new(v.sk_type.clone())))
+                    .map(|v| ResolveResult::new(strip_binding_const(&v.sk_type))))
                 .ok_or(format!("unknown variable '{}'", name));
             // println!("resolve identifier {}, res={:?}", name, res);
             res
@@ -1096,7 +1330,11 @@ fn resolve_type(
             arguments,
             metadata,
         } => {
-            match _type {
+            let mut static_type = unwrap_binding_const(_type);
+            while let Type::Const { inner } = static_type {
+                static_type = inner.deref();
+            }
+            match static_type {
                 Type::Void => {}
                 Type::Byte => {}
                 Type::Short => {}
@@ -1293,6 +1531,7 @@ fn resolve_type(
                 }
                 Type::Function { .. } => {}
                 Type::SkSelf => {}
+                Type::BindingConst { .. } | Type::Const { .. } => unreachable!(),
             }
             Ok(ResolveResult::new(_type.clone()))
         }
