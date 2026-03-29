@@ -1,0 +1,9 @@
+module app.box;
+
+struct Box[T] {
+    value: T;
+}
+
+function wrap[T](value: T): Box[T] {
+    return Box[T] { value: value };
+}

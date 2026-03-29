@@ -1,0 +1,11 @@
+import app.geometry;
+import app.box;
+
+function main(): void {
+    point: Point = make_point(4, 8);
+    boxed: Box[int] = wrap(point.magnitude_hint());
+
+    print(point.x);
+    print(point.y);
+    print(boxed.value);
+}

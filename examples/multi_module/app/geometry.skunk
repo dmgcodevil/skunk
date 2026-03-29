@@ -1,0 +1,14 @@
+module app.geometry;
+
+struct Point {
+    x: int;
+    y: int;
+
+    function magnitude_hint(self): int {
+        return self.x + self.y;
+    }
+}
+
+function make_point(x: int, y: int): Point {
+    return Point { x: x, y: y };
+}
