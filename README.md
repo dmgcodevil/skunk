@@ -8,7 +8,7 @@ Do not use Skunk to build critical, safety-sensitive, security-sensitive, or hig
 
 - Native compilation through LLVM/Clang is the primary execution path.
 - The repository still contains legacy interpreter code while the compiler/runtime continues to absorb older coverage.
-- The language reference lives in [https://dmgcodevil.github.io/skunk/](skunk).
+- The language reference lives in [Skunk](https://dmgcodevil.github.io/skunk/)
 - Syntax and implemented behavior are defined by [`src/grammar.pest`](src/grammar.pest) and the test suite.
 
 ## Build
