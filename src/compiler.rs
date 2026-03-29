@@ -3171,7 +3171,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                         let mut parameter_types = Vec::new();
                         let mut compile_params = Vec::new();
                         for (param_name, param_type) in parameters {
-                            if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                            if ast::is_self_type(param_type) {
                                 continue;
                             }
                             parameter_types.push(llvm_type(param_type, &structs, &enums)?);
@@ -3685,7 +3685,7 @@ mod tests {
                 x: int;
                 y: int;
 
-                function set_x(self, x: int): void {
+                function set_x(mut self, x: int): void {
                     self.x = x;
                 }
 
@@ -3704,6 +3704,89 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "12\n");
+    }
+
+    #[test]
+    fn runs_compiled_mut_self_method_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Counter {
+                value: int;
+
+                function bump(mut self): void {
+                    self.value = self.value + 1;
+                }
+
+                function get(self): int {
+                    return self.value;
+                }
+            }
+
+            function main(): void {
+                counter: Counter = Counter { value: 9 };
+                counter.bump();
+                print(counter.get());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "10\n");
+    }
+
+    #[test]
+    fn rejects_calling_mut_self_method_on_const_binding() {
+        let result = compile_and_run(
+            r#"
+            struct Counter {
+                value: int;
+
+                function bump(mut self): void {
+                    self.value = self.value + 1;
+                }
+            }
+
+            function main(): void {
+                const counter: Counter = Counter { value: 0 };
+                counter.bump();
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot call mutating method through const or immutable receiver"));
+    }
+
+    #[test]
+    fn runs_compiled_const_pointer_readonly_method_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+
+                function get(self): int {
+                    return self.x;
+                }
+            }
+
+            function print_point(point: *const Point): void {
+                print(point.get());
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                point: *Point = Point::create(heap);
+                point.x = 7;
+                print_point(point);
+                heap.destroy(point);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n");
     }
 
     #[test]
@@ -4260,22 +4343,22 @@ mod tests {
         let stdout = compile_and_run(
             r#"
             trait Writer {
-                function write(self, value: int): int;
+                function write(mut self, value: int): int;
             }
 
             trait Resettable {
-                function reset(self): void;
+                function reset(mut self): void;
             }
 
             struct Counter {
                 value: int;
 
-                function write(self, value: int): int {
+                function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
                 }
 
-                function reset(self): void {
+                function reset(mut self): void {
                     self.value = 0;
                 }
             }
@@ -4302,17 +4385,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_call_when_trait_bound_is_not_implemented() {
+    fn rejects_trait_impl_with_receiver_mutability_mismatch() {
         let result = compile_and_run(
             r#"
             trait Writer {
-                function write(self, value: int): int;
+                function write(mut self, value: int): int;
             }
 
             struct Counter {
                 value: int;
 
                 function write(self, value: int): int {
+                    return self.value + value;
+                }
+            }
+
+            impl Writer for Counter {}
+
+            function main(): void {}
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("trait method `Writer.write` expects"));
+    }
+
+    #[test]
+    fn rejects_call_when_trait_bound_is_not_implemented() {
+        let result = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
                 }

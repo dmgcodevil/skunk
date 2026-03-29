@@ -430,7 +430,7 @@ impl Monomorphizer {
                 "impl targets do not support generic instances yet: `{}`",
                 base
             )),
-            Type::SkSelf => Err("`self` is not a valid impl target".to_string()),
+            Type::SkSelf | Type::MutSelf => Err("`self` is not a valid impl target".to_string()),
         }
     }
 
@@ -440,17 +440,19 @@ impl Monomorphizer {
         target_type: &Type,
     ) -> Result<(), String> {
         for method in &trait_template.methods {
-            let first_parameter = method
-                .parameters
-                .first()
-                .map(|(_, sk_type)| ast::unwrap_binding_const(sk_type));
-            if first_parameter != Some(&Type::SkSelf) {
+            let Some((_, expected_receiver_type)) = method.parameters.first() else {
+                return Err(format!(
+                    "trait `{}` method `{}` must declare `self` as its first parameter",
+                    trait_template.name, method.name
+                ));
+            };
+            if !ast::is_self_type(expected_receiver_type) {
                 return Err(format!(
                     "trait `{}` method `{}` must declare `self` as its first parameter",
                     trait_template.name, method.name
                 ));
             }
-            let (actual_parameters, actual_return_type) = self
+            let (actual_receiver_type, actual_parameters, actual_return_type) = self
                 .lookup_method_signature(target_type, &method.name)
                 .map_err(|_| {
                     format!(
@@ -466,7 +468,10 @@ impl Monomorphizer {
                 .skip(1)
                 .map(|(_, sk_type)| sk_type.clone())
                 .collect::<Vec<_>>();
-            if actual_parameters != expected_parameters || actual_return_type != method.return_type
+            if ast::is_mut_self_type(expected_receiver_type)
+                != ast::is_mut_self_type(&actual_receiver_type)
+                || actual_parameters != expected_parameters
+                || actual_return_type != method.return_type
             {
                 return Err(format!(
                     "trait method `{}.{}` expects `({}) -> {}`, but `{}` provides `({}) -> {}`",
@@ -530,16 +535,16 @@ impl Monomorphizer {
         let mut env = Env::new();
         let mut output_parameters = Vec::new();
         for (param_name, param_type) in parameters {
-            let internal_type = if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+            let internal_type = if ast::is_self_type(param_type) {
                 let resolved_self_type = self_type
                     .clone()
                     .ok_or_else(|| "self parameter requires a receiver type".to_string())?;
-                if ast::is_binding_const(param_type) {
+                if ast::is_mut_self_type(param_type) {
+                    resolved_self_type
+                } else {
                     Type::BindingConst {
                         inner: Box::new(resolved_self_type),
                     }
-                } else {
-                    resolved_self_type
                 }
             } else {
                 self.apply_substitutions(param_type, substitutions)
@@ -547,7 +552,7 @@ impl Monomorphizer {
             env.insert(param_name.clone(), internal_type.clone());
             output_parameters.push((
                 param_name.clone(),
-                if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                if ast::is_self_type(param_type) {
                     param_type.clone()
                 } else {
                     self.concretize_type(&internal_type)?
@@ -1008,16 +1013,16 @@ impl Monomorphizer {
         let mut output_parameters = Vec::new();
         let mut function_parameters = Vec::new();
         for (param_name, param_type) in parameters {
-            let internal_type = if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+            let internal_type = if ast::is_self_type(param_type) {
                 let resolved_self_type = self_type
                     .clone()
                     .ok_or_else(|| "self parameter requires a receiver type".to_string())?;
-                if ast::is_binding_const(param_type) {
+                if ast::is_mut_self_type(param_type) {
+                    resolved_self_type
+                } else {
                     Type::BindingConst {
                         inner: Box::new(resolved_self_type),
                     }
-                } else {
-                    resolved_self_type
                 }
             } else {
                 self.apply_substitutions(param_type, substitutions)
@@ -1026,7 +1031,7 @@ impl Monomorphizer {
             function_parameters.push(ast::strip_binding_const(&internal_type));
             output_parameters.push((
                 param_name.clone(),
-                if ast::unwrap_binding_const(param_type) == &Type::SkSelf {
+                if ast::is_self_type(param_type) {
                     param_type.clone()
                 } else {
                     self.concretize_type(&internal_type)?
@@ -1518,7 +1523,7 @@ impl Monomorphizer {
                                     continue;
                                 }
 
-                                let (parameter_types, return_type) = match &current_type {
+                                let (_, parameter_types, return_type) = match &current_type {
                                     _ => {
                                         self.lookup_method_signature(&current_type, method_name)?
                                     }
@@ -2249,7 +2254,7 @@ impl Monomorphizer {
         &mut self,
         receiver_type: &Type,
         method_name: &str,
-    ) -> Result<(Vec<Type>, Type), String> {
+    ) -> Result<(Type, Vec<Type>, Type), String> {
         match receiver_type {
             Type::Custom(name) => {
                 let template = self
@@ -2269,11 +2274,19 @@ impl Monomorphizer {
                         _ => None,
                     })
                     .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, name))?;
+                let receiver = function
+                    .0
+                    .first()
+                    .map(|(_, sk_type)| sk_type.clone())
+                    .ok_or_else(|| {
+                        format!("method `{}` on `{}` is missing self", method_name, name)
+                    })?;
                 Ok((
+                    receiver,
                     function
                         .0
                         .into_iter()
-                        .filter(|(_, sk_type)| ast::unwrap_binding_const(sk_type) != &Type::SkSelf)
+                        .filter(|(_, sk_type)| !ast::is_self_type(sk_type))
                         .map(|(_, sk_type)| sk_type)
                         .collect(),
                     function.1,
@@ -2306,11 +2319,19 @@ impl Monomorphizer {
                         _ => None,
                     })
                     .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, base))?;
+                let receiver = function
+                    .0
+                    .first()
+                    .map(|(_, sk_type)| self.apply_substitutions(sk_type, &substitutions))
+                    .ok_or_else(|| {
+                        format!("method `{}` on `{}` is missing self", method_name, base)
+                    })?;
                 Ok((
+                    receiver,
                     function
                         .0
                         .into_iter()
-                        .filter(|(_, sk_type)| ast::unwrap_binding_const(sk_type) != &Type::SkSelf)
+                        .filter(|(_, sk_type)| !ast::is_self_type(sk_type))
                         .map(|(_, sk_type)| self.apply_substitutions(&sk_type, &substitutions))
                         .collect(),
                     self.apply_substitutions(&function.1, &substitutions),
@@ -2331,6 +2352,7 @@ impl Monomorphizer {
             Type::BindingConst { inner } => Type::BindingConst {
                 inner: Box::new(self.apply_substitutions(inner, substitutions)),
             },
+            Type::MutSelf => Type::MutSelf,
             Type::Custom(name) => substitutions
                 .get(name)
                 .cloned()
@@ -2380,6 +2402,7 @@ impl Monomorphizer {
             Type::BindingConst { inner } => Ok(Type::BindingConst {
                 inner: Box::new(self.concretize_type(inner)?),
             }),
+            Type::MutSelf => Ok(Type::MutSelf),
             Type::Array {
                 elem_type,
                 dimensions,
@@ -2675,6 +2698,7 @@ fn type_mangle(sk_type: &Type) -> String {
                 .join("_"),
             type_mangle(return_type)
         ),
+        Type::MutSelf => "mut_self".to_string(),
         Type::SkSelf => "self".to_string(),
     }
 }

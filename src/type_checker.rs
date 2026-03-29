@@ -1,9 +1,9 @@
 use crate::ast::Type::Void;
 use crate::ast::{
-    fits_integer_type, is_binding_const, is_const_view, is_integral_type, is_numeric_assignable,
-    is_numeric_type, is_scalar_type, promoted_numeric_type, strip_binding_const, strip_const_view,
-    type_to_string, unwrap_binding_const, unwrap_const_view, Literal, Metadata, Node, Operator,
-    Type, UnaryOperator,
+    fits_integer_type, is_binding_const, is_const_view, is_integral_type, is_mut_self_type,
+    is_numeric_assignable, is_numeric_type, is_scalar_type, is_self_type, promoted_numeric_type,
+    strip_binding_const, strip_const_view, type_to_string, unwrap_binding_const, unwrap_const_view,
+    Literal, Metadata, Node, Operator, Type, UnaryOperator,
 };
 use std::collections::HashMap;
 use std::fmt::format;
@@ -536,14 +536,6 @@ fn resolve_access(
         Node::MemberAccess { .. } | Node::ArrayAccess { .. } | Node::SliceAccess { .. }
     ) {
         if let Type::Const { inner } = curr.clone() {
-            if let Node::MemberAccess { member, metadata } = access_nodes.get(i).unwrap() {
-                if matches!(member.deref(), Node::FunctionCall { .. }) {
-                    return Err(format!(
-                        "error {}:{}: cannot call methods through a const-qualified receiver yet",
-                        metadata.span.line, metadata.span.start
-                    ));
-                }
-            }
             return resolve_access(
                 global_scope,
                 symbol_tables,
@@ -750,10 +742,20 @@ fn resolve_access(
                                 struct_name,
                             ));
                         }
+                        let method_symbol = struct_symbol.functions.get(name).unwrap();
+                        if let Type::Function { parameters, .. } = &method_symbol.sk_type {
+                            if parameters.first().is_some_and(is_mut_self_type) {
+                                assert_mutating_receiver_allowed(
+                                    global_scope,
+                                    symbol_tables,
+                                    &access_nodes[..i],
+                                )?;
+                            }
+                        }
                         let return_type = resolve_function_call(
                             global_scope,
                             symbol_tables,
-                            struct_symbol.functions.get(name).unwrap(),
+                            method_symbol,
                             member.deref(),
                         )?;
                         let args_types_res: Result<Vec<ResolveResult>, String> = arguments
@@ -797,6 +799,154 @@ fn binding_allows_indirect_mutation(sk_type: &Type) -> bool {
         unwrap_binding_const(sk_type),
         Type::Pointer { .. } | Type::Slice { .. }
     )
+}
+
+fn assert_mutating_receiver_allowed(
+    global_scope: &GlobalScope,
+    symbol_tables: &SymbolTables,
+    receiver_nodes: &[Node],
+) -> Result<(), String> {
+    let Some(Node::Identifier(name)) = receiver_nodes.first() else {
+        return Err("cannot call a mutating method on a temporary receiver".to_string());
+    };
+    let symbol = lookup_value_symbol(global_scope, symbol_tables, name)
+        .ok_or_else(|| format!("unknown variable '{}'", name))?;
+    let mut current = strip_binding_const(&symbol.sk_type);
+    let mut writable =
+        !is_binding_const(&symbol.sk_type) || binding_allows_indirect_mutation(&symbol.sk_type);
+
+    for step in receiver_nodes.iter().skip(1) {
+        if matches!(
+            step,
+            Node::MemberAccess { .. } | Node::ArrayAccess { .. } | Node::SliceAccess { .. }
+        ) {
+            loop {
+                match current {
+                    Type::Const { inner } => {
+                        writable = false;
+                        current = inner.deref().clone();
+                    }
+                    Type::Pointer { target_type } => {
+                        current = target_type.deref().clone();
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        match step {
+            Node::ArrayAccess { coordinates } => match current {
+                Type::Array {
+                    elem_type,
+                    dimensions,
+                } => {
+                    if coordinates.len() > dimensions.len() {
+                        return Err("too many indices for array access".to_string());
+                    }
+                    let remaining_dimensions = dimensions[coordinates.len()..].to_vec();
+                    current = if remaining_dimensions.is_empty() {
+                        elem_type.deref().clone()
+                    } else {
+                        Type::Array {
+                            elem_type,
+                            dimensions: remaining_dimensions,
+                        }
+                    };
+                }
+                Type::Slice { elem_type } => {
+                    if coordinates.len() != 1 {
+                        return Err("slice access expects exactly one index".to_string());
+                    }
+                    current = elem_type.deref().clone();
+                }
+                _ => return Err("array access to not array variable".to_string()),
+            },
+            Node::SliceAccess { start, end } => {
+                if start.is_some() || end.is_some() {
+                    current = match current {
+                        Type::Array {
+                            elem_type,
+                            dimensions,
+                        } => {
+                            let sliced_elem_type = if dimensions.len() > 1 {
+                                Type::Array {
+                                    elem_type,
+                                    dimensions: dimensions[1..].to_vec(),
+                                }
+                            } else {
+                                elem_type.deref().clone()
+                            };
+                            Type::Slice {
+                                elem_type: Box::new(sliced_elem_type),
+                            }
+                        }
+                        Type::Slice { elem_type } => Type::Slice { elem_type },
+                        _ => {
+                            return Err("slice access requires an array or slice value".to_string())
+                        }
+                    };
+                }
+            }
+            Node::MemberAccess { member, metadata } => match member.deref() {
+                Node::Identifier(field_name) => match &current {
+                    Type::Array { .. } | Type::Slice { .. } if field_name == "len" => {
+                        current = Type::Int;
+                    }
+                    Type::Custom(struct_name) => {
+                        let struct_symbol = global_scope
+                            .structs
+                            .get(struct_name)
+                            .ok_or_else(|| "error: struct doesn't exist".to_string())?;
+                        current = struct_symbol
+                            .fields
+                            .get(field_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "error {}:{}: no field `{}` on type `{}`",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    field_name,
+                                    struct_name
+                                )
+                            })?
+                            .sk_type
+                            .clone();
+                    }
+                    _ => {
+                        return Err(format!(
+                            "cannot assign through member access on `{}`",
+                            type_to_string(&current)
+                        ))
+                    }
+                },
+                Node::FunctionCall { .. } => {
+                    return Err("cannot call a mutating method on a temporary receiver".to_string());
+                }
+                _ => return Err("expected identifier member access in receiver".to_string()),
+            },
+            Node::Identifier(_) => return Err("unexpected identifier in receiver".to_string()),
+            other => return Err(format!("unsupported receiver step `{:?}`", other)),
+        }
+    }
+
+    loop {
+        match current {
+            Type::Const { inner } => {
+                writable = false;
+                current = inner.deref().clone();
+            }
+            Type::Pointer { target_type } => {
+                current = target_type.deref().clone();
+            }
+            _ => break,
+        }
+    }
+
+    if !writable {
+        return Err("cannot call mutating method through const or immutable receiver".to_string());
+    }
+
+    Ok(())
 }
 
 fn assert_assignment_target_mutable(
@@ -953,9 +1103,7 @@ fn resolve_function_call(
                     ..
                 } => {
                     let mut parameters = &parameters[0..];
-                    if parameters.len() > 0
-                        && unwrap_binding_const(parameters.first().unwrap()) == &Type::SkSelf
-                    {
+                    if parameters.first().is_some_and(is_self_type) {
                         parameters = &parameters[1..];
                     }
                     if args.len() != parameters.len() {
@@ -1041,6 +1189,59 @@ fn assert_type(curr: Type, new: Type) -> Result<Type, String> {
     }
 }
 
+fn resolve_function_body(
+    global_scope: &GlobalScope,
+    symbol_tables: &mut SymbolTables,
+    parameters: &[(String, Type)],
+    return_type: &Type,
+    body: &[Node],
+    receiver_type: Option<Type>,
+) -> Result<(), String> {
+    let mut returned = false;
+    let mut symbol_table = SymbolTable::new();
+    for (param_name, param_type) in parameters {
+        let internal_type = if is_self_type(param_type) {
+            let resolved_receiver_type = receiver_type
+                .clone()
+                .ok_or_else(|| "self parameter requires an enclosing receiver type".to_string())?;
+            if is_mut_self_type(param_type) {
+                resolved_receiver_type
+            } else {
+                Type::BindingConst {
+                    inner: Box::new(resolved_receiver_type),
+                }
+            }
+        } else {
+            param_type.clone()
+        };
+        symbol_table.add(Symbol {
+            name: param_name.clone(),
+            sk_type: internal_type,
+        });
+    }
+    symbol_tables.add(symbol_table);
+    let mut actual_return_type = Type::Void;
+    for node in body {
+        let resolved = resolve_type(global_scope, symbol_tables, node, Some(return_type))?;
+        if resolved.returned {
+            returned = true;
+            actual_return_type = assert_type(actual_return_type, resolved.sk_type)?;
+        }
+    }
+    symbol_tables.pop();
+
+    if !returned && *return_type != Void {
+        return Err("missing return statement".to_string());
+    }
+    if actual_return_type != *return_type {
+        return Err(format!(
+            "function return type mismatch. expected={:?}, actual={:?}",
+            return_type, actual_return_type
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_type(
     global_scope: &GlobalScope,
     symbol_tables: &mut SymbolTables,
@@ -1068,7 +1269,29 @@ fn resolve_type(
             }
             other => Ok(ResolveResult::new(other.clone())),
         },
-        Node::StructDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
+        Node::StructDeclaration {
+            name, functions, ..
+        } => {
+            for function in functions {
+                if let Node::FunctionDeclaration {
+                    parameters,
+                    return_type,
+                    body,
+                    ..
+                } = function
+                {
+                    resolve_function_body(
+                        global_scope,
+                        symbol_tables,
+                        parameters,
+                        return_type,
+                        body,
+                        Some(Type::Custom(name.clone())),
+                    )?;
+                }
+            }
+            Ok(ResolveResult::new(Type::Custom(name.clone())))
+        }
         Node::EnumDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
         Node::GenericStructDeclaration { .. }
         | Node::GenericEnumDeclaration { .. }
@@ -1084,44 +1307,18 @@ fn resolve_type(
             body,
             lambda,
         } => {
-            // println!(
-            //     "function declaration {}, return_type={:?}, lambda={:?}, body={:?}",
-            //     name, return_type, lambda, body
-            // );
-            let mut returned = false;
-            let mut symbol_table = SymbolTable::new();
-            for parameter in parameters {
-                symbol_table.add(Symbol {
-                    name: parameter.0.clone(),
-                    sk_type: parameter.1.clone(),
-                })
-            }
-            symbol_tables.add(symbol_table);
-            let mut actual_return_type = Type::Void;
-            for n in body {
-                let t = resolve_type(global_scope, symbol_tables, n, Some(return_type))?;
-                if t.returned {
-                    returned = true;
-                    actual_return_type = assert_type(actual_return_type, t.sk_type)?;
-                }
-            }
-            symbol_tables.pop();
-
-            if !returned && *return_type != Void {
-                return Err("missing return statement".to_string());
-            }
-
-            if actual_return_type != *return_type {
-                Err(format!(
-                    "function '{}' return type mismatch. expected={:?}, actual={:?}",
-                    name, return_type, actual_return_type
-                ))
-            } else {
-                Ok(ResolveResult::new(Type::Function {
-                    parameters: parameters.iter().map(|p| p.1.clone()).collect(),
-                    return_type: Box::new(return_type.clone()),
-                }))
-            }
+            resolve_function_body(
+                global_scope,
+                symbol_tables,
+                parameters,
+                return_type,
+                body,
+                None,
+            )?;
+            Ok(ResolveResult::new(Type::Function {
+                parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+                return_type: Box::new(return_type.clone()),
+            }))
         }
         Node::VariableDeclaration {
             var_type,
@@ -1530,7 +1727,7 @@ fn resolve_type(
                     }));
                 }
                 Type::Function { .. } => {}
-                Type::SkSelf => {}
+                Type::SkSelf | Type::MutSelf => {}
                 Type::BindingConst { .. } | Type::Const { .. } => unreachable!(),
             }
             Ok(ResolveResult::new(_type.clone()))
@@ -1789,7 +1986,7 @@ mod tests {
             x:int;
             y:int;
 
-            function set_x(self, x:int) {
+            function set_x(mut self, x:int) {
                 self.x = x;
             }
 
@@ -1797,7 +1994,7 @@ mod tests {
                return self.x;
             }
 
-            function set_y(self, y:int) {
+            function set_y(mut self, y:int) {
                 self.y = y;
             }
 
@@ -2422,6 +2619,56 @@ mod tests {
                     return v;
                 }
             }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_readonly_self_cannot_mutate_fields() {
+        let source_code = r#"
+        struct Counter {
+            value: int;
+
+            function bump(self): void {
+                self.value = self.value + 1;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_mut_self_can_mutate_fields() {
+        let source_code = r#"
+        struct Counter {
+            value: int;
+
+            function bump(mut self): void {
+                self.value = self.value + 1;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_const_receiver_cannot_call_mutating_method() {
+        let source_code = r#"
+        struct Counter {
+            value: int;
+
+            function bump(mut self): void {
+                self.value = self.value + 1;
+            }
+        }
+
+        function main(): void {
+            const counter: Counter = Counter { value: 0 };
+            counter.bump();
         }
         "#;
         let program = ast::parse(source_code);

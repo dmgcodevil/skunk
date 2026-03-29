@@ -16,6 +16,7 @@
 - **Functions**: First-class functions with support for closures, lambdas, and higher-order programming
 - **Enums and Match**: Generic enums with unit and single-payload variants, plus exhaustive enum-focused `match`
 - **Traits**: Compile-time traits with explicit `impl Trait for Type` declarations and generic bounds like `T: Writer + Flushable`
+- **Receiver Mutability**: Methods and trait requirements distinguish read-only `self` from mutating `mut self`
 - **Type Checking**: Ensures type correctness at parse-time with detailed error messages
 - **Type Inference**: Planned for a cleaner developer experience
 - **String Interpolation and Concatenation**: Upcoming for intuitive string operations
@@ -101,7 +102,7 @@ struct Point {
     x: int;
     y: int;
 
-    function set_x(self, x: int): void {
+    function set_x(mut self, x: int): void {
         self.x = x;
     }
 
@@ -114,6 +115,21 @@ function main(): void {
     p: Point = Point { x: 0, y: 0 };
     p.set_x(10);
     print(p.get_x());
+}
+```
+
+### Receiver Mutability
+```skunk
+struct Counter {
+    value: int;
+
+    function bump(mut self): void {
+        self.value = self.value + 1;
+    }
+
+    function get(self): int {
+        return self.value;
+    }
 }
 ```
 
@@ -149,7 +165,7 @@ Const V1 notes:
 - `*const T` and `[]const T` make the pointee or slice elements read-only
 - `[]T` is assignable to `[]const T`, but not the other way around
 - `const dst: []int` still allows `dst[i] = ...` because the binding is const, not the slice contents
-- method calls through const-qualified receivers are not supported yet
+- const-qualified receivers may call read-only `self` methods but not `mut self` methods
 - const struct fields are not supported yet
 
 ### Generic Enums and Match
@@ -179,22 +195,22 @@ function main(): void {
 ### Traits and Bounds
 ```skunk
 trait Writer {
-    function write(self, value: int): int;
+    function write(mut self, value: int): int;
 }
 
 trait Resettable {
-    function reset(self): void;
+    function reset(mut self): void;
 }
 
 struct Counter {
     value: int;
 
-    function write(self, value: int): int {
+    function write(mut self, value: int): int {
         self.value = self.value + value;
         return self.value;
     }
 
-    function reset(self): void {
+    function reset(mut self): void {
         self.value = 0;
     }
 }
@@ -211,6 +227,13 @@ Traits V1 notes:
 - traits are compile-time constraints only; there are no trait objects or runtime interface values yet
 - `impl Writer, Flushable for TextWriter {}` is sugar for multiple explicit impls
 - impl targets are concrete types only for now; generic impl targets are not supported yet
+- trait implementations must match receiver mutability, so `mut self` and `self` are distinct
+
+Receiver mutability notes:
+- `self` means the method may read receiver state but may not mutate it
+- `mut self` means the method may mutate receiver state
+- `*const T` may call only `self` methods
+- mutable receivers may call both `self` and `mut self` methods
 
 ### Pointers and Allocators
 ```skunk

@@ -38,6 +38,7 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
 size = { INTEGER }
 builtin_type    = { "byte" | "short" | "int" | "long" | "float" | "double" | "string" | "boolean" | "bool" | "char" | "Allocator" | "Arena" | "void" }
 const_kw        = { "const" }
+mut_kw          = { "mut" }
 trait_bound     = { IDENTIFIER }
 generic_param   = { IDENTIFIER ~ (":" ~ trait_bound ~ ("+" ~ trait_bound)*)? }
 generic_params  = { "[" ~ generic_param ~ ("," ~ generic_param)* ~ "]" }
@@ -52,7 +53,7 @@ prefixed_type   = { type_prefix+ ~ const_kw? ~ (base_type | function_type) } // 
 function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
 _type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type }
 
-_self               = { const_kw? ~ "self" }
+_self               = { (const_kw | mut_kw)? ~ "self" }
 member_func_params  = { "(" ~ _self ~ ("," ~ param_list )? ~ ")" }
 static_func_params  = { "(" ~ param_list ~ ")" | empty_params }
 

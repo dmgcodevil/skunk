@@ -482,9 +482,12 @@ fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
         Type::GenericInstance { .. } => {
             panic!("interpreter does not support unresolved generic instance types")
         }
-        Type::Pointer { .. } | Type::Allocator | Type::Arena | Type::Void | Type::SkSelf => {
-            value_ref
-        }
+        Type::Pointer { .. }
+        | Type::Allocator
+        | Type::Arena
+        | Type::Void
+        | Type::SkSelf
+        | Type::MutSelf => value_ref,
     }
 }
 
@@ -1412,7 +1415,9 @@ fn resolve_member_access(
                 let global_environment_ref = global_environment.borrow();
                 let struct_def = global_environment_ref.to_struct_def(&current_value);
                 let fun_def = struct_def.functions.get(name).unwrap();
-                assert_eq!(fun_def.parameters.first().unwrap().sk_type, Type::SkSelf);
+                assert!(ast::is_self_type(
+                    &fun_def.parameters.first().unwrap().sk_type
+                ));
 
                 stack
                     .borrow_mut()
@@ -1531,7 +1536,7 @@ fn evaluate_function(
     global_environment: &Rc<RefCell<GlobalEnvironment>>,
 ) -> ValueRef {
     let mut parameters = &parameters[0..];
-    if parameters.len() > 0 && parameters[0].sk_type == Type::SkSelf {
+    if parameters.len() > 0 && ast::is_self_type(&parameters[0].sk_type) {
         parameters = &parameters[1..];
     }
     let n = parameters.len();

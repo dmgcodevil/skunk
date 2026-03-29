@@ -254,7 +254,7 @@ impl ModuleNormalizer {
                     let parameters = parameters
                         .into_iter()
                         .map(|(param_name, param_type)| {
-                            if param_type != ast::Type::SkSelf {
+                            if !ast::is_self_type(&param_type) {
                                 local_scope.insert(param_name.clone());
                             }
                             self.rename_type(param_type, value_scopes, type_scopes)
@@ -286,7 +286,7 @@ impl ModuleNormalizer {
                     let parameters = parameters
                         .into_iter()
                         .map(|(param_name, param_type)| {
-                            if param_type != ast::Type::SkSelf {
+                            if !ast::is_self_type(&param_type) {
                                 local_scope.insert(param_name.clone());
                             }
                             self.rename_type(param_type, value_scopes, type_scopes)
@@ -334,7 +334,7 @@ impl ModuleNormalizer {
                 let parameters = parameters
                     .into_iter()
                     .map(|(param_name, param_type)| {
-                        if param_type != ast::Type::SkSelf {
+                        if !ast::is_self_type(&param_type) {
                             local_scope.insert(param_name.clone());
                         }
                         self.rename_type(param_type, value_scopes, type_scopes)
@@ -901,6 +901,7 @@ impl ModuleNormalizer {
             ast::Type::BindingConst { inner } => ast::Type::BindingConst {
                 inner: Box::new(self.rename_type(*inner, value_scopes, type_scopes)?),
             },
+            ast::Type::MutSelf => ast::Type::MutSelf,
             ast::Type::GenericInstance {
                 base,
                 type_arguments,

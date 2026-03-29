@@ -254,7 +254,8 @@ pub enum Type {
         parameters: Vec<Type>,
         return_type: Box<Type>,
     },
-    SkSelf, // special type for member functions
+    MutSelf, // special type for mut member functions
+    SkSelf,  // special type for member functions
 }
 
 enum TypePrefix {
@@ -1164,12 +1165,13 @@ impl PestImpl {
             Rule::_self => {
                 let mut inner_pairs = pair.into_inner();
                 let mut self_type = Type::SkSelf;
-                if inner_pairs
-                    .next()
-                    .is_some_and(|pair| pair.as_rule() == Rule::const_kw)
-                {
-                    self_type = Type::BindingConst {
-                        inner: Box::new(self_type),
+                if let Some(qualifier) = inner_pairs.next() {
+                    self_type = match qualifier.as_rule() {
+                        Rule::mut_kw => Type::MutSelf,
+                        Rule::const_kw => Type::BindingConst {
+                            inner: Box::new(self_type),
+                        },
+                        other => panic!("unexpected self qualifier rule {:?}", other),
                     };
                 }
                 Vec::from([("self".to_string(), self_type)])
@@ -1355,6 +1357,7 @@ pub fn type_to_string(t: &Type) -> String {
                 .join(", "),
             type_to_string(return_type)
         ),
+        Type::MutSelf => "mut self".to_string(),
         Type::SkSelf => "self".to_string(),
         Type::Custom(v) => v.to_string(),
     }
@@ -1475,6 +1478,14 @@ pub fn is_binding_const(t: &Type) -> bool {
 
 pub fn is_const_view(t: &Type) -> bool {
     matches!(t, Type::Const { .. })
+}
+
+pub fn is_self_type(t: &Type) -> bool {
+    matches!(unwrap_binding_const(t), Type::SkSelf | Type::MutSelf)
+}
+
+pub fn is_mut_self_type(t: &Type) -> bool {
+    matches!(unwrap_binding_const(t), Type::MutSelf)
 }
 
 pub fn unwrap_binding_const(t: &Type) -> &Type {
@@ -2735,6 +2746,39 @@ mod tests {
     }
 
     #[test]
+    fn test_struct_member_function_with_mut_self() {
+        let source_code = r#"
+            struct Point {
+                function f(mut self, i:int) {
+                }
+            }
+        "#;
+
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::StructDeclaration {
+                        name: "Point".to_string(),
+                        fields: vec![],
+                        functions: vec![Node::FunctionDeclaration {
+                            name: "f".to_string(),
+                            parameters: vec![
+                                ("self".to_string(), Type::MutSelf),
+                                ("i".to_string(), Type::Int),
+                            ],
+                            return_type: Type::Void,
+                            body: vec![],
+                            lambda: false,
+                        }],
+                    },
+                    Node::EOI,
+                ],
+            },
+            parse(source_code)
+        );
+    }
+
+    #[test]
     fn test_struct_static_function() {
         let source_code = r#"
             struct Point {
@@ -3150,6 +3194,34 @@ mod tests {
                 Node::ImplDeclaration {
                     trait_names: vec!["Writer".to_string()],
                     target_type: Type::Custom("TextWriter".to_string()),
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_trait_method_with_mut_self() {
+        let source_code = r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::TraitDeclaration {
+                    name: "Writer".to_string(),
+                    methods: vec![TraitMethodSignature {
+                        name: "write".to_string(),
+                        parameters: vec![
+                            ("self".to_string(), Type::MutSelf),
+                            ("value".to_string(), Type::Int),
+                        ],
+                        return_type: Type::Int,
+                    }],
                 },
                 Node::EOI,
             ],
