@@ -329,7 +329,7 @@ function unwrap(value: Option[int]): int {
 
             <section id="traits-and-impls">
                 <h2>Traits and Impls</h2>
-                <p>Traits are compile-time constraints. They are not runtime interface objects.</p>
+                <p>Traits work both as generic constraints and as runtime interface values.</p>
 <pre><code class="language-skunk">trait Writer {
     function write(mut self, value: int): int;
 }
@@ -357,11 +357,18 @@ function use_counter[T: Writer + Resettable](counter: *T): int {
     counter.reset();
     return counter.write(41);
 }</code></pre>
+<pre><code class="language-skunk">function main(): void {
+    writer: Writer = Counter { value: 1 };
+    print(writer.write(4));
+    print(writer.write(7));
+}</code></pre>
                 <ul>
                     <li>Trait conformance is explicit through <code>impl Trait for Type</code>.</li>
                     <li><code>impl Writer, Resettable for Counter {}</code> is grouped syntax sugar.</li>
                     <li>Impl targets may be concrete or generic, for example <code>impl[T] SizedThing for Box[T] {}</code>.</li>
                     <li>Generic bounds stack with <code>+</code>.</li>
+                    <li>Trait names may be used as runtime types, such as <code>writer: Writer</code>.</li>
+                    <li>Assigning a concrete struct value to a trait value boxes a runtime copy and stores a vtable for dynamic dispatch.</li>
                 </ul>
             </section>
 
@@ -397,11 +404,11 @@ function main(): void {
             <section id="current-limitations">
                 <h2>Current Limitations</h2>
                 <ul>
-                    <li>Traits are still compile-time only. You cannot yet store a value as “some <code>Writer</code>” and dispatch through it dynamically at runtime.</li>
                     <li>No user-defined allocators, raw pointer operations, or <code>unsafe</code> memory layer yet.</li>
                     <li>No general address-of operator yet.</li>
                     <li>No const struct fields yet.</li>
                     <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
+                    <li>Runtime trait values are a V1 boxed model today. Converting a concrete value to a trait value boxes a copy of that value rather than borrowing it in place.</li>
                 </ul>
             </section>
 

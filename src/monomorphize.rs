@@ -104,6 +104,10 @@ struct Monomorphizer {
     traits: HashMap<String, TraitTemplate>,
     impls: Vec<ImplTemplate>,
     implemented_traits: HashMap<String, HashSet<String>>,
+    root_traits: Vec<Node>,
+    root_concrete_impls: Vec<Node>,
+    generated_impl_keys: HashSet<String>,
+    generated_impls: Vec<Node>,
     generated_functions: HashMap<String, Node>,
     generated_function_order: Vec<String>,
     generated_structs: HashMap<String, Node>,
@@ -126,6 +130,8 @@ impl Monomorphizer {
         let mut concrete_enums = HashMap::new();
         let mut traits = HashMap::new();
         let mut impls = Vec::new();
+        let mut root_traits = Vec::new();
+        let mut root_concrete_impls = Vec::new();
         let mut root_statements = Vec::new();
 
         for statement in statements {
@@ -246,6 +252,7 @@ impl Monomorphizer {
                             methods: methods.clone(),
                         },
                     );
+                    root_traits.push(statement.clone());
                 }
                 Node::ImplDeclaration {
                     generic_params,
@@ -259,6 +266,9 @@ impl Monomorphizer {
                         trait_names: trait_names.clone(),
                         target_type: target_type.clone(),
                     });
+                    if generic_params.is_empty() {
+                        root_concrete_impls.push(statement.clone());
+                    }
                 }
                 Node::Module { .. } | Node::Import { .. } => {}
                 Node::EOI => {}
@@ -276,6 +286,10 @@ impl Monomorphizer {
             traits,
             impls,
             implemented_traits: HashMap::new(),
+            root_traits,
+            root_concrete_impls,
+            generated_impl_keys: HashSet::new(),
+            generated_impls: Vec::new(),
             generated_functions: HashMap::new(),
             generated_function_order: Vec::new(),
             generated_structs: HashMap::new(),
@@ -292,6 +306,8 @@ impl Monomorphizer {
     fn prepare(&mut self) -> Result<Node, String> {
         self.validate_impls()?;
         let mut output = Vec::<Node>::new();
+        output.extend(self.root_traits.clone());
+        output.extend(self.root_concrete_impls.clone());
         for statement in self.root_statements.clone() {
             match statement {
                 Node::FunctionDeclaration {
@@ -315,6 +331,10 @@ impl Monomorphizer {
                     fields,
                     functions,
                 } => {
+                    self.ensure_runtime_impls_for_type(
+                        &Type::Custom(name.clone()),
+                        &Type::Custom(name.clone()),
+                    )?;
                     output.push(self.transform_struct_decl(
                         &name,
                         &fields,
@@ -324,6 +344,10 @@ impl Monomorphizer {
                     )?);
                 }
                 Node::EnumDeclaration { name, variants } => {
+                    self.ensure_runtime_impls_for_type(
+                        &Type::Custom(name.clone()),
+                        &Type::Custom(name.clone()),
+                    )?;
                     output.push(self.transform_enum_decl(&name, &variants, &HashMap::new())?);
                 }
                 Node::EOI => {}
@@ -351,6 +375,7 @@ impl Monomorphizer {
                 output.push(node.clone());
             }
         }
+        output.extend(self.generated_impls.clone());
         for name in self.generated_function_order.clone() {
             if let Some(node) = self.generated_functions.get(&name) {
                 output.push(node.clone());
@@ -383,6 +408,8 @@ impl Monomorphizer {
                             trait_name, target_key
                         ));
                     }
+                    self.generated_impl_keys
+                        .insert(format!("{}=>{}", trait_name, target_key));
                 }
             }
         }
@@ -595,6 +622,56 @@ impl Monomorphizer {
         }
 
         Ok(matched)
+    }
+
+    fn ensure_runtime_impls_for_type(
+        &mut self,
+        source_type: &Type,
+        concrete_type: &Type,
+    ) -> Result<(), String> {
+        let concrete_key = ast::type_to_string(concrete_type);
+        for impl_block in self.impls.clone() {
+            let mut substitutions = HashMap::new();
+            if impl_block.generic_params.is_empty() {
+                if impl_block.target_type != *source_type && impl_block.target_type != *concrete_type
+                {
+                    continue;
+                }
+            } else if self
+                .unify_generic_type(
+                    &impl_block.target_type,
+                    source_type,
+                    &impl_block.generic_params,
+                    &mut substitutions,
+                )
+                .is_err()
+            {
+                continue;
+            } else {
+                self.check_trait_bounds(
+                    &impl_block.generic_bounds,
+                    &substitutions,
+                    &format!(
+                        "generic impl target `{}`",
+                        ast::type_to_string(&impl_block.target_type)
+                    ),
+                )?;
+            }
+
+            for trait_name in impl_block.trait_names {
+                let key = format!("{}=>{}", trait_name, concrete_key);
+                if !self.generated_impl_keys.insert(key) {
+                    continue;
+                }
+                self.generated_impls.push(Node::ImplDeclaration {
+                    generic_params: Vec::new(),
+                    generic_bounds: HashMap::new(),
+                    trait_names: vec![trait_name],
+                    target_type: concrete_type.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn transform_named_function(
@@ -2330,6 +2407,7 @@ impl Monomorphizer {
                 )?;
                 self.generated_structs.insert(symbol_name.clone(), node);
                 self.generated_struct_order.push(symbol_name.clone());
+                self.ensure_runtime_impls_for_type(sk_type, &Type::Custom(symbol_name.clone()))?;
                 self.struct_stack.remove(&symbol_name);
                 Ok(symbol_name)
             }
@@ -2382,6 +2460,7 @@ impl Monomorphizer {
                     self.transform_enum_decl(&symbol_name, &template.variants, &substitutions)?;
                 self.generated_enums.insert(symbol_name.clone(), node);
                 self.generated_enum_order.push(symbol_name.clone());
+                self.ensure_runtime_impls_for_type(sk_type, &Type::Custom(symbol_name.clone()))?;
                 self.enum_stack.remove(&symbol_name);
                 Ok(symbol_name)
             }
@@ -2459,40 +2538,63 @@ impl Monomorphizer {
     ) -> Result<(Type, Vec<Type>, Type), String> {
         match receiver_type {
             Type::Custom(name) => {
-                let template = self
-                    .concrete_structs
-                    .get(name)
-                    .ok_or_else(|| format!("unknown struct `{}`", name))?;
-                let function = template
-                    .functions
-                    .iter()
-                    .find_map(|function| match function {
-                        Node::FunctionDeclaration {
-                            name,
-                            parameters,
-                            return_type,
-                            ..
-                        } if name == method_name => Some((parameters.clone(), return_type.clone())),
-                        _ => None,
-                    })
-                    .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, name))?;
-                let receiver = function
-                    .0
-                    .first()
-                    .map(|(_, sk_type)| sk_type.clone())
-                    .ok_or_else(|| {
-                        format!("method `{}` on `{}` is missing self", method_name, name)
-                    })?;
-                Ok((
-                    receiver,
-                    function
+                if let Some(template) = self.concrete_structs.get(name) {
+                    let function = template
+                        .functions
+                        .iter()
+                        .find_map(|function| match function {
+                            Node::FunctionDeclaration {
+                                name,
+                                parameters,
+                                return_type,
+                                ..
+                            } if name == method_name => Some((parameters.clone(), return_type.clone())),
+                            _ => None,
+                        })
+                        .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, name))?;
+                    let receiver = function
                         .0
-                        .into_iter()
-                        .filter(|(_, sk_type)| !ast::is_self_type(sk_type))
-                        .map(|(_, sk_type)| sk_type)
-                        .collect(),
-                    function.1,
-                ))
+                        .first()
+                        .map(|(_, sk_type)| sk_type.clone())
+                        .ok_or_else(|| {
+                            format!("method `{}` on `{}` is missing self", method_name, name)
+                        })?;
+                    Ok((
+                        receiver,
+                        function
+                            .0
+                            .into_iter()
+                            .filter(|(_, sk_type)| !ast::is_self_type(sk_type))
+                            .map(|(_, sk_type)| sk_type)
+                            .collect(),
+                        function.1,
+                    ))
+                } else if let Some(trait_template) = self.traits.get(name) {
+                    let method = trait_template
+                        .methods
+                        .iter()
+                        .find(|method| method.name == method_name)
+                        .ok_or_else(|| format!("unknown method `{}` on trait `{}`", method_name, name))?;
+                    let receiver = method
+                        .parameters
+                        .first()
+                        .map(|(_, sk_type)| sk_type.clone())
+                        .ok_or_else(|| {
+                            format!("method `{}` on trait `{}` is missing self", method_name, name)
+                        })?;
+                    Ok((
+                        receiver,
+                        method
+                            .parameters
+                            .iter()
+                            .skip(1)
+                            .map(|(_, sk_type)| sk_type.clone())
+                            .collect(),
+                        method.return_type.clone(),
+                    ))
+                } else {
+                    Err(format!("unknown struct or trait `{}`", name))
+                }
             }
             Type::GenericInstance {
                 base,

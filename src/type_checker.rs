@@ -35,6 +35,12 @@ struct EnumSymbol {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+struct TraitSymbol {
+    name: String,
+    methods: HashMap<String, Symbol>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 struct SymbolTable {
     vars: HashMap<String, Symbol>,
 }
@@ -135,6 +141,8 @@ fn func_decl_node_to_symbol(node: &Node) -> Symbol {
 struct GlobalScope {
     structs: HashMap<String, StructSymbol>,
     enums: HashMap<String, EnumSymbol>,
+    traits: HashMap<String, TraitSymbol>,
+    implemented_traits: HashMap<String, std::collections::HashSet<String>>,
     functions: HashMap<String, Symbol>,
     variables: HashMap<String, Symbol>,
 }
@@ -144,6 +152,8 @@ impl GlobalScope {
         GlobalScope {
             structs: HashMap::new(),
             enums: HashMap::new(),
+            traits: HashMap::new(),
+            implemented_traits: HashMap::new(),
             functions: HashMap::new(),
             variables: HashMap::new(),
         }
@@ -207,7 +217,49 @@ impl GlobalScope {
                 self.functions
                     .insert(name.clone(), func_decl_node_to_symbol(node));
             }
-            Node::TraitDeclaration { .. } | Node::ImplDeclaration { .. } => {}
+            Node::TraitDeclaration { name, methods } => {
+                self.traits.insert(
+                    name.clone(),
+                    TraitSymbol {
+                        name: name.clone(),
+                        methods: methods
+                            .iter()
+                            .map(|method| {
+                                (
+                                    method.name.clone(),
+                                    Symbol {
+                                        name: method.name.clone(),
+                                        sk_type: Type::Function {
+                                            parameters: method
+                                                .parameters
+                                                .iter()
+                                                .map(|(_, ty)| ty.clone())
+                                                .collect(),
+                                            return_type: Box::new(method.return_type.clone()),
+                                        },
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                );
+            }
+            Node::ImplDeclaration {
+                generic_params,
+                generic_bounds: _,
+                trait_names,
+                target_type,
+            } => {
+                if generic_params.is_empty() {
+                    let entry = self
+                        .implemented_traits
+                        .entry(type_to_string(target_type))
+                        .or_default();
+                    for trait_name in trait_names {
+                        entry.insert(trait_name.clone());
+                    }
+                }
+            }
             Node::VariableDeclaration {
                 var_type,
                 name,
@@ -227,7 +279,7 @@ impl GlobalScope {
     }
 }
 
-fn is_assignable(expected: &Type, actual: &Type) -> bool {
+fn is_assignable(global_scope: &GlobalScope, expected: &Type, actual: &Type) -> bool {
     let expected = unwrap_binding_const(expected);
     let actual = unwrap_binding_const(actual);
     if expected == actual || is_numeric_assignable(expected, actual) {
@@ -240,7 +292,7 @@ fn is_assignable(expected: &Type, actual: &Type) -> bool {
                 inner: expected_inner,
             },
             _,
-        ) => is_assignable(expected_inner, actual),
+        ) => is_assignable(global_scope, expected_inner, actual),
         (
             Type::Pointer {
                 target_type: expected_target,
@@ -248,7 +300,7 @@ fn is_assignable(expected: &Type, actual: &Type) -> bool {
             Type::Pointer {
                 target_type: actual_target,
             },
-        ) => is_assignable(expected_target, actual_target),
+        ) => is_assignable(global_scope, expected_target, actual_target),
         (
             Type::Slice {
                 elem_type: expected_elem,
@@ -256,7 +308,7 @@ fn is_assignable(expected: &Type, actual: &Type) -> bool {
             Type::Slice {
                 elem_type: actual_elem,
             },
-        ) => is_assignable(expected_elem, actual_elem),
+        ) => is_assignable(global_scope, expected_elem, actual_elem),
         (
             Type::Array {
                 elem_type: expected_elem,
@@ -266,7 +318,16 @@ fn is_assignable(expected: &Type, actual: &Type) -> bool {
                 elem_type: actual_elem,
                 dimensions: actual_dimensions,
             },
-        ) => expected_dimensions == actual_dimensions && is_assignable(expected_elem, actual_elem),
+        ) => {
+            expected_dimensions == actual_dimensions
+                && is_assignable(global_scope, expected_elem, actual_elem)
+        }
+        (Type::Custom(expected_name), _) if global_scope.traits.contains_key(expected_name) => {
+            global_scope
+                .implemented_traits
+                .get(&type_to_string(actual))
+                .is_some_and(|traits| traits.contains(expected_name))
+        }
         _ => false,
     }
 }
@@ -334,6 +395,16 @@ fn struct_symbol_for_type<'a>(
 ) -> Option<&'a StructSymbol> {
     match unwrap_binding_const(unwrap_const_view(sk_type)) {
         Type::Custom(name) => global_scope.structs.get(name),
+        _ => None,
+    }
+}
+
+fn trait_symbol_for_type<'a>(
+    global_scope: &'a GlobalScope,
+    sk_type: &Type,
+) -> Option<&'a TraitSymbol> {
+    match unwrap_binding_const(unwrap_const_view(sk_type)) {
+        Type::Custom(name) => global_scope.traits.get(name),
         _ => None,
     }
 }
@@ -765,17 +836,64 @@ fn resolve_access(
                 )),
                 _ => Err("arena member access expects a function call".to_string()),
             },
-            Type::Custom(struct_name) => {
-                if !global_scope.structs.contains_key(&struct_name) {
-                    return Err("error: struct doesn't exist".to_string());
-                }
-                let struct_symbol = global_scope.structs.get(&struct_name).unwrap();
+            Type::Custom(type_name) => {
+                if let Some(trait_symbol) = global_scope.traits.get(&type_name) {
+                    match member.deref() {
+                        Node::Identifier(field_name) => Err(format!(
+                            "error {}:{}: no field `{}` on trait object `{}`",
+                            metadata.span.line, metadata.span.start, field_name, type_name
+                        )),
+                        Node::FunctionCall {
+                            name,
+                            type_arguments: _,
+                            arguments,
+                            metadata,
+                        } => {
+                            let method_symbol = trait_symbol.methods.get(name).ok_or_else(|| {
+                                format!(
+                                    "error {}:{}: no method named `{}` found for trait `{}`",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    name,
+                                    type_name,
+                                )
+                            })?;
+                            if let Type::Function { parameters, .. } = &method_symbol.sk_type {
+                                if parameters.first().is_some_and(is_mut_self_type) {
+                                    assert_mutating_receiver_allowed(
+                                        global_scope,
+                                        symbol_tables,
+                                        &access_nodes[..i],
+                                    )?;
+                                }
+                            }
+                            let return_type = resolve_function_call(
+                                global_scope,
+                                symbol_tables,
+                                method_symbol,
+                                member.deref(),
+                            )?;
+                            resolve_access(
+                                global_scope,
+                                symbol_tables,
+                                return_type,
+                                i + 1,
+                                access_nodes,
+                            )
+                        }
+                        _ => panic!("expected member access node"),
+                    }
+                } else {
+                    if !global_scope.structs.contains_key(&type_name) {
+                        return Err("error: struct doesn't exist".to_string());
+                    }
+                    let struct_symbol = global_scope.structs.get(&type_name).unwrap();
                 match member.deref() {
                     Node::Identifier(field_name) => {
                         if !struct_symbol.fields.contains_key(field_name) {
                             return Err(format!(
                                 "error {}:{}: no field `{}` on type `{}`",
-                                metadata.span.line, metadata.span.start, field_name, struct_name
+                                metadata.span.line, metadata.span.start, field_name, type_name
                             ));
                         }
                         resolve_access(
@@ -803,7 +921,7 @@ fn resolve_access(
                                 metadata.span.line,
                                 metadata.span.start,
                                 name,
-                                struct_name,
+                                type_name,
                             ));
                         }
                         let method_symbol = struct_symbol.functions.get(name).unwrap();
@@ -840,6 +958,7 @@ fn resolve_access(
                         )
                     }
                     _ => panic!("expected member access node"),
+                }
                 }
             }
             _ => Err(format!("access to member access to not instance structs")),
@@ -1189,7 +1308,8 @@ fn resolve_function_call(
                         )?);
                     }
                     for i in 0..argument_types.len() {
-                        if !is_assignable(&parameters[i], &argument_types[i].sk_type) {
+                        if !is_assignable(global_scope, &parameters[i], &argument_types[i].sk_type)
+                        {
                             return Err(format!(
                                 "error {}:{}:arguments to function '{}' are incorrect. \
                                 parameter pos='{}', expected type='{:?}', actual type='{:?}'",
@@ -1404,7 +1524,7 @@ fn resolve_type(
                     Some(unwrap_binding_const(var_type)),
                 )?
                 .sk_type;
-                if !is_assignable(var_type, &value_type) {
+                if !is_assignable(global_scope, var_type, &value_type) {
                     Err(format!(
                         "expected '{:?}' var type: {:?}, actual: {:?}. pos: {:?}",
                         name.clone(),
@@ -1449,7 +1569,7 @@ fn resolve_type(
                 Some(struct_type),
             )?
             .sk_type;
-            if !is_assignable(struct_type, &value_type) {
+            if !is_assignable(global_scope, struct_type, &value_type) {
                 return Err(format!(
                     "struct destructure type mismatch. expected `{}`, actual `{}`",
                     type_to_string(struct_type),
@@ -1550,7 +1670,7 @@ fn resolve_type(
                 resolve_type(global_scope, symbol_tables, var.deref(), expected_type_opt)?.sk_type;
             let value_type =
                 resolve_type(global_scope, symbol_tables, value.deref(), Some(&var_type))?.sk_type;
-            if !is_assignable(&var_type, &value_type) {
+            if !is_assignable(global_scope, &var_type, &value_type) {
                 // todo include var name, metadata
                 Err(format!(
                     "assignment type mismatch. expected: {:?}, actual: {:?}",
@@ -1702,7 +1822,7 @@ fn resolve_type(
                         arguments.get(0).unwrap(),
                         Some(elem_type.deref()),
                     )?;
-                    if !is_assignable(elem_type.deref(), &arg_type.sk_type) {
+                    if !is_assignable(global_scope, elem_type.deref(), &arg_type.sk_type) {
                         return Err(format!(
                             "error {}:{}: array `{}`. expected arg type is `{:?}` but given `{:?}`",
                             metadata.span.line,
@@ -1794,7 +1914,7 @@ fn resolve_type(
                             argument,
                             Some(payload_type),
                         )?;
-                        if !is_assignable(payload_type, &arg_type.sk_type) {
+                        if !is_assignable(global_scope, payload_type, &arg_type.sk_type) {
                             return Err(format!(
                                 "error {}:{}: enum variant `{}` expected `{}` but got `{}`",
                                 metadata.span.line,
@@ -2049,7 +2169,7 @@ fn resolve_type(
                     .to_returned();
             }
             if let Some(expected_type) = expected_type_opt {
-                if !is_assignable(expected_type, &res.sk_type) {
+                if !is_assignable(global_scope, expected_type, &res.sk_type) {
                     return Err(format!(
                         "return invalid type. expected={:?}, actual={:?}, body={:?}",
                         expected_type, res.sk_type, body_opt

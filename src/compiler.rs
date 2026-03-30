@@ -18,6 +18,7 @@ enum LlvmType {
     PtrI8,
     Allocator,
     Arena,
+    TraitObject(String),
     Struct(String),
     Enum(String),
     Pointer {
@@ -51,6 +52,7 @@ impl LlvmType {
             LlvmType::PtrI8 => "ptr".to_string(),
             LlvmType::Allocator => "ptr".to_string(),
             LlvmType::Arena => "ptr".to_string(),
+            LlvmType::TraitObject(name) => format!("%trait.{}", sanitize_name(name)),
             LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
             LlvmType::Enum(name) => format!("%enum.{}", sanitize_name(name)),
             LlvmType::Pointer { .. } => "ptr".to_string(),
@@ -96,6 +98,20 @@ struct EnumVariantLayout {
 struct EnumLayout {
     name: String,
     variants: Vec<EnumVariantLayout>,
+}
+
+#[derive(Clone, Debug)]
+struct TraitMethodLayout {
+    name: String,
+    receiver_is_mut: bool,
+    return_type: LlvmType,
+    parameters: Vec<LlvmType>,
+}
+
+#[derive(Clone, Debug)]
+struct TraitLayout {
+    name: String,
+    methods: Vec<TraitMethodLayout>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,9 +166,12 @@ fn llvm_type(
     sk_type: &Type,
     structs: &HashMap<String, StructLayout>,
     enums: &HashMap<String, EnumLayout>,
+    traits: &HashMap<String, TraitLayout>,
 ) -> Result<LlvmType, String> {
     match sk_type {
-        Type::Const { inner } | Type::BindingConst { inner } => llvm_type(inner, structs, enums),
+        Type::Const { inner } | Type::BindingConst { inner } => {
+            llvm_type(inner, structs, enums, traits)
+        }
         Type::Byte => Ok(LlvmType::I8),
         Type::Short => Ok(LlvmType::I16),
         Type::Int => Ok(LlvmType::I32),
@@ -168,7 +187,7 @@ fn llvm_type(
             elem_type,
             dimensions,
         } => {
-            let mut llvm_elem = llvm_type(elem_type, structs, enums)?;
+            let mut llvm_elem = llvm_type(elem_type, structs, enums, traits)?;
             for dimension in dimensions.iter().rev() {
                 llvm_elem = LlvmType::Array {
                     elem_type: Box::new(llvm_elem),
@@ -178,10 +197,10 @@ fn llvm_type(
             Ok(llvm_elem)
         }
         Type::Slice { elem_type } => Ok(LlvmType::Slice {
-            elem_type: Box::new(llvm_type(elem_type, structs, enums)?),
+            elem_type: Box::new(llvm_type(elem_type, structs, enums, traits)?),
         }),
         Type::Pointer { target_type } => Ok(LlvmType::Pointer {
-            target_type: Box::new(llvm_type(target_type, structs, enums)?),
+            target_type: Box::new(llvm_type(target_type, structs, enums, traits)?),
         }),
         Type::Function {
             parameters,
@@ -189,15 +208,17 @@ fn llvm_type(
         } => Ok(LlvmType::Function {
             parameters: parameters
                 .iter()
-                .map(|param| llvm_type(param, structs, enums))
+                .map(|param| llvm_type(param, structs, enums, traits))
                 .collect::<Result<Vec<_>, _>>()?,
-            return_type: Box::new(llvm_type(return_type, structs, enums)?),
+            return_type: Box::new(llvm_type(return_type, structs, enums, traits)?),
         }),
         Type::Custom(name) => {
             if structs.contains_key(name) {
                 Ok(LlvmType::Struct(name.clone()))
             } else if enums.contains_key(name) {
                 Ok(LlvmType::Enum(name.clone()))
+            } else if traits.contains_key(name) {
+                Ok(LlvmType::TraitObject(name.clone()))
             } else {
                 Err(format!("unknown nominal type `{}` in LLVM backend", name))
             }
@@ -245,11 +266,12 @@ fn collect_struct_layouts(statements: &[Node]) -> Result<HashMap<String, StructL
             .map(|(field_name, field_type)| {
                 Ok((
                     field_name.clone(),
-                    llvm_type(
-                        field_type,
-                        &layouts_with_raw(raw_fields.keys(), &layouts),
-                        &enum_placeholders,
-                    )?,
+                        llvm_type(
+                            field_type,
+                            &layouts_with_raw(raw_fields.keys(), &layouts),
+                            &enum_placeholders,
+                            &HashMap::new(),
+                        )?,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -282,7 +304,7 @@ fn collect_enum_layouts(
             let payload_types = variant
                 .payload_types
                 .iter()
-                .map(|payload_type| llvm_type(payload_type, structs, &enum_placeholders))
+                .map(|payload_type| llvm_type(payload_type, structs, &enum_placeholders, &HashMap::new()))
                 .collect::<Result<Vec<_>, String>>()?;
             let field_indices = (0..payload_types.len())
                 .map(|_| {
@@ -325,6 +347,60 @@ fn collect_enum_placeholders(statements: &[Node]) -> HashMap<String, EnumLayout>
             _ => None,
         })
         .collect()
+}
+
+fn collect_trait_layouts(
+    statements: &[Node],
+    structs: &HashMap<String, StructLayout>,
+    enums: &HashMap<String, EnumLayout>,
+) -> Result<HashMap<String, TraitLayout>, String> {
+    let mut layouts = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Node::TraitDeclaration { name, .. } => Some((
+                name.clone(),
+                TraitLayout {
+                    name: name.clone(),
+                    methods: Vec::new(),
+                },
+            )),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    for statement in statements {
+        let Node::TraitDeclaration { name, methods } = statement else {
+            continue;
+        };
+        let method_layouts = methods
+            .iter()
+            .map(|method| {
+                let receiver_type = method
+                    .parameters
+                    .first()
+                    .map(|(_, ty)| ty.clone())
+                    .ok_or_else(|| format!("trait method `{}` is missing self", method.name))?;
+                Ok(TraitMethodLayout {
+                    name: method.name.clone(),
+                    receiver_is_mut: matches!(receiver_type, Type::MutSelf),
+                    return_type: llvm_type(&method.return_type, structs, enums, &layouts)?,
+                    parameters: method
+                        .parameters
+                        .iter()
+                        .skip(1)
+                        .map(|(_, ty)| llvm_type(ty, structs, enums, &layouts))
+                        .collect::<Result<Vec<_>, String>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        layouts.insert(
+            name.clone(),
+            TraitLayout {
+                name: name.clone(),
+                methods: method_layouts,
+            },
+        );
+    }
+    Ok(layouts)
 }
 
 fn layouts_with_raw<'a>(
@@ -376,6 +452,8 @@ struct FunctionCompiler<'a> {
     signatures: &'a HashMap<String, FunctionSignature>,
     structs: &'a HashMap<String, StructLayout>,
     enums: &'a HashMap<String, EnumLayout>,
+    traits: &'a HashMap<String, TraitLayout>,
+    trait_vtables: &'a HashMap<String, String>,
     globals: &'a mut Vec<GlobalString>,
     extra_type_decls: &'a mut Vec<String>,
     extra_function_irs: &'a mut Vec<String>,
@@ -395,6 +473,8 @@ impl<'a> FunctionCompiler<'a> {
         signatures: &'a HashMap<String, FunctionSignature>,
         structs: &'a HashMap<String, StructLayout>,
         enums: &'a HashMap<String, EnumLayout>,
+        traits: &'a HashMap<String, TraitLayout>,
+        trait_vtables: &'a HashMap<String, String>,
         globals: &'a mut Vec<GlobalString>,
         extra_type_decls: &'a mut Vec<String>,
         extra_function_irs: &'a mut Vec<String>,
@@ -407,6 +487,8 @@ impl<'a> FunctionCompiler<'a> {
             signatures,
             structs,
             enums,
+            traits,
+            trait_vtables,
             globals,
             extra_type_decls,
             extra_function_irs,
@@ -448,12 +530,12 @@ impl<'a> FunctionCompiler<'a> {
         for (index, (name, sk_type)) in parameters.iter().enumerate() {
             let arg_name = format!("%arg{}", arg_index);
             if index == 0 && name == "self" {
-                let llvm_type = llvm_type(sk_type, self.structs, self.enums)?;
+                let llvm_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
                 self.declare_local(name.clone(), arg_name, llvm_type);
                 arg_index += 1;
                 continue;
             }
-            let llvm_type = llvm_type(sk_type, self.structs, self.enums)?;
+            let llvm_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
             let ptr = self.emit_heap_alloc(llvm_type.clone(), name);
             self.emit_line(format!(
                 "store {} {}, ptr {}, align {}",
@@ -501,7 +583,7 @@ impl<'a> FunctionCompiler<'a> {
                 value,
                 ..
             } => {
-                let llvm_type = llvm_type(var_type, self.structs, self.enums)?;
+                let llvm_type = llvm_type(var_type, self.structs, self.enums, self.traits)?;
                 let ptr = self.emit_heap_alloc(llvm_type.clone(), name);
                 self.declare_local(name.clone(), ptr.clone(), llvm_type.clone());
                 let init = match value {
@@ -525,7 +607,7 @@ impl<'a> FunctionCompiler<'a> {
                 value,
                 ..
             } => {
-                let expected = llvm_type(struct_type, self.structs, self.enums)?;
+                let expected = llvm_type(struct_type, self.structs, self.enums, self.traits)?;
                 let value = self.compile_expr_with_expected(value, Some(&expected))?;
                 let value = self.coerce_expr(value, &expected, "struct destructure")?;
                 let LlvmType::Struct(struct_name) = &value.llvm_type else {
@@ -904,7 +986,10 @@ impl<'a> FunctionCompiler<'a> {
                 ));
                 Ok(())
             }
-            LlvmType::Allocator | LlvmType::Arena | LlvmType::Pointer { .. } => {
+            LlvmType::Allocator
+            | LlvmType::Arena
+            | LlvmType::TraitObject(_)
+            | LlvmType::Pointer { .. } => {
                 Err("cannot print a pointer-like value directly".to_string())
             }
             LlvmType::Struct(_) => Err("cannot print a struct value directly".to_string()),
@@ -980,6 +1065,10 @@ impl<'a> FunctionCompiler<'a> {
                     }
                 };
                 match expected {
+                    Some(LlvmType::TraitObject(_)) => {
+                        let inferred = LlvmType::Struct(struct_name.to_string());
+                        self.compile_struct_literal(struct_name, fields, &inferred)
+                    }
                     Some(expected) => self.compile_struct_literal(struct_name, fields, expected),
                     None => {
                         let inferred = LlvmType::Struct(struct_name.to_string());
@@ -1117,7 +1206,7 @@ impl<'a> FunctionCompiler<'a> {
                     self.coerce_expr(allocator, &LlvmType::Allocator, "slice alloc allocator")?;
                 let len = self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I32))?;
                 let len = self.coerce_expr(len, &LlvmType::I32, "slice alloc length")?;
-                let llvm_slice_type = llvm_type(sk_type, self.structs, self.enums)?;
+                let llvm_slice_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
                 let elem_type = match &llvm_slice_type {
                     LlvmType::Slice { elem_type } => elem_type.as_ref().clone(),
                     _ => unreachable!(),
@@ -1155,7 +1244,7 @@ impl<'a> FunctionCompiler<'a> {
                         name
                     ));
                 }
-                let llvm_type = llvm_type(sk_type, self.structs, self.enums)?;
+                let llvm_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
                 self.compile_array_fill(&llvm_type, &arguments[0])
             }
             Type::Custom(enum_name) if self.enums.contains_key(enum_name) => {
@@ -1183,7 +1272,7 @@ impl<'a> FunctionCompiler<'a> {
                 let allocator =
                     self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::Allocator))?;
                 let allocator = self.coerce_expr(allocator, &LlvmType::Allocator, "type create")?;
-                let target_type = llvm_type(sk_type, self.structs, self.enums)?;
+                let target_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
                 let temp = self.next_temp();
                 self.emit_line(format!(
                     "{} = call ptr @skunk_alloc_create(ptr {}, i64 {})",
@@ -1660,6 +1749,98 @@ impl<'a> FunctionCompiler<'a> {
             })?
             .llvm_type
         };
+
+        if let LlvmType::TraitObject(trait_name) = receiver_type {
+            let trait_layout = self
+                .traits
+                .get(&trait_name)
+                .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
+            let (method_index, method) = trait_layout
+                .methods
+                .iter()
+                .enumerate()
+                .find(|(_, method)| method.name == method_name)
+                .ok_or_else(|| {
+                    format!(
+                        "unknown method `{}` on trait object `{}`",
+                        method_name, trait_name
+                    )
+                })?;
+
+            let first_args = arguments
+                .first()
+                .ok_or_else(|| "method call is missing its first argument group".to_string())?;
+            if first_args.len() != method.parameters.len() {
+                return Err(format!(
+                    "method `{}` expects {} arguments, got {}",
+                    method_name,
+                    method.parameters.len(),
+                    first_args.len()
+                ));
+            }
+
+            let receiver_value = self.compile_expr(&Node::Access {
+                nodes: receiver_nodes.to_vec(),
+            })?;
+            let data_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = extractvalue {} {}, 0",
+                data_ptr,
+                receiver_value.llvm_type.ir(),
+                receiver_value.value
+            ));
+            let vtable_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = extractvalue {} {}, 1",
+                vtable_ptr,
+                receiver_value.llvm_type.ir(),
+                receiver_value.value
+            ));
+            let slot_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = getelementptr inbounds %vtable.{}, ptr {}, i32 0, i32 {}",
+                slot_ptr,
+                sanitize_name(&trait_name),
+                vtable_ptr,
+                method_index
+            ));
+            let fn_ptr = self.next_temp();
+            self.emit_line(format!("{} = load ptr, ptr {}, align 8", fn_ptr, slot_ptr));
+
+            let mut arg_parts = vec![format!("ptr {}", data_ptr)];
+            for (arg_node, expected_type) in first_args.iter().zip(method.parameters.iter()) {
+                let arg = self.compile_expr_with_expected(arg_node, Some(expected_type))?;
+                let arg = self.coerce_expr(arg, expected_type, "trait method argument")?;
+                arg_parts.push(format!("{} {}", arg.llvm_type.ir(), arg.value));
+            }
+
+            let mut current = if method.return_type == LlvmType::Void {
+                self.emit_line(format!("call void {}({})", fn_ptr, arg_parts.join(", ")));
+                ExprValue {
+                    llvm_type: LlvmType::Void,
+                    value: "void".to_string(),
+                }
+            } else {
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call {} {}({})",
+                    temp,
+                    method.return_type.ir(),
+                    fn_ptr,
+                    arg_parts.join(", ")
+                ));
+                ExprValue {
+                    llvm_type: method.return_type.clone(),
+                    value: temp,
+                }
+            };
+
+            for arg_group in arguments.iter().skip(1) {
+                current = self.compile_closure_call(current, arg_group, "trait method call")?;
+            }
+
+            return Ok(Some(current));
+        }
 
         if receiver_type == LlvmType::Allocator {
             if arguments.len() != 1 {
@@ -2156,9 +2337,9 @@ impl<'a> FunctionCompiler<'a> {
             None => LlvmType::Function {
                 parameters: parameters
                     .iter()
-                    .map(|(_, sk_type)| llvm_type(sk_type, self.structs, self.enums))
+                    .map(|(_, sk_type)| llvm_type(sk_type, self.structs, self.enums, self.traits))
                     .collect::<Result<Vec<_>, _>>()?,
-                return_type: Box::new(llvm_type(return_type, self.structs, self.enums)?),
+                return_type: Box::new(llvm_type(return_type, self.structs, self.enums, self.traits)?),
             },
         };
 
@@ -2203,6 +2384,8 @@ impl<'a> FunctionCompiler<'a> {
             self.signatures,
             self.structs,
             self.enums,
+            self.traits,
+            self.trait_vtables,
             self.globals,
             self.extra_type_decls,
             self.extra_function_irs,
@@ -2216,7 +2399,7 @@ impl<'a> FunctionCompiler<'a> {
             .map(|(index, (_, ty))| {
                 Ok(format!(
                     "{} %arg{}",
-                    llvm_type(ty, self.structs, self.enums)?.ir(),
+                    llvm_type(ty, self.structs, self.enums, self.traits)?.ir(),
                     index + 1
                 ))
             })
@@ -2709,6 +2892,10 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: LlvmType::Arena,
                 value: "null".to_string(),
             },
+            LlvmType::TraitObject(_) => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
             LlvmType::Pointer { .. } => ExprValue {
                 llvm_type: llvm_type.clone(),
                 value: "null".to_string(),
@@ -2820,6 +3007,20 @@ impl<'a> FunctionCompiler<'a> {
     ) -> Result<ExprValue, String> {
         if &value.llvm_type == expected {
             return Ok(value);
+        }
+
+        if let LlvmType::TraitObject(trait_name) = expected {
+            return match value.llvm_type.clone() {
+                LlvmType::Struct(concrete_name) => {
+                    self.box_trait_object(trait_name, &concrete_name, value, context)
+                }
+                other => Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    other.ir()
+                )),
+            };
         }
 
         let temp = self.next_temp();
@@ -2941,6 +3142,58 @@ impl<'a> FunctionCompiler<'a> {
         })
     }
 
+    fn box_trait_object(
+        &mut self,
+        trait_name: &str,
+        concrete_name: &str,
+        value: ExprValue,
+        context: &str,
+    ) -> Result<ExprValue, String> {
+        let vtable_symbol = self
+            .trait_vtables
+            .get(&format!("{}=>{}", trait_name, concrete_name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "type mismatch in {}: `{}` does not implement trait `{}`",
+                    context, concrete_name, trait_name
+                )
+            })?;
+
+        let allocator = self.next_temp();
+        self.emit_line(format!("{} = call ptr @skunk_system_allocator()", allocator));
+        let boxed_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = call ptr @skunk_alloc_create(ptr {}, i64 {})",
+            boxed_ptr,
+            allocator,
+            self.size_of(&value.llvm_type)
+        ));
+        self.emit_store(&boxed_ptr, &value);
+
+        let trait_type = LlvmType::TraitObject(trait_name.to_string());
+        let with_data = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, ptr {}, 0",
+            with_data,
+            trait_type.ir(),
+            boxed_ptr
+        ));
+        let boxed_value = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} {}, ptr @{}, 1",
+            boxed_value,
+            trait_type.ir(),
+            with_data,
+            vtable_symbol
+        ));
+
+        Ok(ExprValue {
+            llvm_type: trait_type,
+            value: boxed_value,
+        })
+    }
+
     fn global_c_string(&mut self, prefix: &str, value: &str) -> String {
         let mut bytes = value.as_bytes().to_vec();
         bytes.push(0);
@@ -3046,6 +3299,7 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::PtrI8
             | LlvmType::Allocator
             | LlvmType::Arena
+            | LlvmType::TraitObject(_)
             | LlvmType::Pointer { .. } => 8,
             LlvmType::Function { .. } => 8,
             LlvmType::Struct(name) => self
@@ -3091,6 +3345,7 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::Allocator
             | LlvmType::Arena
             | LlvmType::Pointer { .. } => 8,
+            LlvmType::TraitObject(_) => 16,
             LlvmType::Function { .. } => 16,
             LlvmType::Slice { .. } => 16,
             LlvmType::Array { elem_type, len } => self.size_of(elem_type) * len,
@@ -3211,8 +3466,11 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
 
     let structs = collect_struct_layouts(statements)?;
     let enums = collect_enum_layouts(statements, &structs)?;
+    let traits = collect_trait_layouts(statements, &structs, &enums)?;
     let mut signatures = HashMap::<String, FunctionSignature>::new();
     let mut functions = Vec::<FunctionPlan>::new();
+    let mut trait_vtables = HashMap::<String, String>::new();
+    let mut trait_vtable_globals = Vec::<String>::new();
 
     for statement in statements {
         match statement {
@@ -3225,9 +3483,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             } => {
                 let params = parameters
                     .iter()
-                    .map(|(_, ty)| llvm_type(ty, &structs, &enums))
+                    .map(|(_, ty)| llvm_type(ty, &structs, &enums, &traits))
                     .collect::<Result<Vec<_>, _>>()?;
-                let llvm_return_type = llvm_type(return_type, &structs, &enums)?;
+                let llvm_return_type = llvm_type(return_type, &structs, &enums, &traits)?;
                 signatures.insert(
                     name.clone(),
                     FunctionSignature {
@@ -3267,10 +3525,10 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                             if ast::is_self_type(param_type) {
                                 continue;
                             }
-                            parameter_types.push(llvm_type(param_type, &structs, &enums)?);
+                            parameter_types.push(llvm_type(param_type, &structs, &enums, &traits)?);
                             compile_params.push((param_name.clone(), param_type.clone()));
                         }
-                        let llvm_return_type = llvm_type(return_type, &structs, &enums)?;
+                        let llvm_return_type = llvm_type(return_type, &structs, &enums, &traits)?;
                         let key = format!("{}::{}", name, method_name);
                         let symbol_name =
                             format!("skunk_{}_{}", sanitize_name(name), sanitize_name(method_name));
@@ -3307,6 +3565,64 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         return Err("LLVM backend currently requires `function main(): ... {}`".to_string());
     }
 
+    for statement in statements {
+        let Node::ImplDeclaration {
+            generic_params,
+            trait_names,
+            target_type,
+            ..
+        } = statement
+        else {
+            continue;
+        };
+        if !generic_params.is_empty() {
+            continue;
+        }
+        let target_name = match target_type {
+            Type::Custom(name) => name.clone(),
+            other => {
+                return Err(format!(
+                    "runtime trait values currently require concrete nominal impl targets, found `{}`",
+                    ast::type_to_string(other)
+                ))
+            }
+        };
+        for trait_name in trait_names {
+            let trait_layout = traits
+                .get(trait_name)
+                .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
+            let vtable_symbol = format!(
+                "skunk_vtable_{}_{}",
+                sanitize_name(trait_name),
+                sanitize_name(&target_name)
+            );
+            trait_vtables.insert(
+                format!("{}=>{}", trait_name, target_name),
+                vtable_symbol.clone(),
+            );
+            let entries = trait_layout
+                .methods
+                .iter()
+                .map(|method| {
+                    let signature_key = format!("{}::{}", target_name, method.name);
+                    let signature = signatures.get(&signature_key).ok_or_else(|| {
+                        format!(
+                            "missing concrete method `{}` for trait `{}` implementation on `{}`",
+                            method.name, trait_name, target_name
+                        )
+                    })?;
+                    Ok(format!("ptr @{}", signature.symbol_name))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            trait_vtable_globals.push(format!(
+                "@{} = private unnamed_addr constant %vtable.{} {{ {} }}",
+                vtable_symbol,
+                sanitize_name(trait_name),
+                entries.join(", ")
+            ));
+        }
+    }
+
     let mut globals = Vec::<GlobalString>::new();
     let mut extra_type_decls = Vec::<String>::new();
     let mut function_irs = Vec::<String>::new();
@@ -3314,13 +3630,13 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let mut lambda_counter = 0usize;
 
     for function in &functions {
-        let llvm_return_type = llvm_type(&function.return_type, &structs, &enums)?;
+        let llvm_return_type = llvm_type(&function.return_type, &structs, &enums, &traits)?;
         let param_defs = if function.is_method {
             let mut defs = vec![format!("ptr %arg0")];
             for (index, (_, ty)) in function.parameters.iter().skip(1).enumerate() {
                 defs.push(format!(
                     "{} %arg{}",
-                    llvm_type(ty, &structs, &enums)?.ir(),
+                    llvm_type(ty, &structs, &enums, &traits)?.ir(),
                     index + 1
                 ));
             }
@@ -3333,7 +3649,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 .map(|(index, (_, ty))| {
                     Ok(format!(
                         "{} %arg{}",
-                        llvm_type(ty, &structs, &enums)?.ir(),
+                        llvm_type(ty, &structs, &enums, &traits)?.ir(),
                         index
                     ))
                 })
@@ -3345,6 +3661,8 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             &signatures,
             &structs,
             &enums,
+            &traits,
+            &trait_vtables,
             &mut globals,
             &mut extra_type_decls,
             &mut extra_function_irs,
@@ -3396,7 +3714,10 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         LlvmType::PtrI8 => {
             return Err("LLVM backend does not support `main` returning string yet".to_string())
         }
-        LlvmType::Allocator | LlvmType::Arena | LlvmType::Pointer { .. } => {
+        LlvmType::Allocator
+        | LlvmType::Arena
+        | LlvmType::TraitObject(_)
+        | LlvmType::Pointer { .. } => {
             return Err("LLVM backend does not support `main` returning pointer-like values yet".to_string())
         }
         LlvmType::Function { .. } => {
@@ -3428,6 +3749,30 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let _ = writeln!(ir, "declare void @skunk_alloc_destroy(ptr, ptr)");
     let _ = writeln!(ir, "declare void @skunk_alloc_free(ptr, ptr)");
     let _ = writeln!(ir);
+    for layout in traits.values() {
+        let _ = writeln!(
+            ir,
+            "%trait.{} = type {{ ptr, ptr }}",
+            sanitize_name(&layout.name)
+        );
+        let vtable_fields = if layout.methods.is_empty() {
+            String::new()
+        } else {
+            std::iter::repeat("ptr")
+                .take(layout.methods.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(
+            ir,
+            "%vtable.{} = type {{ {} }}",
+            sanitize_name(&layout.name),
+            vtable_fields
+        );
+    }
+    if !traits.is_empty() {
+        let _ = writeln!(ir);
+    }
     for layout in structs.values() {
         let field_types = layout
             .fields
@@ -3460,6 +3805,12 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         );
     }
     if !enums.is_empty() {
+        let _ = writeln!(ir);
+    }
+    for global in &trait_vtable_globals {
+        let _ = writeln!(ir, "{}", global);
+    }
+    if !trait_vtable_globals.is_empty() {
         let _ = writeln!(ir);
     }
     for decl in &extra_type_decls {
@@ -4556,6 +4907,141 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "41\n");
+    }
+
+    #[test]
+    fn runs_compiled_trait_object_dynamic_dispatch_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            impl Writer for Counter {}
+
+            function main(): void {
+                writer: Writer = Counter { value: 1 };
+                print(writer.write(4));
+                print(writer.write(7));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "5\n12\n");
+    }
+
+    #[test]
+    fn runs_compiled_trait_object_parameter_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            impl Writer for Counter {}
+
+            function use_writer(writer: Writer): int {
+                return writer.write(9);
+            }
+
+            function main(): void {
+                writer: Writer = Counter { value: 3 };
+                print(use_writer(writer));
+                print(writer.write(1));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "12\n13\n");
+    }
+
+    #[test]
+    fn runs_compiled_function_returning_trait_object_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            impl Writer for Counter {}
+
+            function create_writer(): Writer {
+                return Counter { value: 10 };
+            }
+
+            function main(): void {
+                writer: Writer = create_writer();
+                print(writer.write(2));
+                print(writer.write(5));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "12\n17\n");
+    }
+
+    #[test]
+    fn rejects_trait_object_assignment_for_non_impl_type() {
+        let result = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            struct Plain {
+                value: int;
+            }
+
+            impl Writer for Counter {}
+
+            function main(): void {
+                writer: Writer = Plain { value: 1 };
+                print(writer.write(1));
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Writer"));
     }
 
     #[test]
