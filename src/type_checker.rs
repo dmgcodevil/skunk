@@ -25,7 +25,7 @@ struct StructSymbol {
 #[derive(Debug, PartialEq, Clone)]
 struct EnumVariantSymbol {
     name: String,
-    payload_type: Option<Type>,
+    payload_types: Vec<Type>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -195,7 +195,7 @@ impl GlobalScope {
                                     variant.name.clone(),
                                     EnumVariantSymbol {
                                         name: variant.name.clone(),
-                                        payload_type: variant.payload_type.clone(),
+                                        payload_types: variant.payload_types.clone(),
                                     },
                                 )
                             })
@@ -341,7 +341,7 @@ fn struct_symbol_for_type<'a>(
 enum MatchPatternResolution {
     Enum {
         case_key: String,
-        binding: Option<(String, Type)>,
+        bindings: Vec<(String, Type)>,
     },
     Struct {
         bindings: Vec<(String, Type)>,
@@ -357,7 +357,7 @@ fn resolve_match_pattern(
         crate::ast::MatchPattern::EnumVariant {
             enum_type,
             variant,
-            binding,
+            bindings,
         } => {
             let enum_symbol =
                 enum_symbol_for_type(global_scope, matched_type).ok_or_else(|| {
@@ -381,21 +381,21 @@ fn resolve_match_pattern(
                     enum_symbol.name, variant
                 )
             })?;
-            match (&variant_symbol.payload_type, binding) {
-                (Some(_), None) => {
-                    return Err(format!("variant `{}` requires a payload binding", variant));
-                }
-                (None, Some(_)) => {
-                    return Err(format!(
-                        "unit variant `{}` does not take a payload binding",
-                        variant
-                    ));
-                }
-                _ => {}
+            if variant_symbol.payload_types.len() != bindings.len() {
+                return Err(format!(
+                    "variant `{}` expects {} payload binding(s), got {}",
+                    variant,
+                    variant_symbol.payload_types.len(),
+                    bindings.len()
+                ));
             }
             Ok(MatchPatternResolution::Enum {
                 case_key: variant.clone(),
-                binding: binding.clone().zip(variant_symbol.payload_type.clone()),
+                bindings: bindings
+                    .clone()
+                    .into_iter()
+                    .zip(variant_symbol.payload_types.clone())
+                    .collect(),
             })
         }
         crate::ast::MatchPattern::Struct {
@@ -700,6 +700,7 @@ fn resolve_access(
             Type::Allocator => match member.deref() {
                 Node::FunctionCall {
                     name,
+                    type_arguments: _,
                     arguments,
                     metadata,
                 } if name == "destroy" => {
@@ -721,6 +722,7 @@ fn resolve_access(
                 }
                 Node::FunctionCall {
                     name,
+                    type_arguments: _,
                     arguments,
                     metadata,
                 } if name == "free" => {
@@ -791,6 +793,7 @@ fn resolve_access(
                     }
                     Node::FunctionCall {
                         name,
+                        type_arguments: _,
                         arguments,
                         metadata,
                     } => {
@@ -1150,6 +1153,7 @@ fn resolve_function_call(
 ) -> Result<Type, String> {
     if let Node::FunctionCall {
         name,
+        type_arguments: _,
         arguments,
         metadata,
     } = node
@@ -1771,38 +1775,34 @@ fn resolve_type(
                             metadata.span.line, metadata.span.start, custom_name, name
                         )
                     })?;
-                    match &variant_symbol.payload_type {
-                        Some(payload_type) => {
-                            if arguments.len() != 1 {
-                                return Err(format!(
-                                    "error {}:{}: enum variant `{}` expects one argument",
-                                    metadata.span.line, metadata.span.start, name
-                                ));
-                            }
-                            let arg_type = resolve_type(
-                                global_scope,
-                                symbol_tables,
-                                &arguments[0],
-                                Some(payload_type),
-                            )?;
-                            if !is_assignable(payload_type, &arg_type.sk_type) {
-                                return Err(format!(
-                                    "error {}:{}: enum variant `{}` expected `{}` but got `{}`",
-                                    metadata.span.line,
-                                    metadata.span.start,
-                                    name,
-                                    type_to_string(payload_type),
-                                    type_to_string(&arg_type.sk_type)
-                                ));
-                            }
-                        }
-                        None => {
-                            if !arguments.is_empty() {
-                                return Err(format!(
-                                    "error {}:{}: unit enum variant `{}` expects no arguments",
-                                    metadata.span.line, metadata.span.start, name
-                                ));
-                            }
+                    if arguments.len() != variant_symbol.payload_types.len() {
+                        return Err(format!(
+                            "error {}:{}: enum variant `{}` expects {} argument(s), got {}",
+                            metadata.span.line,
+                            metadata.span.start,
+                            name,
+                            variant_symbol.payload_types.len(),
+                            arguments.len()
+                        ));
+                    }
+                    for (argument, payload_type) in
+                        arguments.iter().zip(variant_symbol.payload_types.iter())
+                    {
+                        let arg_type = resolve_type(
+                            global_scope,
+                            symbol_tables,
+                            argument,
+                            Some(payload_type),
+                        )?;
+                        if !is_assignable(payload_type, &arg_type.sk_type) {
+                            return Err(format!(
+                                "error {}:{}: enum variant `{}` expected `{}` but got `{}`",
+                                metadata.span.line,
+                                metadata.span.start,
+                                name,
+                                type_to_string(payload_type),
+                                type_to_string(&arg_type.sk_type)
+                            ));
                         }
                     }
                     return Ok(ResolveResult::new(_type.clone()));
@@ -1948,8 +1948,8 @@ fn resolve_type(
                 let var_table = symbol_tables.get().clone();
                 symbol_tables.add(var_table);
                 match resolution {
-                    MatchPatternResolution::Enum { binding, .. } => {
-                        if let Some((binding, payload_type)) = binding {
+                    MatchPatternResolution::Enum { bindings, .. } => {
+                        for (binding, payload_type) in bindings {
                             symbol_tables.get_mut().add(Symbol {
                                 name: binding,
                                 sk_type: payload_type,

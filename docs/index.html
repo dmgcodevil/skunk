@@ -298,13 +298,13 @@ function wrap[T](value: T): Box[T] {
                 <ul>
                     <li>Nested instantiations such as <code>Box[Box[int]]</code> are supported.</li>
                     <li>Function type argument inference works from call arguments in common cases.</li>
-                    <li>Explicit function call type arguments are not supported yet.</li>
+                    <li>Explicit function call type arguments are supported with forms like <code>id[int](42)</code>.</li>
                 </ul>
             </section>
 
             <section id="enums-and-match">
                 <h2>Enums and Match</h2>
-                <p>Skunk supports generic enums with unit and single-payload variants, plus exhaustive enum-focused <code>match</code>.</p>
+                <p>Skunk supports generic enums with unit variants and tuple-style payload variants, plus exhaustive enum-focused <code>match</code>.</p>
 <pre><code class="language-skunk">enum Option[T] {
     None;
     Some(T);
@@ -322,8 +322,8 @@ function unwrap(value: Option[int]): int {
 }</code></pre>
                 <ul>
                     <li>Construct variants with forms like <code>Option[int]::None()</code> and <code>Option[int]::Some(7)</code>.</li>
+                    <li>Variants may carry multiple payload values, such as <code>Pair(A, B)</code>.</li>
                     <li><code>match</code> is exhaustiveness-checked for enums.</li>
-                    <li>Enum variants currently carry at most one payload value.</li>
                 </ul>
             </section>
 
@@ -360,8 +360,8 @@ function use_counter[T: Writer + Resettable](counter: *T): int {
                 <ul>
                     <li>Trait conformance is explicit through <code>impl Trait for Type</code>.</li>
                     <li><code>impl Writer, Resettable for Counter {}</code> is grouped syntax sugar.</li>
+                    <li>Impl targets may be concrete or generic, for example <code>impl[T] SizedThing for Box[T] {}</code>.</li>
                     <li>Generic bounds stack with <code>+</code>.</li>
-                    <li>Impl targets are concrete types only in the current version.</li>
                 </ul>
             </section>
 
@@ -397,13 +397,10 @@ function main(): void {
             <section id="current-limitations">
                 <h2>Current Limitations</h2>
                 <ul>
-                    <li>No trait objects or runtime interface values yet.</li>
-                    <li>No generic impl targets yet.</li>
-                    <li>No explicit function call type arguments yet.</li>
+                    <li>Traits are still compile-time only. You cannot yet store a value as “some <code>Writer</code>” and dispatch through it dynamically at runtime.</li>
                     <li>No user-defined allocators, raw pointer operations, or <code>unsafe</code> memory layer yet.</li>
                     <li>No general address-of operator yet.</li>
                     <li>No const struct fields yet.</li>
-                    <li>Enum variants currently support at most one payload value.</li>
                     <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
                 </ul>
             </section>

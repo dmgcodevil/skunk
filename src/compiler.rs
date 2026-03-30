@@ -88,8 +88,8 @@ struct StructLayout {
 struct EnumVariantLayout {
     name: String,
     tag: usize,
-    payload_type: Option<LlvmType>,
-    field_index: Option<usize>,
+    payload_types: Vec<LlvmType>,
+    field_indices: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -279,21 +279,23 @@ fn collect_enum_layouts(
         let mut variant_layouts = Vec::new();
         let mut next_field_index = 1usize;
         for (tag, variant) in variants.iter().enumerate() {
-            let payload_type = variant
-                .payload_type
-                .as_ref()
+            let payload_types = variant
+                .payload_types
+                .iter()
                 .map(|payload_type| llvm_type(payload_type, structs, &enum_placeholders))
-                .transpose()?;
-            let field_index = payload_type.as_ref().map(|_| {
-                let current = next_field_index;
-                next_field_index += 1;
-                current
-            });
+                .collect::<Result<Vec<_>, String>>()?;
+            let field_indices = (0..payload_types.len())
+                .map(|_| {
+                    let current = next_field_index;
+                    next_field_index += 1;
+                    current
+                })
+                .collect::<Vec<_>>();
             variant_layouts.push(EnumVariantLayout {
                 name: variant.name.clone(),
                 tag,
-                payload_type,
-                field_index,
+                payload_types,
+                field_indices,
             });
         }
 
@@ -701,27 +703,33 @@ impl<'a> FunctionCompiler<'a> {
                     self.emit_label(label);
                     self.push_scope();
                     let ast::MatchPattern::EnumVariant {
-                        variant, binding, ..
+                        variant, bindings, ..
                     } = &case.pattern
                     else {
                         return Err("enum match case expected enum pattern".to_string());
                     };
-                    if let Some(binding) = binding {
-                        let variant_layout = enum_layout
-                            .variants
-                            .iter()
-                            .find(|candidate| candidate.name == *variant)
-                            .ok_or_else(|| {
-                                format!("unknown variant `{}` on enum `{}`", variant, enum_name)
-                            })?;
-                        let payload_type =
-                            variant_layout.payload_type.clone().ok_or_else(|| {
-                                format!("variant `{}` does not carry a payload", variant)
-                            })?;
-                        let payload_value = self.extract_enum_payload(&matched, variant_layout)?;
+                    let variant_layout = enum_layout
+                        .variants
+                        .iter()
+                        .find(|candidate| candidate.name == *variant)
+                        .ok_or_else(|| {
+                            format!("unknown variant `{}` on enum `{}`", variant, enum_name)
+                        })?;
+                    if bindings.len() != variant_layout.payload_types.len() {
+                        return Err(format!(
+                            "variant `{}` binding arity does not match payload arity",
+                            variant
+                        ));
+                    }
+                    let payload_values = self.extract_enum_payloads(&matched, variant_layout)?;
+                    for ((binding, payload_type), payload_value) in bindings
+                        .iter()
+                        .zip(variant_layout.payload_types.iter())
+                        .zip(payload_values.into_iter())
+                    {
                         let payload_ptr = self.emit_heap_alloc(payload_type.clone(), binding);
                         self.emit_store(&payload_ptr, &payload_value);
-                        self.declare_local(binding.clone(), payload_ptr, payload_type);
+                        self.declare_local(binding.clone(), payload_ptr, payload_type.clone());
                     }
                     self.compile_statements(&case.body)?;
                     self.pop_scope();
@@ -1225,41 +1233,39 @@ impl<'a> FunctionCompiler<'a> {
             llvm_enum_type.ir(),
             variant.tag
         ));
-        if let Some(payload_type) = &variant.payload_type {
-            if arguments.len() != 1 {
-                return Err(format!(
-                    "enum variant `{}::{}` expects one argument",
-                    enum_name, variant_name
-                ));
-            }
-            let payload = self.compile_expr_with_expected(&arguments[0], Some(payload_type))?;
+        if arguments.len() != variant.payload_types.len() {
+            return Err(format!(
+                "enum variant `{}::{}` expects {} argument(s), got {}",
+                enum_name,
+                variant_name,
+                variant.payload_types.len(),
+                arguments.len()
+            ));
+        }
+        let mut current = with_tag;
+        for ((argument, payload_type), field_index) in arguments
+            .iter()
+            .zip(variant.payload_types.iter())
+            .zip(variant.field_indices.iter())
+        {
+            let payload = self.compile_expr_with_expected(argument, Some(payload_type))?;
             let payload = self.coerce_expr(payload, payload_type, "enum variant payload")?;
-            let full = self.next_temp();
+            let next = self.next_temp();
             self.emit_line(format!(
                 "{} = insertvalue {} {}, {} {}, {}",
-                full,
+                next,
                 llvm_enum_type.ir(),
-                with_tag,
+                current,
                 payload_type.ir(),
                 payload.value,
-                variant.field_index.expect("payload field exists")
+                field_index
             ));
-            Ok(ExprValue {
-                llvm_type: llvm_enum_type,
-                value: full,
-            })
-        } else {
-            if !arguments.is_empty() {
-                return Err(format!(
-                    "unit enum variant `{}::{}` expects no arguments",
-                    enum_name, variant_name
-                ));
-            }
-            Ok(ExprValue {
-                llvm_type: llvm_enum_type,
-                value: with_tag,
-            })
+            current = next;
         }
+        Ok(ExprValue {
+            llvm_type: llvm_enum_type,
+            value: current,
+        })
     }
 
     fn compile_array_literal(
@@ -2734,30 +2740,32 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
-    fn extract_enum_payload(
+    fn extract_enum_payloads(
         &mut self,
         value: &ExprValue,
         variant: &EnumVariantLayout,
-    ) -> Result<ExprValue, String> {
-        let payload_type = variant
-            .payload_type
-            .clone()
-            .ok_or_else(|| format!("variant `{}` does not carry a payload", variant.name))?;
-        let field_index = variant
-            .field_index
-            .ok_or_else(|| format!("variant `{}` has no payload field index", variant.name))?;
-        let temp = self.next_temp();
-        self.emit_line(format!(
-            "{} = extractvalue {} {}, {}",
-            temp,
-            value.llvm_type.ir(),
-            value.value,
-            field_index
-        ));
-        Ok(ExprValue {
-            llvm_type: payload_type,
-            value: temp,
-        })
+    ) -> Result<Vec<ExprValue>, String> {
+        let mut payloads = Vec::new();
+        for (payload_type, field_index) in variant
+            .payload_types
+            .iter()
+            .cloned()
+            .zip(variant.field_indices.iter().copied())
+        {
+            let temp = self.next_temp();
+            self.emit_line(format!(
+                "{} = extractvalue {} {}, {}",
+                temp,
+                value.llvm_type.ir(),
+                value.value,
+                field_index
+            ));
+            payloads.push(ExprValue {
+                llvm_type: payload_type,
+                value: temp,
+            });
+        }
+        Ok(payloads)
     }
 
     fn extract_struct_field_value(
@@ -3059,7 +3067,7 @@ impl<'a> FunctionCompiler<'a> {
                     layout
                         .variants
                         .iter()
-                        .filter_map(|variant| variant.payload_type.as_ref())
+                        .flat_map(|variant| variant.payload_types.iter())
                         .map(|payload_type| self.align_of(payload_type))
                         .max()
                         .unwrap_or(4)
@@ -3107,7 +3115,7 @@ impl<'a> FunctionCompiler<'a> {
                 let mut offset = 4usize;
                 let mut max_align = 4usize;
                 for variant in &layout.variants {
-                    if let Some(payload_type) = &variant.payload_type {
+                    for payload_type in &variant.payload_types {
                         let align = self.align_of(payload_type);
                         max_align = max_align.max(align);
                         offset = align_up(offset, align);
@@ -3440,7 +3448,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     for layout in enums.values() {
         let mut field_types = vec!["i32".to_string()];
         for variant in &layout.variants {
-            if let Some(payload_type) = &variant.payload_type {
+            for payload_type in &variant.payload_types {
                 field_types.push(payload_type.ir());
             }
         }
@@ -4429,6 +4437,37 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_multi_payload_enum_match_program() {
+        let stdout = compile_and_run(
+            r#"
+            enum PairOrNone[A, B] {
+                None;
+                Pair(A, B);
+            }
+
+            function unwrap(value: PairOrNone[int, int]): int {
+                match (value) {
+                    case None: {
+                        return 0;
+                    }
+                    case Pair(a, b): {
+                        return a + b;
+                    }
+                }
+            }
+
+            function main(): void {
+                print(unwrap(PairOrNone[int, int]::None()));
+                print(unwrap(PairOrNone[int, int]::Pair(20, 22)));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "0\n42\n");
+    }
+
+    #[test]
     fn runs_compiled_imported_generic_enum_module_program() {
         let stdout = compile_project_and_run(
             &[
@@ -4517,6 +4556,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "41\n");
+    }
+
+    #[test]
+    fn runs_compiled_generic_impl_target_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait SizedThing {
+                function size(self): int;
+            }
+
+            struct Box[T] {
+                value: T;
+
+                function size(self): int {
+                    return 1;
+                }
+            }
+
+            impl[T] SizedThing for Box[T] {}
+
+            function measure[T: SizedThing](value: T): int {
+                return value.size();
+            }
+
+            function main(): void {
+                print(measure(Box[int] { value: 7 }));
+                print(measure(Box[string] { value: "x" }));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "1\n1\n");
+    }
+
+    #[test]
+    fn runs_compiled_explicit_generic_function_call_program() {
+        let stdout = compile_and_run(
+            r#"
+            function id[T](value: T): T {
+                return value;
+            }
+
+            function main(): void {
+                print(id[int](42));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "42\n");
     }
 
     #[test]

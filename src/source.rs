@@ -413,15 +413,30 @@ impl ModuleNormalizer {
                 }
             }
             Node::ImplDeclaration {
+                generic_params,
+                generic_bounds,
                 trait_names,
                 target_type,
-            } => Node::ImplDeclaration {
-                trait_names: trait_names
+            } => {
+                let mut type_scope = HashSet::new();
+                for param in &generic_params {
+                    type_scope.insert(param.clone());
+                }
+                type_scopes.push(type_scope);
+                let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let trait_names = trait_names
                     .into_iter()
                     .map(|name| self.rename_type_name(&name, type_scopes))
-                    .collect(),
-                target_type: self.rename_type(target_type, value_scopes, type_scopes)?,
-            },
+                    .collect();
+                let target_type = self.rename_type(target_type, value_scopes, type_scopes)?;
+                type_scopes.pop();
+                Node::ImplDeclaration {
+                    generic_params,
+                    generic_bounds,
+                    trait_names,
+                    target_type,
+                }
+            }
             Node::StructDeclaration {
                 name,
                 fields,
@@ -511,12 +526,13 @@ impl ModuleNormalizer {
                     .map(|variant| {
                         Ok(ast::EnumVariant {
                             name: variant.name,
-                            payload_type: variant
-                                .payload_type
+                            payload_types: variant
+                                .payload_types
+                                .into_iter()
                                 .map(|payload_type| {
                                     self.rename_type(payload_type, value_scopes, type_scopes)
                                 })
-                                .transpose()?,
+                                .collect::<Result<Vec<_>, String>>()?,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -550,12 +566,13 @@ impl ModuleNormalizer {
                     .map(|variant| {
                         Ok(ast::EnumVariant {
                             name: variant.name,
-                            payload_type: variant
-                                .payload_type
+                            payload_types: variant
+                                .payload_types
+                                .into_iter()
                                 .map(|payload_type| {
                                     self.rename_type(payload_type, value_scopes, type_scopes)
                                 })
-                                .transpose()?,
+                                .collect::<Result<Vec<_>, String>>()?,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -595,11 +612,10 @@ impl ModuleNormalizer {
                         value_scopes.push(HashSet::new());
                         let scope = value_scopes.last_mut().expect("case scope exists");
                         match &pattern {
-                            ast::MatchPattern::EnumVariant {
-                                binding: Some(binding),
-                                ..
-                            } => {
-                                scope.insert(binding.clone());
+                            ast::MatchPattern::EnumVariant { bindings, .. } => {
+                                for binding in bindings {
+                                    scope.insert(binding.clone());
+                                }
                             }
                             ast::MatchPattern::Struct { fields, .. } => {
                                 for field in fields {
@@ -725,10 +741,15 @@ impl ModuleNormalizer {
             },
             Node::FunctionCall {
                 name,
+                type_arguments,
                 arguments,
                 metadata,
             } => Node::FunctionCall {
                 name: self.rename_value_name(&name, value_scopes),
+                type_arguments: type_arguments
+                    .into_iter()
+                    .map(|type_argument| self.rename_type(type_argument, value_scopes, type_scopes))
+                    .collect::<Result<Vec<_>, String>>()?,
                 arguments: arguments
                     .into_iter()
                     .map(|group| {
@@ -764,10 +785,17 @@ impl ModuleNormalizer {
                 member: Box::new(match *member {
                     Node::FunctionCall {
                         name,
+                        type_arguments,
                         arguments,
                         metadata,
                     } => Node::FunctionCall {
                         name,
+                        type_arguments: type_arguments
+                            .into_iter()
+                            .map(|type_argument| {
+                                self.rename_type(type_argument, value_scopes, type_scopes)
+                            })
+                            .collect::<Result<Vec<_>, String>>()?,
                         arguments: arguments
                             .into_iter()
                             .map(|group| {
@@ -869,13 +897,13 @@ impl ModuleNormalizer {
             ast::MatchPattern::EnumVariant {
                 enum_type,
                 variant,
-                binding,
+                bindings,
             } => ast::MatchPattern::EnumVariant {
                 enum_type: enum_type
                     .map(|enum_type| self.rename_type(enum_type, value_scopes, type_scopes))
                     .transpose()?,
                 variant,
-                binding,
+                bindings,
             },
             ast::MatchPattern::Struct {
                 struct_type,

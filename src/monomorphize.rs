@@ -37,6 +37,8 @@ struct TraitTemplate {
 
 #[derive(Clone)]
 struct ImplTemplate {
+    generic_params: Vec<String>,
+    generic_bounds: HashMap<String, Vec<String>>,
     trait_names: Vec<String>,
     target_type: Type,
 }
@@ -246,10 +248,14 @@ impl Monomorphizer {
                     );
                 }
                 Node::ImplDeclaration {
+                    generic_params,
+                    generic_bounds,
                     trait_names,
                     target_type,
                 } => {
                     impls.push(ImplTemplate {
+                        generic_params: generic_params.clone(),
+                        generic_bounds: generic_bounds.clone(),
                         trait_names: trait_names.clone(),
                         target_type: target_type.clone(),
                     });
@@ -357,7 +363,7 @@ impl Monomorphizer {
     fn validate_impls(&mut self) -> Result<(), String> {
         let impls = self.impls.clone();
         for impl_block in impls {
-            self.validate_impl_target_type(&impl_block.target_type)?;
+            self.validate_impl_target_type(&impl_block.target_type, &impl_block.generic_params)?;
             let target_key = ast::type_to_string(&impl_block.target_type);
             for trait_name in impl_block.trait_names {
                 let trait_template = self
@@ -366,26 +372,32 @@ impl Monomorphizer {
                     .cloned()
                     .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
                 self.validate_trait_implementation(&trait_template, &impl_block.target_type)?;
-                let implemented = self
-                    .implemented_traits
-                    .entry(target_key.clone())
-                    .or_default();
-                if !implemented.insert(trait_name.clone()) {
-                    return Err(format!(
-                        "duplicate impl of trait `{}` for `{}`",
-                        trait_name, target_key
-                    ));
+                if impl_block.generic_params.is_empty() {
+                    let implemented = self
+                        .implemented_traits
+                        .entry(target_key.clone())
+                        .or_default();
+                    if !implemented.insert(trait_name.clone()) {
+                        return Err(format!(
+                            "duplicate impl of trait `{}` for `{}`",
+                            trait_name, target_key
+                        ));
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    fn validate_impl_target_type(&self, sk_type: &Type) -> Result<(), String> {
+    fn validate_impl_target_type(
+        &self,
+        sk_type: &Type,
+        generic_params: &[String],
+    ) -> Result<(), String> {
         let sk_type = ast::unwrap_binding_const(sk_type);
         match sk_type {
-            Type::BindingConst { inner } => self.validate_impl_target_type(inner),
-            Type::Const { inner } => self.validate_impl_target_type(inner),
+            Type::BindingConst { inner } => self.validate_impl_target_type(inner, generic_params),
+            Type::Const { inner } => self.validate_impl_target_type(inner, generic_params),
             Type::Void => Err("cannot implement traits for `void`".to_string()),
             Type::Byte
             | Type::Short
@@ -398,6 +410,7 @@ impl Monomorphizer {
             | Type::Char
             | Type::Allocator
             | Type::Arena => Ok(()),
+            Type::Custom(name) if generic_params.iter().any(|param| param == name) => Ok(()),
             Type::Custom(name) => {
                 if self.concrete_structs.contains_key(name)
                     || self.concrete_enums.contains_key(name)
@@ -414,22 +427,33 @@ impl Monomorphizer {
                     Err(format!("unknown impl target type `{}`", name))
                 }
             }
-            Type::Array { elem_type, .. } => self.validate_impl_target_type(elem_type),
-            Type::Pointer { target_type } => self.validate_impl_target_type(target_type),
-            Type::Slice { elem_type } => self.validate_impl_target_type(elem_type),
+            Type::Array { elem_type, .. } => self.validate_impl_target_type(elem_type, generic_params),
+            Type::Pointer { target_type } => {
+                self.validate_impl_target_type(target_type, generic_params)
+            }
+            Type::Slice { elem_type } => self.validate_impl_target_type(elem_type, generic_params),
             Type::Function {
                 parameters,
                 return_type,
             } => {
                 for parameter in parameters {
-                    self.validate_impl_target_type(parameter)?;
+                    self.validate_impl_target_type(parameter, generic_params)?;
                 }
-                self.validate_impl_target_type(return_type)
+                self.validate_impl_target_type(return_type, generic_params)
             }
-            Type::GenericInstance { base, .. } => Err(format!(
-                "impl targets do not support generic instances yet: `{}`",
-                base
-            )),
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => {
+                if !(self.generic_structs.contains_key(base) || self.generic_enums.contains_key(base))
+                {
+                    return Err(format!("unknown generic nominal type `{}`", base));
+                }
+                for type_argument in type_arguments {
+                    self.validate_impl_target_type(type_argument, generic_params)?;
+                }
+                Ok(())
+            }
             Type::SkSelf | Type::MutSelf => Err("`self` is not a valid impl target".to_string()),
         }
     }
@@ -506,21 +530,71 @@ impl Monomorphizer {
             let actual_type = substitutions
                 .get(param)
                 .ok_or_else(|| format!("missing type argument `{}` for {}", param, context))?;
-            let actual_key = ast::type_to_string(actual_type);
             for trait_name in trait_names {
-                let implemented = self
-                    .implemented_traits
-                    .get(&actual_key)
-                    .is_some_and(|traits| traits.contains(trait_name));
+                let implemented = self.type_implements_trait(actual_type, trait_name)?;
                 if !implemented {
                     return Err(format!(
                         "{} requires `{}` to implement trait `{}`, but `{}` does not",
-                        context, param, trait_name, actual_key
+                        context,
+                        param,
+                        trait_name,
+                        ast::type_to_string(actual_type)
                     ));
                 }
             }
         }
         Ok(())
+    }
+
+    fn type_implements_trait(&self, actual_type: &Type, trait_name: &str) -> Result<bool, String> {
+        let actual_key = ast::type_to_string(actual_type);
+        if self
+            .implemented_traits
+            .get(&actual_key)
+            .is_some_and(|traits| traits.contains(trait_name))
+        {
+            return Ok(true);
+        }
+
+        let mut matched = false;
+        for impl_block in &self.impls {
+            if !impl_block.trait_names.iter().any(|name| name == trait_name) {
+                continue;
+            }
+            if impl_block.generic_params.is_empty() {
+                continue;
+            }
+            let mut substitutions = HashMap::new();
+            if self
+                .unify_generic_type(
+                    &impl_block.target_type,
+                    actual_type,
+                    &impl_block.generic_params,
+                    &mut substitutions,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            self.check_trait_bounds(
+                &impl_block.generic_bounds,
+                &substitutions,
+                &format!(
+                    "generic impl of trait `{}` for `{}`",
+                    trait_name,
+                    ast::type_to_string(&impl_block.target_type)
+                ),
+            )?;
+            if matched {
+                return Err(format!(
+                    "multiple impls of trait `{}` match `{}`",
+                    trait_name, actual_key
+                ));
+            }
+            matched = true;
+        }
+
+        Ok(matched)
     }
 
     fn transform_named_function(
@@ -650,14 +724,14 @@ impl Monomorphizer {
             .map(|variant| {
                 Ok(ast::EnumVariant {
                     name: variant.name.clone(),
-                    payload_type: variant
-                        .payload_type
-                        .as_ref()
+                    payload_types: variant
+                        .payload_types
+                        .iter()
                         .map(|payload_type| {
                             let substituted = self.apply_substitutions(payload_type, substitutions);
                             self.concretize_type(&substituted)
                         })
-                        .transpose()?,
+                        .collect::<Result<Vec<_>, String>>()?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -888,13 +962,19 @@ impl Monomorphizer {
                 for case in cases {
                     env.push();
                     match &case.pattern {
-                        ast::MatchPattern::EnumVariant { binding, .. } => {
-                            if let Some(binding) = binding {
-                                if let Some(payload_type) = self
-                                    .lookup_enum_variant_payload_type(&value_type, &case.pattern)?
-                                {
-                                    env.insert(binding.clone(), payload_type);
-                                }
+                        ast::MatchPattern::EnumVariant { bindings, .. } => {
+                            let payload_types =
+                                self.lookup_enum_variant_payload_types(&value_type, &case.pattern)?;
+                            if bindings.len() != payload_types.len() {
+                                return Err(format!(
+                                    "match pattern binding count does not match enum payload arity for `{}`",
+                                    ast::type_to_string(&value_type)
+                                ));
+                            }
+                            for (binding, payload_type) in
+                                bindings.iter().cloned().zip(payload_types.into_iter())
+                            {
+                                env.insert(binding, payload_type);
                             }
                         }
                         ast::MatchPattern::Struct { .. } => {
@@ -1296,34 +1376,26 @@ impl Monomorphizer {
                     Type::Custom(_) | Type::GenericInstance { .. }
                         if self.lookup_enum_variant(&internal_type, name)?.is_some() =>
                     {
-                        let payload_type = self.lookup_enum_variant(&internal_type, name)?.unwrap();
-                        match payload_type {
-                            Some(payload_type) => {
-                                if arguments.len() != 1 {
-                                    return Err(format!(
-                                        "enum variant constructor `{}::{}` expects one argument",
-                                        ast::type_to_string(&internal_type),
-                                        name
-                                    ));
-                                }
-                                let (argument, _) = self.transform_expr(
-                                    &arguments[0],
-                                    env,
-                                    Some(&payload_type),
-                                    substitutions,
-                                    self_type.clone(),
-                                )?;
-                                output_args.push(argument);
-                            }
-                            None => {
-                                if !arguments.is_empty() {
-                                    return Err(format!(
-                                        "unit enum variant constructor `{}::{}` expects no arguments",
-                                        ast::type_to_string(&internal_type),
-                                        name
-                                    ));
-                                }
-                            }
+                        let payload_types =
+                            self.lookup_enum_variant(&internal_type, name)?.unwrap_or_default();
+                        if arguments.len() != payload_types.len() {
+                            return Err(format!(
+                                "enum variant constructor `{}::{}` expects {} argument(s), got {}",
+                                ast::type_to_string(&internal_type),
+                                name,
+                                payload_types.len(),
+                                arguments.len()
+                            ));
+                        }
+                        for (argument, payload_type) in arguments.iter().zip(payload_types.iter()) {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                Some(payload_type),
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
                         }
                         internal_type.clone()
                     }
@@ -1347,10 +1419,12 @@ impl Monomorphizer {
             }
             Node::FunctionCall {
                 name,
+                type_arguments,
                 arguments,
                 metadata,
             } => self.transform_function_call(
                 name,
+                type_arguments,
                 arguments,
                 metadata,
                 env,
@@ -1462,9 +1536,16 @@ impl Monomorphizer {
                             }
                             Node::FunctionCall {
                                 name: method_name,
+                                type_arguments,
                                 arguments,
                                 metadata: call_metadata,
                             } => {
+                                if !type_arguments.is_empty() {
+                                    return Err(format!(
+                                        "generic method calls are not supported yet: `{}[...]`",
+                                        method_name
+                                    ));
+                                }
                                 if current_type == Type::Allocator {
                                     let mut output_args = Vec::<Vec<Node>>::new();
                                     let return_type = match method_name.as_str() {
@@ -1527,6 +1608,7 @@ impl Monomorphizer {
                                     output_nodes.push(Node::MemberAccess {
                                         member: Box::new(Node::FunctionCall {
                                             name: method_name.clone(),
+                                            type_arguments: Vec::new(),
                                             arguments: output_args,
                                             metadata: call_metadata.clone(),
                                         }),
@@ -1562,6 +1644,7 @@ impl Monomorphizer {
                                     output_nodes.push(Node::MemberAccess {
                                         member: Box::new(Node::FunctionCall {
                                             name: method_name.clone(),
+                                            type_arguments: Vec::new(),
                                             arguments: arguments.clone(),
                                             metadata: call_metadata.clone(),
                                         }),
@@ -1611,6 +1694,7 @@ impl Monomorphizer {
                                 output_nodes.push(Node::MemberAccess {
                                     member: Box::new(Node::FunctionCall {
                                         name: method_name.clone(),
+                                        type_arguments: Vec::new(),
                                         arguments: output_args,
                                         metadata: call_metadata.clone(),
                                     }),
@@ -1737,7 +1821,7 @@ impl Monomorphizer {
             ast::MatchPattern::EnumVariant {
                 enum_type,
                 variant,
-                binding,
+                bindings,
             } => Ok(ast::MatchPattern::EnumVariant {
                 enum_type: if let Some(enum_type) = enum_type {
                     Some(self.concretize_type(&self.apply_substitutions(enum_type, substitutions))?)
@@ -1748,7 +1832,7 @@ impl Monomorphizer {
                     }
                 },
                 variant: variant.clone(),
-                binding: binding.clone(),
+                bindings: bindings.clone(),
             }),
             ast::MatchPattern::Struct {
                 struct_type,
@@ -1765,14 +1849,14 @@ impl Monomorphizer {
         &mut self,
         enum_type: &Type,
         variant_name: &str,
-    ) -> Result<Option<Option<Type>>, String> {
+    ) -> Result<Option<Vec<Type>>, String> {
         match enum_type {
             Type::Custom(name) => Ok(self.concrete_enums.get(name).and_then(|template| {
                 template
                     .variants
                     .iter()
                     .find(|variant| variant.name == variant_name)
-                    .map(|variant| variant.payload_type.clone())
+                    .map(|variant| variant.payload_types.clone())
             })),
             Type::GenericInstance {
                 base,
@@ -1793,25 +1877,29 @@ impl Monomorphizer {
                     .iter()
                     .find(|variant| variant.name == variant_name)
                     .map(|variant| {
-                        variant.payload_type.as_ref().map(|payload_type| {
-                            self.apply_substitutions(payload_type, &substitutions)
-                        })
+                        variant
+                            .payload_types
+                            .iter()
+                            .map(|payload_type| {
+                                self.apply_substitutions(payload_type, &substitutions)
+                            })
+                            .collect::<Vec<_>>()
                     }))
             }
             _ => Ok(None),
         }
     }
 
-    fn lookup_enum_variant_payload_type(
+    fn lookup_enum_variant_payload_types(
         &mut self,
         enum_type: &Type,
         pattern: &ast::MatchPattern,
-    ) -> Result<Option<Type>, String> {
+    ) -> Result<Vec<Type>, String> {
         match pattern {
             ast::MatchPattern::EnumVariant { variant, .. } => self
                 .lookup_enum_variant(enum_type, variant)
-                .map(|payload| payload.flatten()),
-            ast::MatchPattern::Struct { .. } => Ok(None),
+                .map(|payload| payload.unwrap_or_default()),
+            ast::MatchPattern::Struct { .. } => Ok(Vec::new()),
         }
     }
 
@@ -1844,6 +1932,7 @@ impl Monomorphizer {
     fn transform_function_call(
         &mut self,
         name: &str,
+        explicit_type_arguments: &[Type],
         arguments: &[Vec<Node>],
         metadata: &Metadata,
         env: &mut Env,
@@ -1868,8 +1957,29 @@ impl Monomorphizer {
         }
 
         if let Some(template) = self.generic_functions.get(name).cloned() {
-            let substitutions =
-                self.infer_generic_function_arguments(&template, &argument_types, expected_type)?;
+            let substitutions = if explicit_type_arguments.is_empty() {
+                self.infer_generic_function_arguments(&template, &argument_types, expected_type)?
+            } else {
+                if template.generic_params.len() != explicit_type_arguments.len() {
+                    return Err(format!(
+                        "generic function `{}` expects {} type arguments, got {}",
+                        template.name,
+                        template.generic_params.len(),
+                        explicit_type_arguments.len()
+                    ));
+                }
+                template
+                    .generic_params
+                    .iter()
+                    .cloned()
+                    .zip(
+                        explicit_type_arguments
+                            .iter()
+                            .map(|arg| self.concretize_type(&self.apply_substitutions(arg, substitutions)))
+                            .collect::<Result<Vec<_>, String>>()?,
+                    )
+                    .collect::<HashMap<_, _>>()
+            };
             self.check_trait_bounds(
                 &template.generic_bounds,
                 &substitutions,
@@ -1885,10 +1995,18 @@ impl Monomorphizer {
             return Ok((
                 Node::FunctionCall {
                     name: specialized_name,
+                    type_arguments: Vec::new(),
                     arguments: output_args,
                     metadata: metadata.clone(),
                 },
                 result_type,
+            ));
+        }
+
+        if !explicit_type_arguments.is_empty() {
+            return Err(format!(
+                "function `{}` does not accept explicit type arguments",
+                name
             ));
         }
 
@@ -1912,6 +2030,7 @@ impl Monomorphizer {
         Ok((
             Node::FunctionCall {
                 name: name.to_string(),
+                type_arguments: Vec::new(),
                 arguments: output_args,
                 metadata: metadata.clone(),
             },
@@ -2927,7 +3046,9 @@ mod tests {
             statement,
             Node::EnumDeclaration { name, variants }
                 if name == "Option__int"
-                    && variants.iter().any(|variant| variant.name == "Some" && variant.payload_type == Some(Type::Int))
+                    && variants
+                        .iter()
+                        .any(|variant| variant.name == "Some" && variant.payload_types == vec![Type::Int])
         )));
         assert!(statements.iter().any(|statement| matches!(
             statement,

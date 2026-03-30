@@ -35,6 +35,8 @@ pub enum Node {
         methods: Vec<TraitMethodSignature>,
     },
     ImplDeclaration {
+        generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
         trait_names: Vec<String>,
         target_type: Type,
     },
@@ -125,6 +127,7 @@ pub enum Node {
     },
     FunctionCall {
         name: String,              // The function name
+        type_arguments: Vec<Type>,
         arguments: Vec<Vec<Node>>, // The arguments are a list of expression nodes
         metadata: Metadata,
     },
@@ -159,7 +162,7 @@ pub enum Node {
 #[derive(Debug, PartialEq, Clone)]
 pub struct EnumVariant {
     pub name: String,
-    pub payload_type: Option<Type>,
+    pub payload_types: Vec<Type>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -186,7 +189,7 @@ pub enum MatchPattern {
     EnumVariant {
         enum_type: Option<Type>,
         variant: String,
-        binding: Option<String>,
+        bindings: Vec<String>,
     },
     Struct {
         struct_type: Type,
@@ -612,14 +615,28 @@ impl PestImpl {
 
     fn create_function_call(&self, pair: Pair<Rule>) -> Node {
         let metadata = (self.metadata_creator)(&pair);
-        let mut inner_pairs = pair.into_inner();
+        let mut inner_pairs = pair.into_inner().peekable();
         let name = inner_pairs.next().unwrap().as_str().to_string();
+        let type_arguments = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::type_arg_list)
+        {
+            inner_pairs
+                .next()
+                .unwrap()
+                .into_inner()
+                .map(|pair| self.create_type(pair))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let mut arguments = Vec::new();
         while let Some(arg_list) = inner_pairs.next() {
             arguments.push(self.create_arg_list(arg_list));
         }
         Node::FunctionCall {
             name,
+            type_arguments,
             arguments,
             metadata,
         }
@@ -982,11 +999,11 @@ impl PestImpl {
             None
         };
         let variant = inner_pairs.next().unwrap().as_str().to_string();
-        let binding = inner_pairs.next().map(|p| p.as_str().to_string());
+        let bindings = inner_pairs.map(|p| p.as_str().to_string()).collect::<Vec<_>>();
         MatchPattern::EnumVariant {
             enum_type,
             variant,
-            binding,
+            bindings,
         }
     }
 
@@ -1169,13 +1186,24 @@ impl PestImpl {
 
     fn create_impl_decl(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::impl_decl);
-        let mut inner_pairs = pair.into_inner().collect::<Vec<_>>();
-        let target_type = self.create_type(inner_pairs.pop().unwrap());
-        let trait_names = inner_pairs
+        let mut inner_pairs = pair.into_inner().peekable();
+        let (generic_params, generic_bounds) = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
+        {
+            self.create_generic_params(inner_pairs.next().unwrap())
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+        let mut rest = inner_pairs.collect::<Vec<_>>();
+        let target_type = self.create_type(rest.pop().unwrap());
+        let trait_names = rest
             .into_iter()
             .map(|p| p.as_str().to_string())
             .collect();
         Node::ImplDeclaration {
+            generic_params,
+            generic_bounds,
             trait_names,
             target_type,
         }
@@ -1185,8 +1213,11 @@ impl PestImpl {
         assert_eq!(pair.as_rule(), Rule::enum_variant_decl);
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
-        let payload_type = inner_pairs.next().map(|p| self.create_type(p));
-        EnumVariant { name, payload_type }
+        let payload_types = inner_pairs.map(|p| self.create_type(p)).collect::<Vec<_>>();
+        EnumVariant {
+            name,
+            payload_types,
+        }
     }
 
     fn create_struct_field_dec(&self, pair: Pair<Rule>) -> (String, Type) {
@@ -1880,6 +1911,7 @@ mod tests {
                         var_type: Type::Int,
                         value: Some(Box::new(Node::FunctionCall {
                             name: "f".to_string(),
+                            type_arguments: vec![],
                             arguments: [[].to_vec()].to_vec(),
                             metadata: Metadata::EMPTY
                         })),
@@ -2059,6 +2091,7 @@ mod tests {
                             var_type: Type::Int,
                             value: Some(Box::new(Node::FunctionCall {
                                 name: "sum".to_string(),
+                                type_arguments: vec![],
                                 arguments: Vec::from([Vec::from([
                                     Node::Literal(Literal::Integer(1)),
                                     Node::Literal(Literal::Integer(2))
@@ -2722,6 +2755,7 @@ mod tests {
                     },
                     Node::FunctionCall {
                         name: "test".to_string(),
+                        type_arguments: vec![],
                         arguments: vec![vec![]],
                         metadata: Metadata::EMPTY
                     },
@@ -3335,8 +3369,34 @@ mod tests {
                     }],
                 },
                 Node::ImplDeclaration {
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
                     trait_names: vec!["Writer".to_string()],
                     target_type: Type::Custom("TextWriter".to_string()),
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_impl_declaration() {
+        let source_code = r#"
+            impl[T] Writer for Box[T] {}
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::ImplDeclaration {
+                    generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::new(),
+                    trait_names: vec!["Writer".to_string()],
+                    target_type: Type::GenericInstance {
+                        base: "Box".to_string(),
+                        type_arguments: vec![Type::Custom("T".to_string())],
+                    },
                 },
                 Node::EOI,
             ],
@@ -3396,6 +3456,89 @@ mod tests {
                         nodes: vec![Node::Identifier("value".to_string())],
                     })))],
                     lambda: false,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_explicit_generic_function_call() {
+        let source_code = r#"
+            value: int = id[int](7);
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    name: "value".to_string(),
+                    var_type: Type::Int,
+                    value: Some(Box::new(Node::FunctionCall {
+                        name: "id".to_string(),
+                        type_arguments: vec![Type::Int],
+                        arguments: vec![vec![Node::Literal(Literal::Integer(7))]],
+                        metadata: Metadata::EMPTY,
+                    })),
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_enum_multi_payload_declaration_and_match() {
+        let source_code = r#"
+            enum PairOrNone[A, B] {
+                None;
+                Pair(A, B);
+            }
+
+            match (value) {
+                case Pair(a, b): {
+                    print(a);
+                }
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericEnumDeclaration {
+                    name: "PairOrNone".to_string(),
+                    generic_params: vec!["A".to_string(), "B".to_string()],
+                    generic_bounds: HashMap::new(),
+                    variants: vec![
+                        EnumVariant {
+                            name: "None".to_string(),
+                            payload_types: vec![],
+                        },
+                        EnumVariant {
+                            name: "Pair".to_string(),
+                            payload_types: vec![
+                                Type::Custom("A".to_string()),
+                                Type::Custom("B".to_string()),
+                            ],
+                        },
+                    ],
+                },
+                Node::Match {
+                    value: Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("value".to_string())],
+                    }),
+                    cases: vec![MatchCase {
+                        pattern: MatchPattern::EnumVariant {
+                            enum_type: None,
+                            variant: "Pair".to_string(),
+                            bindings: vec!["a".to_string(), "b".to_string()],
+                        },
+                        body: vec![Node::Print(Box::new(Node::Access {
+                            nodes: vec![Node::Identifier("a".to_string())],
+                        }))],
+                    }],
                 },
                 Node::EOI,
             ],
@@ -3572,6 +3715,7 @@ mod tests {
                             Node::MemberAccess {
                                 member: Box::new(Node::FunctionCall {
                                     name: "f".to_string(),
+                                    type_arguments: vec![],
                                     arguments: [[].to_vec()].to_vec(),
                                     metadata: Metadata::EMPTY
                                 }),
@@ -4038,6 +4182,7 @@ mod tests {
                 statements: Vec::from([
                     Node::FunctionCall {
                         name: "f".to_string(),
+                        type_arguments: vec![],
                         arguments: vec![vec![Node::FunctionDeclaration {
                             name: "anonymous".to_string(),
                             parameters: vec![],
@@ -4097,6 +4242,7 @@ mod tests {
                         },
                         value: Some(Box::new(Node::FunctionCall {
                             name: "f".to_string(),
+                            type_arguments: vec![],
                             arguments: vec![vec![]],
                             metadata: Metadata::EMPTY
                         })),
@@ -4104,6 +4250,7 @@ mod tests {
                     },
                     Node::FunctionCall {
                         name: "g".to_string(),
+                        type_arguments: vec![],
                         arguments: vec![vec![Node::Literal(Literal::Integer(47))]],
                         metadata: Metadata::EMPTY,
                     },
@@ -4125,6 +4272,7 @@ mod tests {
                 statements: Vec::from([
                     Node::FunctionCall {
                         name: "f".to_string(),
+                        type_arguments: vec![],
                         arguments: vec![
                             vec![],
                             vec![Node::Literal(Literal::Integer(1))],

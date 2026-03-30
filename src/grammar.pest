@@ -42,6 +42,7 @@ mut_kw          = { "mut" }
 trait_bound     = { IDENTIFIER }
 generic_param   = { IDENTIFIER ~ (":" ~ trait_bound ~ ("+" ~ trait_bound)*)? }
 generic_params  = { "[" ~ generic_param ~ ("," ~ generic_param)* ~ "]" }
+type_arg_list   = { "[" ~ _type ~ ("," ~ _type)* ~ "]" }
 nominal_type    = { IDENTIFIER ~ ("[" ~ _type ~ ("," ~ _type)* ~ "]")? }
 base_type       = { builtin_type | nominal_type }
 legacy_array_dim = { "[" ~ expression ~ "]" }
@@ -81,14 +82,14 @@ struct_destructure_stmt = { struct_destructure ~ ";"? }
 func_decl         = { "function" ~ IDENTIFIER ~ generic_params? ~ (member_func_params | static_func_params) ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 trait_method_decl = { "function" ~ IDENTIFIER ~ member_func_params ~ optional_return_type ~ ";" }
 trait_decl        = { "trait" ~ IDENTIFIER ~ "{" ~ trait_method_decl* ~ "}" }
-impl_decl         = { "impl" ~ IDENTIFIER ~ ("," ~ IDENTIFIER)* ~ "for" ~ _type ~ "{" ~ "}" }
+impl_decl         = { "impl" ~ generic_params? ~ IDENTIFIER ~ ("," ~ IDENTIFIER)* ~ "for" ~ _type ~ "{" ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
 param_list        = { (param_decl ~ ("," ~ param_decl)*) }
 param_type_list   = { (_type ~ ("," ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ generic_params? ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
 struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }
 enum_decl         = { "enum" ~ IDENTIFIER ~ generic_params? ~ "{" ~ enum_variant_decl* ~ "}" }
-enum_variant_decl = { IDENTIFIER ~ ("(" ~ _type ~ ")")? ~ ";" }
+enum_variant_decl = { IDENTIFIER ~ ("(" ~ _type ~ ("," ~ _type)* ~ ")")? ~ ";" }
 
 lambda_expr       = { "function" ~ static_func_params ~ optional_return_type ~ "{" ~ statement* ~ "}" }
 
@@ -127,7 +128,7 @@ for_infinite = { "(" ~ expression? ~ ")" }
 match_expr       = { "match" ~ "(" ~ expression ~ ")" ~ "{" ~ match_case+ ~ "}" }
 match_case       = { "case" ~ match_pattern ~ ":" ~ "{" ~ statement* ~ "}" }
 match_pattern    = { struct_match_pattern | enum_match_pattern }
-enum_match_pattern = { (nominal_type ~ "::")? ~ IDENTIFIER ~ ("(" ~ IDENTIFIER ~ ")")? }
+enum_match_pattern = { (nominal_type ~ "::")? ~ IDENTIFIER ~ ("(" ~ IDENTIFIER ~ ("," ~ IDENTIFIER)* ~ ")")? }
 struct_match_pattern = { nominal_type ~ "{" ~ struct_pattern_fields ~ "}" }
 
 // I/O and Return
@@ -144,7 +145,7 @@ primary         = { lambda_expr | unary_op | literal | static_func_call | func_c
 
 literal         = { FLOAT_LITERAL | DOUBLE_LITERAL | LONG_LITERAL | INTEGER | STRING_LITERAL | BOOLEAN_LITERAL | CHAR_LITERAL }
 arg_list        = { (expression ~ ("," ~ expression)*)? }
-func_call       = { IDENTIFIER ~ ("(" ~ arg_list ~ ")")+ }
+func_call       = { IDENTIFIER ~ type_arg_list? ~ ("(" ~ arg_list ~ ")")+ }
 
 member_access = { "." ~ (func_call | IDENTIFIER) }
 access_step = { slice_access | array_access | member_access }
