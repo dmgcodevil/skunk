@@ -2071,6 +2071,9 @@ pub fn evaluate_node(
                     Value::Boolean(val) => Value::Boolean(!val),
                     _ => panic!("Unary negate is only supported for booleans"),
                 }),
+                ast::UnaryOperator::AddressOf => {
+                    panic!("address-of is not supported in the legacy interpreter")
+                }
             }
         }
         Node::BinaryOp {

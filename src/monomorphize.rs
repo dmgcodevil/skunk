@@ -964,6 +964,22 @@ impl Monomorphizer {
                 env.pop();
                 Ok((Node::Block { statements: output }, Some(Type::Void)))
             }
+            Node::UnsafeBlock { statements } => {
+                env.push();
+                let mut output = Vec::new();
+                for statement in statements {
+                    let (statement, _) = self.transform_statement(
+                        statement,
+                        env,
+                        expected_return_type,
+                        substitutions,
+                        self_type.clone(),
+                    )?;
+                    output.push(statement);
+                }
+                env.pop();
+                Ok((Node::UnsafeBlock { statements: output }, Some(Type::Void)))
+            }
             Node::If {
                 condition,
                 body,
@@ -1186,6 +1202,7 @@ impl Monomorphizer {
             | Node::ArrayInit { .. }
             | Node::StructInitialization { .. }
             | Node::StaticFunctionCall { .. }
+            | Node::Dereference { .. }
             | Node::Literal(_)
             | Node::Identifier(_)
             | Node::BinaryOp { .. }
@@ -1278,6 +1295,9 @@ impl Monomorphizer {
         self_type: Option<Type>,
     ) -> Result<(Node, Type), String> {
         match node {
+            Node::Dereference { .. } => {
+                Err("access steps should be nested inside `Node::Access`".to_string())
+            }
             Node::Literal(literal) => {
                 Ok((node.clone(), self.literal_type(literal, expected_type)?))
             }
@@ -1387,9 +1407,50 @@ impl Monomorphizer {
                 let internal_type = self.apply_substitutions(_type, substitutions);
                 let output_type = self.concretize_type(&internal_type)?;
                 let mut output_args = Vec::new();
+                if name == "size_of" || name == "align_of" {
+                    if !arguments.is_empty() {
+                        return Err(format!(
+                            "{} expects no arguments",
+                            name
+                        ));
+                    }
+                    return Ok((
+                        Node::StaticFunctionCall {
+                            _type: output_type,
+                            name: name.clone(),
+                            arguments: Vec::new(),
+                            metadata: metadata.clone(),
+                        },
+                        Type::Int,
+                    ));
+                }
                 let return_type = match &internal_type {
                     Type::Custom(system_name) if system_name == "System" && name == "allocator" => {
                         Type::Allocator
+                    }
+                    Type::Custom(memory_name) if memory_name == "Memory" => {
+                        match name.as_str() {
+                            "copy" | "set" => {
+                                for argument in arguments {
+                                    let (argument, _) = self.transform_expr(
+                                        argument,
+                                        env,
+                                        None,
+                                        substitutions,
+                                        self_type.clone(),
+                                    )?;
+                                    output_args.push(argument);
+                                }
+                                Type::Void
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "unsupported static call during monomorphization: `{}::{}`",
+                                    ast::type_to_string(&internal_type),
+                                    name
+                                ))
+                            }
+                        }
                     }
                     Type::Arena if name == "init" => {
                         for argument in arguments {
@@ -1434,6 +1495,36 @@ impl Monomorphizer {
                             output_args.push(argument);
                         }
                         internal_type.clone()
+                    }
+                    Type::Pointer { target_type } if name == "cast" => {
+                        for argument in arguments {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                None,
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
+                        }
+                        Type::Pointer {
+                            target_type: target_type.clone(),
+                        }
+                    }
+                    Type::Pointer { target_type } if name == "offset" => {
+                        for argument in arguments {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                None,
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
+                        }
+                        Type::Pointer {
+                            target_type: target_type.clone(),
+                        }
                     }
                     Type::Custom(_) | Type::GenericInstance { .. } if name == "create" => {
                         for argument in arguments {
@@ -1586,6 +1677,20 @@ impl Monomorphizer {
                             };
                             current_type = slice_result_type(&current_type)?;
                             output_nodes.push(Node::SliceAccess { start, end });
+                        }
+                        Node::Dereference { metadata } => {
+                            current_type = match current_type {
+                                Type::Pointer { target_type } => target_type.deref().clone(),
+                                other => {
+                                    return Err(format!(
+                                        "cannot dereference non-pointer type `{}`",
+                                        ast::type_to_string(&other)
+                                    ))
+                                }
+                            };
+                            output_nodes.push(Node::Dereference {
+                                metadata: metadata.clone(),
+                            });
                         }
                         Node::MemberAccess { member, metadata } => match member.as_ref() {
                             Node::Identifier(field_name) => {
@@ -1831,6 +1936,9 @@ impl Monomorphizer {
                 let result_type = match operator {
                     UnaryOperator::Plus | UnaryOperator::Minus => operand_type.clone(),
                     UnaryOperator::Negate => Type::Boolean,
+                    UnaryOperator::AddressOf => Type::Pointer {
+                        target_type: Box::new(operand_type.clone()),
+                    },
                 };
                 Ok((
                     Node::UnaryOp {
@@ -1856,6 +1964,7 @@ impl Monomorphizer {
                 self_type,
             ),
             Node::Block { .. }
+            | Node::UnsafeBlock { .. }
             | Node::If { .. }
             | Node::Match { .. }
             | Node::For { .. }

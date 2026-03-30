@@ -24,6 +24,9 @@ pub enum Node {
         statements: Vec<Node>,
         // metadata: Metadata,
     },
+    UnsafeBlock {
+        statements: Vec<Node>,
+    },
     // Statements
     StructDeclaration {
         name: String,
@@ -142,6 +145,9 @@ pub enum Node {
         member: Box<Node>, // field, function
         metadata: Metadata,
     },
+    Dereference {
+        metadata: Metadata,
+    },
     Access {
         nodes: Vec<Node>,
     },
@@ -232,6 +238,7 @@ pub enum UnaryOperator {
     Plus,
     Minus,
     Negate,
+    AddressOf,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -364,6 +371,7 @@ impl PestImpl {
                 self.create_ast(inner)
             }
             Rule::block => self.create_block(pair),
+            Rule::unsafe_block => self.create_unsafe_block(pair),
             Rule::expression => self.create_expression(pair),
             Rule::assignment => self.create_assignment(pair),
             Rule::struct_decl => self.create_struct_decl(pair),
@@ -431,6 +439,12 @@ impl PestImpl {
         }
     }
 
+    fn create_unsafe_block(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::unsafe_block);
+        let statements = pair.into_inner().map(|p| self.create_ast(p)).collect();
+        Node::UnsafeBlock { statements }
+    }
+
     fn create_primary(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::primary);
         let mut primary_inner_pairs = pair.into_inner();
@@ -461,6 +475,10 @@ impl PestImpl {
                     },
                     Rule::negate => Node::UnaryOp {
                         operator: UnaryOperator::Negate,
+                        operand: Box::new(self.create_ast(unary_operand_pair)),
+                    },
+                    Rule::address_of => Node::UnaryOp {
+                        operator: UnaryOperator::AddressOf,
                         operand: Box::new(self.create_ast(unary_operand_pair)),
                     },
                     _ => panic!("unsupported unary operator {:?}", unary_op_pair),
@@ -571,6 +589,13 @@ impl PestImpl {
         }
     }
 
+    fn create_dereference_access(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(Rule::deref_access, pair.as_rule());
+        Node::Dereference {
+            metadata: (self.metadata_creator)(&pair),
+        }
+    }
+
     fn create_chained_access(&self, pair: Pair<Rule>) -> Vec<Node> {
         let mut nodes: Vec<Node> = Vec::new();
         let mut inner_pairs = pair.into_inner();
@@ -582,6 +607,7 @@ impl PestImpl {
             match step_pair.as_rule() {
                 Rule::IDENTIFIER => nodes.push(self.create_identifier(step_pair)),
                 Rule::member_access => nodes.push(self.create_member_access(step_pair)),
+                Rule::deref_access => nodes.push(self.create_dereference_access(step_pair)),
                 Rule::array_access => nodes.push(self.create_array_access(step_pair)),
                 Rule::slice_access => nodes.push(self.create_slice_access(step_pair)),
                 _ => panic!("unsupported chained access node: {:?}", step_pair),

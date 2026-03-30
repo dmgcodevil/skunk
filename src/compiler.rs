@@ -464,6 +464,7 @@ struct FunctionCompiler<'a> {
     temp_counter: usize,
     label_counter: usize,
     terminated: bool,
+    unsafe_depth: usize,
 }
 
 impl<'a> FunctionCompiler<'a> {
@@ -499,6 +500,7 @@ impl<'a> FunctionCompiler<'a> {
             temp_counter: 0,
             label_counter: 0,
             terminated: false,
+            unsafe_depth: 0,
         }
     }
 
@@ -624,6 +626,14 @@ impl<'a> FunctionCompiler<'a> {
                 self.pop_scope();
                 Ok(())
             }
+            Node::UnsafeBlock { statements } => {
+                self.push_scope();
+                self.enter_unsafe();
+                let result = self.compile_statements(statements);
+                self.exit_unsafe();
+                self.pop_scope();
+                result
+            }
             Node::If {
                 condition,
                 body,
@@ -667,6 +677,10 @@ impl<'a> FunctionCompiler<'a> {
             }
             Node::Print(value) => self.compile_print(value),
             Node::FunctionCall { .. } => {
+                let _ = self.compile_expr(node)?;
+                Ok(())
+            }
+            Node::StaticFunctionCall { .. } => {
                 let _ = self.compile_expr(node)?;
                 Ok(())
             }
@@ -1090,10 +1104,30 @@ impl<'a> FunctionCompiler<'a> {
                 ..
             } => self.compile_lambda_expr(parameters, return_type, body, expected),
             Node::UnaryOp { operator, operand } => {
-                let value = self.compile_expr_with_expected(operand, expected)?;
                 match operator {
-                    UnaryOperator::Plus => Ok(value),
+                    UnaryOperator::AddressOf => {
+                        if !self.unsafe_allowed() {
+                            return Err("address-of requires an unsafe block".to_string());
+                        }
+                        let Node::Access { nodes } = operand.as_ref() else {
+                            return Err(
+                                "address-of requires an addressable access expression".to_string()
+                            );
+                        };
+                        let (ptr, llvm_type) = self.resolve_access_ptr(nodes)?;
+                        Ok(ExprValue {
+                            llvm_type: LlvmType::Pointer {
+                                target_type: Box::new(llvm_type),
+                            },
+                            value: ptr,
+                        })
+                    }
+                    UnaryOperator::Plus => {
+                        let value = self.compile_expr_with_expected(operand, expected)?;
+                        Ok(value)
+                    }
                     UnaryOperator::Minus => {
+                        let value = self.compile_expr_with_expected(operand, expected)?;
                         if !is_numeric_llvm_type(&value.llvm_type)
                             || value.llvm_type == LlvmType::Char16
                         {
@@ -1134,6 +1168,7 @@ impl<'a> FunctionCompiler<'a> {
                         })
                     }
                     UnaryOperator::Negate => {
+                        let value = self.compile_expr_with_expected(operand, expected)?;
                         if value.llvm_type != LlvmType::I1 {
                             return Err("unary `!` requires a boolean operand".to_string());
                         }
@@ -1167,7 +1202,140 @@ impl<'a> FunctionCompiler<'a> {
         name: &str,
         arguments: &[Node],
     ) -> Result<ExprValue, String> {
+        if name == "size_of" || name == "align_of" {
+            if !arguments.is_empty() {
+                return Err(format!("{} expects no arguments", name));
+            }
+            let measured_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
+            let value = if name == "size_of" {
+                self.size_of(&measured_type)
+            } else {
+                self.align_of(&measured_type)
+            };
+            return Ok(ExprValue {
+                llvm_type: LlvmType::I32,
+                value: value.to_string(),
+            });
+        }
         match sk_type {
+            Type::Custom(memory_name) if memory_name == "Memory" => {
+                if !self.unsafe_allowed() {
+                    return Err(format!("Memory::{} requires an unsafe block", name));
+                }
+                match name {
+                    "copy" => {
+                        if arguments.len() != 3 {
+                            return Err(
+                                "Memory::copy expects dst, src, and byte count".to_string()
+                            );
+                        }
+                        let dst = self.compile_expr(&arguments[0])?;
+                        let src = self.compile_expr(&arguments[1])?;
+                        let count =
+                            self.compile_expr_with_expected(&arguments[2], Some(&LlvmType::I32))?;
+                        let count = self.coerce_expr(count, &LlvmType::I64, "Memory::copy")?;
+                        if !matches!(dst.llvm_type, LlvmType::Pointer { .. }) {
+                            return Err("Memory::copy expects a pointer destination".to_string());
+                        }
+                        if !matches!(src.llvm_type, LlvmType::Pointer { .. }) {
+                            return Err("Memory::copy expects a pointer source".to_string());
+                        }
+                        self.emit_line(format!(
+                            "call ptr @memcpy(ptr {}, ptr {}, i64 {})",
+                            dst.value, src.value, count.value
+                        ));
+                        return Ok(ExprValue {
+                            llvm_type: LlvmType::Void,
+                            value: "void".to_string(),
+                        });
+                    }
+                    "set" => {
+                        if arguments.len() != 3 {
+                            return Err(
+                                "Memory::set expects dst, value, and byte count".to_string()
+                            );
+                        }
+                        let dst = self.compile_expr(&arguments[0])?;
+                        let value =
+                            self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I8))?;
+                        let value = self.coerce_expr(value, &LlvmType::I32, "Memory::set")?;
+                        let count =
+                            self.compile_expr_with_expected(&arguments[2], Some(&LlvmType::I32))?;
+                        let count = self.coerce_expr(count, &LlvmType::I64, "Memory::set")?;
+                        if !matches!(dst.llvm_type, LlvmType::Pointer { .. }) {
+                            return Err("Memory::set expects a pointer destination".to_string());
+                        }
+                        self.emit_line(format!(
+                            "call ptr @memset(ptr {}, i32 {}, i64 {})",
+                            dst.value, value.value, count.value
+                        ));
+                        return Ok(ExprValue {
+                            llvm_type: LlvmType::Void,
+                            value: "void".to_string(),
+                        });
+                    }
+                    _ => {
+                        return Err(format!(
+                            "LLVM backend does not support static function call `Memory::{}` yet",
+                            name
+                        ))
+                    }
+                }
+            }
+            Type::Pointer { target_type } if name == "cast" => {
+                if !self.unsafe_allowed() {
+                    return Err("pointer cast requires an unsafe block".to_string());
+                }
+                if arguments.len() != 1 {
+                    return Err("pointer cast expects exactly one pointer argument".to_string());
+                }
+                let value = self.compile_expr(&arguments[0])?;
+                let target_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
+                match value.llvm_type {
+                    LlvmType::Pointer { .. } => Ok(ExprValue {
+                        llvm_type: target_type,
+                        value: value.value,
+                    }),
+                    other => Err(format!(
+                        "pointer cast expects a pointer argument, found `{}`",
+                        other.ir()
+                    )),
+                }
+            }
+            Type::Pointer { target_type } if name == "offset" => {
+                if !self.unsafe_allowed() {
+                    return Err("pointer offset requires an unsafe block".to_string());
+                }
+                if !matches!(ast::unwrap_const_view(target_type.as_ref()), Type::Byte) {
+                    return Err("pointer offset currently requires a byte pointer type".to_string());
+                }
+                if arguments.len() != 2 {
+                    return Err("pointer offset expects pointer and integer offset".to_string());
+                }
+                let base = self.compile_expr(&arguments[0])?;
+                let offset =
+                    self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I32))?;
+                let offset = self.coerce_expr(offset, &LlvmType::I64, "pointer offset")?;
+                match base.llvm_type {
+                    LlvmType::Pointer { .. } => {
+                        let temp = self.next_temp();
+                        self.emit_line(format!(
+                            "{} = getelementptr inbounds i8, ptr {}, i64 {}",
+                            temp, base.value, offset.value
+                        ));
+                        Ok(ExprValue {
+                            llvm_type: LlvmType::Pointer {
+                                target_type: Box::new(LlvmType::I8),
+                            },
+                            value: temp,
+                        })
+                    }
+                    other => Err(format!(
+                        "pointer offset expects a pointer argument, found `{}`",
+                        other.ir()
+                    )),
+                }
+            }
             Type::Custom(system_name) if system_name == "System" && name == "allocator" => {
                 if !arguments.is_empty() {
                     return Err("System::allocator expects no arguments".to_string());
@@ -2094,6 +2262,13 @@ impl<'a> FunctionCompiler<'a> {
             _ => current,
         };
         match node {
+            Node::Dereference { .. } => match current {
+                LlvmType::Pointer { target_type } => Ok(*target_type),
+                other => Err(format!(
+                    "cannot dereference non-pointer type `{}` in LLVM backend",
+                    other.ir()
+                )),
+            },
             Node::ArrayAccess { coordinates } => {
                 let mut current = current;
                 for _ in coordinates {
@@ -2182,6 +2357,24 @@ impl<'a> FunctionCompiler<'a> {
                 }
             }
             match node {
+                Node::Dereference { .. } => {
+                    if !self.unsafe_allowed() {
+                        return Err("pointer dereference requires an unsafe block".to_string());
+                    }
+                    match current_type.clone() {
+                        LlvmType::Pointer { target_type } => {
+                            let loaded = self.load_from_ptr(&ptr, &current_type)?;
+                            ptr = loaded.value;
+                            current_type = *target_type;
+                        }
+                        other => {
+                            return Err(format!(
+                                "cannot dereference non-pointer type `{}` in LLVM backend",
+                                other.ir()
+                            ))
+                        }
+                    }
+                }
                 Node::ArrayAccess { coordinates } => {
                     for coordinate in coordinates {
                         let index = self.compile_expr(coordinate)?;
@@ -3278,6 +3471,20 @@ impl<'a> FunctionCompiler<'a> {
         self.scopes.pop();
     }
 
+    fn enter_unsafe(&mut self) {
+        self.unsafe_depth += 1;
+    }
+
+    fn exit_unsafe(&mut self) {
+        if self.unsafe_depth > 0 {
+            self.unsafe_depth -= 1;
+        }
+    }
+
+    fn unsafe_allowed(&self) -> bool {
+        self.unsafe_depth > 0
+    }
+
     fn declare_local(&mut self, name: String, ptr: String, llvm_type: LlvmType) {
         self.scopes
             .last_mut()
@@ -3739,6 +3946,8 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let mut ir = String::new();
     let _ = writeln!(ir, "declare i32 @printf(ptr, ...)");
     let _ = writeln!(ir, "declare ptr @malloc(i64)");
+    let _ = writeln!(ir, "declare ptr @memcpy(ptr, ptr, i64)");
+    let _ = writeln!(ir, "declare ptr @memset(ptr, i32, i64)");
     let _ = writeln!(ir, "declare ptr @skunk_system_allocator()");
     let _ = writeln!(ir, "declare ptr @skunk_arena_init(ptr)");
     let _ = writeln!(ir, "declare ptr @skunk_arena_allocator(ptr)");
@@ -5042,6 +5251,123 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Writer"));
+    }
+
+    #[test]
+    fn runs_compiled_unsafe_address_of_and_dereference_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                value: int = 41;
+                unsafe {
+                    ptr: *int = &value;
+                    print(ptr.*);
+                    ptr.* = 42;
+                }
+                print(value);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "41\n42\n");
+    }
+
+    #[test]
+    fn runs_compiled_size_of_and_align_of_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Pair {
+                left: int;
+                right: int;
+            }
+
+            function main(): void {
+                print(int::size_of());
+                print(int::align_of());
+                print(Pair::size_of());
+                print(Pair::align_of());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "4\n4\n8\n4\n");
+    }
+
+    #[test]
+    fn runs_compiled_unsafe_memory_copy_and_set_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                src: int = 123;
+                dst: int = 0;
+                bytes: [4]byte;
+                unsafe {
+                    Memory::copy(*byte::cast(&dst), *byte::cast(&src), int::size_of());
+                    Memory::set(&bytes[0], 7, 4);
+                }
+                print(dst);
+                print(bytes[0]);
+                print(bytes[3]);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "123\n7\n7\n");
+    }
+
+    #[test]
+    fn runs_compiled_unsafe_byte_pointer_offset_program() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                bytes: [4]byte;
+                unsafe {
+                    start: *byte = &bytes[0];
+                    second: *byte = *byte::offset(start, 1);
+                    second.* = 9;
+                }
+                print(bytes[1]);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "9\n");
+    }
+
+    #[test]
+    fn rejects_address_of_outside_unsafe_block() {
+        let result = compile_and_run(
+            r#"
+            function main(): void {
+                value: int = 1;
+                ptr: *int = &value;
+                print(ptr.*);
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("address-of"));
+    }
+
+    #[test]
+    fn rejects_memory_copy_outside_unsafe_block() {
+        let result = compile_and_run(
+            r#"
+            function main(): void {
+                src: int = 1;
+                dst: int = 0;
+                Memory::copy(*byte::cast(&dst), *byte::cast(&src), int::size_of());
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unsafe"));
     }
 
     #[test]

@@ -31,6 +31,7 @@
                 <a href="#arrays-and-slices">Arrays and Slices</a>
                 <a href="#structs-and-methods">Structs and Methods</a>
                 <a href="#pointers-allocators-and-arenas">Pointers, Allocators, and Arenas</a>
+                <a href="#unsafe-memory">Unsafe Memory</a>
                 <a href="#generics">Generics</a>
                 <a href="#enums-and-match">Enums and Match</a>
                 <a href="#traits-and-impls">Traits and Impls</a>
@@ -282,6 +283,41 @@ function main(): void {
                     <li><code>alloc.destroy(ptr)</code> releases a pointer allocation.</li>
                     <li><code>alloc.free(slice)</code> releases a slice allocation.</li>
                     <li><code>Arena::init(backing)</code>, <code>arena.allocator()</code>, <code>arena.reset()</code>, and <code>arena.deinit()</code> provide arena-style lifetime management.</li>
+                    <li>Field access like <code>point.x</code> and method calls like <code>point.bump()</code> still auto-deref ordinary typed pointers.</li>
+                </ul>
+            </section>
+
+            <section id="unsafe-memory">
+                <h2>Unsafe Memory</h2>
+                <p>Skunk now has a small unsafe memory layer for low-level pointer work. These operations must appear inside an <code>unsafe { ... }</code> block.</p>
+<pre><code class="language-skunk">function main(): void {
+    value: int = 41;
+    other: int = 0;
+
+    unsafe {
+        ptr: *int = &value;
+        print(ptr.*);
+        ptr.* = 42;
+
+        bytes: [4]byte;
+        second: *byte = *byte::offset(&bytes[0], 1);
+        second.* = 9;
+
+        Memory::set(&bytes[0], 7, 4);
+        Memory::copy(*byte::cast(&other), *byte::cast(&value), int::size_of());
+    }
+
+    print(int::size_of());
+    print(int::align_of());
+}</code></pre>
+                <ul>
+                    <li><code>unsafe { ... }</code> enables low-level operations the compiler cannot verify as memory-safe.</li>
+                    <li><code>&amp;expr</code> takes the address of an addressable access expression.</li>
+                    <li><code>ptr.*</code> explicitly dereferences a pointer value.</li>
+                    <li><code>T::size_of()</code> and <code>T::align_of()</code> are safe compile-time layout queries.</li>
+                    <li><code>*T::cast(ptr)</code> reinterprets one pointer type as another pointer type.</li>
+                    <li><code>*byte::offset(ptr, n)</code> performs byte-wise pointer offsetting.</li>
+                    <li><code>Memory::copy(dst, src, count)</code> and <code>Memory::set(dst, value, count)</code> operate on raw bytes.</li>
                 </ul>
             </section>
 
@@ -404,8 +440,8 @@ function main(): void {
             <section id="current-limitations">
                 <h2>Current Limitations</h2>
                 <ul>
-                    <li>No user-defined allocators, raw pointer operations, or <code>unsafe</code> memory layer yet.</li>
-                    <li>No general address-of operator yet.</li>
+                    <li>No user-defined allocators yet. The current allocator and arena model is still runtime-provided.</li>
+                    <li>The unsafe memory layer is intentionally small today: there are no raw pointer trait bounds, no arbitrary pointer arithmetic beyond <code>*byte::offset</code>, and no general <code>unsafe</code> standard library yet.</li>
                     <li>No const struct fields yet.</li>
                     <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
                     <li>Runtime trait values are a V1 boxed model today. Converting a concrete value to a trait value boxes a copy of that value rather than borrowing it in place.</li>

@@ -67,11 +67,15 @@ impl SymbolTable {
 #[derive(Debug, PartialEq, Clone)]
 struct SymbolTables {
     tables: Vec<SymbolTable>,
+    unsafe_depth: usize,
 }
 
 impl SymbolTables {
     fn new() -> Self {
-        SymbolTables { tables: vec![] }
+        SymbolTables {
+            tables: vec![],
+            unsafe_depth: 0,
+        }
     }
     fn add(&mut self, var_table: SymbolTable) {
         self.tables.push(var_table);
@@ -106,6 +110,20 @@ impl SymbolTables {
         } else {
             None
         }
+    }
+
+    fn enter_unsafe(&mut self) {
+        self.unsafe_depth += 1;
+    }
+
+    fn exit_unsafe(&mut self) {
+        if self.unsafe_depth > 0 {
+            self.unsafe_depth -= 1;
+        }
+    }
+
+    fn is_unsafe(&self) -> bool {
+        self.unsafe_depth > 0
     }
 }
 
@@ -756,6 +774,22 @@ fn resolve_access(
             };
             resolve_access(global_scope, symbol_tables, next_type, i + 1, access_nodes)
         }
+        Node::Dereference { .. } => {
+            require_unsafe(symbol_tables, "pointer dereference")?;
+            match curr {
+                Type::Pointer { target_type } => resolve_access(
+                    global_scope,
+                    symbol_tables,
+                    target_type.deref().clone(),
+                    i + 1,
+                    access_nodes,
+                ),
+                other => Err(format!(
+                    "cannot dereference non-pointer type `{}`",
+                    type_to_string(&other)
+                )),
+            }
+        }
 
         Node::MemberAccess { member, metadata } => match curr {
             Type::Array { .. } | Type::Slice { .. } => match member.deref() {
@@ -977,6 +1011,154 @@ fn lookup_value_symbol<'a>(
         .or_else(|| global_scope.variables.get(name))
 }
 
+fn require_unsafe(symbol_tables: &SymbolTables, operation: &str) -> Result<(), String> {
+    if symbol_tables.is_unsafe() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` requires an unsafe block",
+            operation
+        ))
+    }
+}
+
+fn resolve_addressable_access_type(
+    global_scope: &GlobalScope,
+    symbol_tables: &mut SymbolTables,
+    access_nodes: &[Node],
+) -> Result<Type, String> {
+    let Some(first) = access_nodes.first() else {
+        return Err("address-of requires an access expression".to_string());
+    };
+    let mut current = resolve_type(global_scope, symbol_tables, first, None)?.sk_type;
+
+    for (index, step) in access_nodes.iter().enumerate().skip(1) {
+        if matches!(
+            step,
+            Node::MemberAccess { .. } | Node::ArrayAccess { .. } | Node::SliceAccess { .. }
+        ) {
+            loop {
+                match current {
+                    Type::Const { inner } => current = inner.deref().clone(),
+                    Type::Pointer { target_type } => current = target_type.deref().clone(),
+                    _ => break,
+                }
+            }
+        }
+
+        match step {
+            Node::Dereference { .. } => {
+                require_unsafe(symbol_tables, "pointer dereference")?;
+                current = match current {
+                    Type::Pointer { target_type } => target_type.deref().clone(),
+                    other => {
+                        return Err(format!(
+                            "cannot dereference non-pointer type `{}`",
+                            type_to_string(&other)
+                        ))
+                    }
+                };
+            }
+            Node::ArrayAccess { coordinates } => match current {
+                Type::Array {
+                    elem_type,
+                    dimensions,
+                } => {
+                    if coordinates.len() > dimensions.len() {
+                        return Err("too many indices for array access".to_string());
+                    }
+                    let remaining_dimensions = dimensions[coordinates.len()..].to_vec();
+                    current = if remaining_dimensions.is_empty() {
+                        elem_type.deref().clone()
+                    } else {
+                        Type::Array {
+                            elem_type,
+                            dimensions: remaining_dimensions,
+                        }
+                    };
+                }
+                Type::Slice { elem_type } => {
+                    if coordinates.len() != 1 {
+                        return Err("slice access expects exactly one index".to_string());
+                    }
+                    current = elem_type.deref().clone();
+                }
+                other => {
+                    return Err(format!(
+                        "cannot index non-array type `{}`",
+                        type_to_string(&other)
+                    ))
+                }
+            },
+            Node::SliceAccess { .. } => {
+                return Err("cannot take the address of a slice expression".to_string());
+            }
+            Node::MemberAccess { member, metadata } => match member.deref() {
+                Node::Identifier(field_name) => match current {
+                    Type::Array { .. } | Type::Slice { .. } if field_name == "len" => {
+                        return Err(format!(
+                            "error {}:{}: cannot take the address of array or slice length",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    Type::Custom(trait_name) if global_scope.traits.contains_key(&trait_name) => {
+                        return Err(format!(
+                            "error {}:{}: cannot take the address of a trait object field access",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    Type::Custom(struct_name) => {
+                        let struct_symbol = global_scope
+                            .structs
+                            .get(&struct_name)
+                            .ok_or_else(|| "error: struct doesn't exist".to_string())?;
+                        current = struct_symbol
+                            .fields
+                            .get(field_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "error {}:{}: no field `{}` on type `{}`",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    field_name,
+                                    struct_name
+                                )
+                            })?
+                            .sk_type
+                            .clone();
+                    }
+                    other => {
+                        return Err(format!(
+                            "cannot take the address of member access on `{}`",
+                            type_to_string(&other)
+                        ))
+                    }
+                },
+                Node::FunctionCall { .. } => {
+                    return Err("cannot take the address of a method call".to_string());
+                }
+                _ => {
+                    return Err("expected identifier member access in address-of target".to_string())
+                }
+            },
+            Node::Identifier(_) => {
+                return Err(format!(
+                    "unexpected identifier at access step {} in address-of target",
+                    index
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unsupported address-of target step `{:?}`",
+                    other
+                ))
+            }
+        }
+    }
+
+    Ok(current)
+}
+
 fn binding_allows_indirect_mutation(sk_type: &Type) -> bool {
     matches!(
         unwrap_binding_const(sk_type),
@@ -1018,6 +1200,18 @@ fn assert_mutating_receiver_allowed(
         }
 
         match step {
+            Node::Dereference { .. } => {
+                require_unsafe(symbol_tables, "pointer dereference")?;
+                current = match current {
+                    Type::Pointer { target_type } => target_type.deref().clone(),
+                    other => {
+                        return Err(format!(
+                            "cannot dereference non-pointer type `{}`",
+                            type_to_string(&other)
+                        ))
+                    }
+                };
+            }
             Node::ArrayAccess { coordinates } => match current {
                 Type::Array {
                     elem_type,
@@ -1176,6 +1370,18 @@ fn assert_assignment_target_mutable(
         }
 
         match step {
+            Node::Dereference { .. } => {
+                require_unsafe(symbol_tables, "pointer dereference")?;
+                current = match current {
+                    Type::Pointer { target_type } => target_type.deref().clone(),
+                    other => {
+                        return Err(format!(
+                            "cannot dereference non-pointer type `{}`",
+                            type_to_string(&other)
+                        ))
+                    }
+                };
+            }
             Node::ArrayAccess { coordinates } => match current {
                 Type::Array {
                     elem_type,
@@ -1765,6 +1971,15 @@ fn resolve_type(
             while let Type::Const { inner } = static_type {
                 static_type = inner.deref();
             }
+            if name == "size_of" || name == "align_of" {
+                if !arguments.is_empty() {
+                    return Err(format!(
+                        "error {}:{}: {} expects no arguments",
+                        metadata.span.line, metadata.span.start, name
+                    ));
+                }
+                return Ok(ResolveResult::new(Type::Int));
+            }
             match static_type {
                 Type::Void => {}
                 Type::Byte => {}
@@ -1877,7 +2092,151 @@ fn resolve_type(
                         ));
                     }
                 }
+                Type::Pointer { target_type } if name == "cast" => {
+                    require_unsafe(symbol_tables, "pointer cast")?;
+                    if arguments.len() != 1 {
+                        return Err(format!(
+                            "error {}:{}: pointer cast expects exactly one pointer argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let arg_type =
+                        resolve_type(global_scope, symbol_tables, &arguments[0], None)?.sk_type;
+                    if !matches!(unwrap_binding_const(&arg_type), Type::Pointer { .. }) {
+                        return Err(format!(
+                            "error {}:{}: pointer cast expects a pointer argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    return Ok(ResolveResult::new(Type::Pointer {
+                        target_type: target_type.clone(),
+                    }));
+                }
+                Type::Pointer { target_type } if name == "offset" => {
+                    require_unsafe(symbol_tables, "pointer offset")?;
+                    if !matches!(
+                        unwrap_const_view(target_type.deref()),
+                        Type::Byte
+                    ) {
+                        return Err(format!(
+                            "error {}:{}: pointer offset currently requires a byte pointer target",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    if arguments.len() != 2 {
+                        return Err(format!(
+                            "error {}:{}: pointer offset expects pointer and integer offset",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let ptr_type =
+                        resolve_type(global_scope, symbol_tables, &arguments[0], None)?.sk_type;
+                    if !matches!(unwrap_binding_const(&ptr_type), Type::Pointer { .. }) {
+                        return Err(format!(
+                            "error {}:{}: pointer offset expects a pointer argument",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let offset_type = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[1],
+                        Some(&Type::Int),
+                    )?;
+                    if !is_integral_type(&offset_type.sk_type) {
+                        return Err(format!(
+                            "error {}:{}: pointer offset requires an integer offset",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    return Ok(ResolveResult::new(_type.clone()));
+                }
                 Type::Pointer { .. } => {}
+                Type::Custom(custom_name) if custom_name == "Memory" => {
+                    require_unsafe(symbol_tables, &format!("Memory::{}", name))?;
+                    match name.as_str() {
+                        "copy" => {
+                            if arguments.len() != 3 {
+                                return Err(format!(
+                                    "error {}:{}: Memory::copy expects dst, src, and byte count",
+                                    metadata.span.line, metadata.span.start
+                                ));
+                            }
+                            for argument in arguments.iter().take(2) {
+                                let arg_type =
+                                    resolve_type(global_scope, symbol_tables, argument, None)?
+                                        .sk_type;
+                                if !matches!(unwrap_binding_const(&arg_type), Type::Pointer { .. }) {
+                                    return Err(format!(
+                                        "error {}:{}: Memory::copy expects pointer arguments",
+                                        metadata.span.line, metadata.span.start
+                                    ));
+                                }
+                            }
+                            let count_type = resolve_type(
+                                global_scope,
+                                symbol_tables,
+                                &arguments[2],
+                                Some(&Type::Int),
+                            )?;
+                            if !is_integral_type(&count_type.sk_type) {
+                                return Err(format!(
+                                    "error {}:{}: Memory::copy byte count must be an integer",
+                                    metadata.span.line, metadata.span.start
+                                ));
+                            }
+                            return Ok(ResolveResult::new(Type::Void));
+                        }
+                        "set" => {
+                            if arguments.len() != 3 {
+                                return Err(format!(
+                                    "error {}:{}: Memory::set expects dst, value, and byte count",
+                                    metadata.span.line, metadata.span.start
+                                ));
+                            }
+                            let dst_type =
+                                resolve_type(global_scope, symbol_tables, &arguments[0], None)?
+                                    .sk_type;
+                            if !matches!(unwrap_binding_const(&dst_type), Type::Pointer { .. }) {
+                                return Err(format!(
+                                    "error {}:{}: Memory::set expects a pointer destination",
+                                    metadata.span.line, metadata.span.start
+                                ));
+                            }
+                            let value_type = resolve_type(
+                                global_scope,
+                                symbol_tables,
+                                &arguments[1],
+                                Some(&Type::Byte),
+                            )?;
+                            if !is_integral_type(&value_type.sk_type) {
+                                return Err(format!(
+                                    "error {}:{}: Memory::set value must be a byte-sized integer",
+                                    metadata.span.line, metadata.span.start
+                                ));
+                            }
+                            let count_type = resolve_type(
+                                global_scope,
+                                symbol_tables,
+                                &arguments[2],
+                                Some(&Type::Int),
+                            )?;
+                            if !is_integral_type(&count_type.sk_type) {
+                                return Err(format!(
+                                    "error {}:{}: Memory::set byte count must be an integer",
+                                    metadata.span.line, metadata.span.start
+                                ));
+                            }
+                            return Ok(ResolveResult::new(Type::Void));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "error {}:{}: Memory does not support static method `{}`",
+                                metadata.span.line, metadata.span.start, name
+                            ))
+                        }
+                    }
+                }
                 Type::Custom(custom_name) if custom_name == "System" => {
                     if name != "allocator" || !arguments.is_empty() {
                         return Err(format!(
@@ -1972,6 +2331,25 @@ fn resolve_type(
                     result = assert_type(result, Type::Void)?;
                 }
             }
+            if result != Type::Void {
+                Ok(ResolveResult::returned(result))
+            } else {
+                Ok(ResolveResult::new(Type::Void))
+            }
+        }
+        Node::UnsafeBlock { statements } => {
+            let var_table = symbol_tables.get().clone();
+            symbol_tables.add(var_table);
+            symbol_tables.enter_unsafe();
+            let mut result = Type::Void;
+            for statement in statements {
+                let res = resolve_type(global_scope, symbol_tables, statement, expected_type_opt)?;
+                if res.returned {
+                    result = assert_type(result, Type::Void)?;
+                }
+            }
+            symbol_tables.exit_unsafe();
+            symbol_tables.pop();
             if result != Type::Void {
                 Ok(ResolveResult::returned(result))
             } else {
@@ -2202,6 +2580,17 @@ fn resolve_type(
                             operand_type
                         ))
                     }
+                }
+                UnaryOperator::AddressOf => {
+                    require_unsafe(symbol_tables, "address-of")?;
+                    let Node::Access { nodes } = operand.deref() else {
+                        return Err("address-of requires an addressable access expression".to_string());
+                    };
+                    let target_type =
+                        resolve_addressable_access_type(global_scope, symbol_tables, nodes)?;
+                    Ok(ResolveResult::new(Type::Pointer {
+                        target_type: Box::new(target_type),
+                    }))
                 }
             }
         }

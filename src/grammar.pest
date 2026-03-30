@@ -32,6 +32,7 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
     unary_plus      = { "+" }
     unary_minus     = { "-" }
     negate          = { "!" }
+    address_of      = { "&" }
 
 
 // Types
@@ -65,7 +66,7 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | import | export_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | impl_decl | control_flow | io | sk_return | assignment ~ ";" | expression ~ ";" | block }
+statement         = { module | import | export_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | impl_decl | control_flow | io | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
 assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
@@ -84,6 +85,7 @@ trait_method_decl = { "function" ~ IDENTIFIER ~ member_func_params ~ optional_re
 trait_decl        = { "trait" ~ IDENTIFIER ~ "{" ~ trait_method_decl* ~ "}" }
 impl_decl         = { "impl" ~ generic_params? ~ IDENTIFIER ~ ("," ~ IDENTIFIER)* ~ "for" ~ _type ~ "{" ~ "}" }
 block             = { "{" ~ statement* ~ "}" }
+unsafe_block      = { "unsafe" ~ "{" ~ statement* ~ "}" }
 param_list        = { (param_decl ~ ("," ~ param_decl)*) }
 param_type_list   = { (_type ~ ("," ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ generic_params? ~ "{" ~ struct_field_decl* ~ func_decl* ~ "}" }
@@ -139,7 +141,7 @@ io              = { print | input }
 sk_return        = { "return" ~ (lambda_expr | expression)? ~ ";" }
 
 
-unary_op        = { (unary_plus | unary_minus | negate) ~ primary }
+unary_op        = { (unary_plus | unary_minus | negate | address_of) ~ primary }
 expression      = { primary ~ (operation ~ primary)* }
 primary         = { lambda_expr | unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
 
@@ -148,6 +150,7 @@ arg_list        = { (expression ~ ("," ~ expression)*)? }
 func_call       = { IDENTIFIER ~ type_arg_list? ~ ("(" ~ arg_list ~ ")")+ }
 
 member_access = { "." ~ (func_call | IDENTIFIER) }
-access_step = { slice_access | array_access | member_access }
+deref_access = { "." ~ "*" }
+access_step = { deref_access | slice_access | array_access | member_access }
 chained_access = {  ( func_call | IDENTIFIER ) ~ access_step+ }
 access = { chained_access | IDENTIFIER }

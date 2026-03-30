@@ -208,6 +208,13 @@ impl ModuleNormalizer {
                 value_scopes.pop();
                 Node::Block { statements }
             }
+            Node::UnsafeBlock { statements } => {
+                value_scopes.push(HashSet::new());
+                let statements =
+                    self.rename_statement_list(statements, value_scopes, type_scopes, false)?;
+                value_scopes.pop();
+                Node::UnsafeBlock { statements }
+            }
             Node::VariableDeclaration {
                 var_type,
                 name,
@@ -812,6 +819,7 @@ impl ModuleNormalizer {
                 }),
                 metadata,
             },
+            Node::Dereference { .. } => node,
             Node::Access { nodes } => {
                 let mut output = Vec::new();
                 for (index, node) in nodes.into_iter().enumerate() {
@@ -819,7 +827,9 @@ impl ModuleNormalizer {
                         Node::MemberAccess { .. } => {
                             self.rename_expr(node, value_scopes, type_scopes)?
                         }
-                        Node::ArrayAccess { .. } | Node::SliceAccess { .. } => {
+                        Node::ArrayAccess { .. }
+                        | Node::SliceAccess { .. }
+                        | Node::Dereference { .. } => {
                             self.rename_expr(node, value_scopes, type_scopes)?
                         }
                         other if index == 0 => {
@@ -862,6 +872,7 @@ impl ModuleNormalizer {
                     .collect::<Result<Vec<_>, String>>()?,
             },
             Node::Block { .. }
+            | Node::UnsafeBlock { .. }
             | Node::If { .. }
             | Node::Match { .. }
             | Node::For { .. }
