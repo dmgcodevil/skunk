@@ -1024,6 +1024,14 @@ impl<'a> FunctionCompiler<'a> {
         node: &Node,
         expected: Option<&LlvmType>,
     ) -> Result<ExprValue, String> {
+        if let Some(LlvmType::TraitObject(trait_name)) = expected {
+            if let Some(value) =
+                self.try_compile_borrowed_trait_object(node, trait_name, "trait object coercion")?
+            {
+                return Ok(value);
+            }
+        }
+
         match node {
             Node::Literal(Literal::Integer(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::I32,
@@ -1194,6 +1202,34 @@ impl<'a> FunctionCompiler<'a> {
                 unsupported
             )),
         }
+    }
+
+    fn try_compile_borrowed_trait_object(
+        &mut self,
+        node: &Node,
+        trait_name: &str,
+        context: &str,
+    ) -> Result<Option<ExprValue>, String> {
+        let addressable = match node {
+            Node::Identifier(name) => self
+                .lookup_local(name)
+                .cloned()
+                .map(|local| (local.ptr, local.llvm_type)),
+            Node::Access { nodes } => self.resolve_access_ptr(nodes).ok(),
+            _ => None,
+        };
+
+        let Some((ptr, llvm_type)) = addressable else {
+            return Ok(None);
+        };
+
+        let LlvmType::Struct(concrete_name) = llvm_type else {
+            return Ok(None);
+        };
+
+        let trait_value =
+            self.trait_object_from_ptr(trait_name, &concrete_name, ptr, context)?;
+        Ok(Some(trait_value))
     }
 
     fn compile_static_function_call(
@@ -3356,16 +3392,7 @@ impl<'a> FunctionCompiler<'a> {
         value: ExprValue,
         context: &str,
     ) -> Result<ExprValue, String> {
-        let vtable_symbol = self
-            .trait_vtables
-            .get(&format!("{}=>{}", trait_name, concrete_name))
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "type mismatch in {}: `{}` does not implement trait `{}`",
-                    context, concrete_name, trait_name
-                )
-            })?;
+        let vtable_symbol = self.trait_vtable_symbol(trait_name, concrete_name, context)?;
 
         let allocator = self.next_temp();
         self.emit_line(format!("{} = call ptr @skunk_system_allocator()", allocator));
@@ -3378,13 +3405,50 @@ impl<'a> FunctionCompiler<'a> {
         ));
         self.emit_store(&boxed_ptr, &value);
 
+        self.trait_object_from_data_ptr(trait_name, boxed_ptr, &vtable_symbol)
+    }
+
+    fn trait_vtable_symbol(
+        &self,
+        trait_name: &str,
+        concrete_name: &str,
+        context: &str,
+    ) -> Result<String, String> {
+        self.trait_vtables
+            .get(&format!("{}=>{}", trait_name, concrete_name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "type mismatch in {}: `{}` does not implement trait `{}`",
+                    context, concrete_name, trait_name
+                )
+            })
+    }
+
+    fn trait_object_from_ptr(
+        &mut self,
+        trait_name: &str,
+        concrete_name: &str,
+        data_ptr: String,
+        context: &str,
+    ) -> Result<ExprValue, String> {
+        let vtable_symbol = self.trait_vtable_symbol(trait_name, concrete_name, context)?;
+        self.trait_object_from_data_ptr(trait_name, data_ptr, &vtable_symbol)
+    }
+
+    fn trait_object_from_data_ptr(
+        &mut self,
+        trait_name: &str,
+        data_ptr: String,
+        vtable_symbol: &str,
+    ) -> Result<ExprValue, String> {
         let trait_type = LlvmType::TraitObject(trait_name.to_string());
         let with_data = self.next_temp();
         self.emit_line(format!(
             "{} = insertvalue {} zeroinitializer, ptr {}, 0",
             with_data,
             trait_type.ir(),
-            boxed_ptr
+            data_ptr
         ));
         let boxed_value = self.next_temp();
         self.emit_line(format!(
@@ -5296,6 +5360,45 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_trait_object_borrowed_local_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            struct IntWriter {
+                i: int;
+            }
+
+            attach IntWriter {
+                function get_i(self): int {
+                    return self.i;
+                }
+            }
+
+            conform Writer for IntWriter {
+                function write(mut self, value: int): int {
+                    self.i = value;
+                    return self.i;
+                }
+            }
+
+            function main(): void {
+                iw: IntWriter = IntWriter { i: 0 };
+                w: Writer = iw;
+                w.write(1);
+                print(iw.get_i());
+                print(iw.i);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "1\n1\n");
+    }
+
+    #[test]
     fn runs_compiled_trait_object_parameter_program() {
         let stdout = compile_and_run(
             r#"
@@ -5328,6 +5431,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "12\n13\n");
+    }
+
+    #[test]
+    fn runs_compiled_trait_default_method_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+
+                function write_twice(mut self, value: int): int {
+                    self.write(value);
+                    return self.write(value);
+                }
+            }
+
+            struct Counter {
+                value: int;
+            }
+
+            conform Writer for Counter {
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            function use_counter[T: Writer](counter: *T): int {
+                return counter.write_twice(3);
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                counter: *Counter = Counter::create(heap);
+                counter.value = 1;
+                print(use_counter(counter));
+
+                writer: Writer = Counter { value: 10 };
+                print(writer.write_twice(2));
+
+                heap.destroy(counter);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n14\n");
     }
 
     #[test]

@@ -396,21 +396,34 @@ impl ModuleNormalizer {
                 let methods = methods
                     .into_iter()
                     .map(|method| {
+                        let mut local_scope = HashSet::new();
+                        let parameters = method
+                            .parameters
+                            .into_iter()
+                            .map(|(param_name, param_type)| {
+                                if !ast::is_self_type(&param_type) {
+                                    local_scope.insert(param_name.clone());
+                                }
+                                self.rename_type(param_type, value_scopes, type_scopes)
+                                    .map(|param_type| (param_name, param_type))
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        let return_type =
+                            self.rename_type(method.return_type, value_scopes, type_scopes)?;
+                        let default_body = if let Some(body) = method.default_body {
+                            value_scopes.push(local_scope);
+                            let body =
+                                self.rename_statement_list(body, value_scopes, type_scopes, false)?;
+                            value_scopes.pop();
+                            Some(body)
+                        } else {
+                            None
+                        };
                         Ok(ast::TraitMethodSignature {
                             name: method.name,
-                            parameters: method
-                                .parameters
-                                .into_iter()
-                                .map(|(param_name, param_type)| {
-                                    self.rename_type(param_type, value_scopes, type_scopes)
-                                        .map(|param_type| (param_name, param_type))
-                                })
-                                .collect::<Result<Vec<_>, String>>()?,
-                            return_type: self.rename_type(
-                                method.return_type,
-                                value_scopes,
-                                type_scopes,
-                            )?,
+                            parameters,
+                            return_type,
+                            default_body,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -446,6 +459,7 @@ impl ModuleNormalizer {
                                 value_scopes,
                                 type_scopes,
                             )?,
+                            default_body: None,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;

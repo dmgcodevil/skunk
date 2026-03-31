@@ -1,5 +1,10 @@
 trait Writer {
     function write(mut self, value: int): int;
+
+    function write_twice(mut self, value: int): int {
+        self.write(value);
+        return self.write(value);
+    }
 }
 
 shape WriterLike {
@@ -63,7 +68,7 @@ function main(): void {
     print(local_buffer.write(5));
 
     writer: Writer = ConsoleWriter::new(3);
-    print(writer.write(2));
+    print(writer.write_twice(2));
 
     heap.destroy(console);
     heap.destroy(buffer);

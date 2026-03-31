@@ -34,12 +34,29 @@ The legacy interpreter path still exists:
 cargo run -- path/to/main.skunk
 ```
 
+## VS Code
+
+A lightweight VS Code extension now lives in [`editors/vscode/skunk`](editors/vscode/skunk). It includes:
+
+- syntax highlighting for `.skunk`
+- basic autocompletion for keywords, snippets, and top-level symbols
+- a simple formatter for indentation and brace layout
+
+Quick local install on macOS or Linux:
+
+```bash
+sh editors/vscode/skunk/build-vsix.sh
+```
+
+Then install `editors/vscode/skunk/dist/dmgcodevil.skunk-0.0.3.vsix` from VS Code via `Extensions > ... > Install from VSIX...`. More details are in [`editors/vscode/skunk/README.md`](editors/vscode/skunk/README.md).
+
 ## In This Repository
 
 - [docs/index.html](docs/index.html): Skunk Language Reference
 - [docs/pointers-and-allocators.md](docs/pointers-and-allocators.md): pointer and allocator design note
 - [docs/language-development.md](docs/language-development.md): development contract
 - [`examples/`](examples): runnable sample programs
+- [`editors/vscode/skunk`](editors/vscode/skunk): VS Code syntax highlighting, completion, and formatter extension
 
 ## License
 

@@ -353,12 +353,18 @@ impl Monomorphizer {
                 Node::StructDeclaration {
                     name,
                     fields,
-                    functions,
+                    functions: _,
                 } => {
                     self.ensure_runtime_impls_for_type(
                         &Type::Custom(name.clone()),
                         &Type::Custom(name.clone()),
                     )?;
+                    let functions = self
+                        .concrete_structs
+                        .get(&name)
+                        .ok_or_else(|| format!("unknown concrete struct `{}`", name))?
+                        .functions
+                        .clone();
                     output.push(self.transform_struct_decl(
                         &name,
                         &fields,
@@ -527,16 +533,36 @@ impl Monomorphizer {
                     trait_template.name, method.name
                 ));
             }
-            let (actual_receiver_type, actual_parameters, actual_return_type) = self
-                .lookup_method_signature(target_type, &method.name)
-                .map_err(|_| {
-                    format!(
-                        "type `{}` does not implement required trait method `{}.{}`",
-                        ast::type_to_string(target_type),
-                        trait_template.name,
-                        method.name
-                    )
-                })?;
+            let (actual_receiver_type, actual_parameters, actual_return_type) =
+                match self.lookup_method_signature(target_type, &method.name) {
+                    Ok(signature) => signature,
+                    Err(_) => {
+                        if method.default_body.is_some() {
+                            self.synthesize_trait_default_method(
+                                trait_template,
+                                target_type,
+                                method,
+                            )?;
+                            self.lookup_method_signature(target_type, &method.name).map_err(
+                                |_| {
+                                    format!(
+                                        "type `{}` does not implement required trait method `{}.{}`",
+                                        ast::type_to_string(target_type),
+                                        trait_template.name,
+                                        method.name
+                                    )
+                                },
+                            )?
+                        } else {
+                            return Err(format!(
+                                "type `{}` does not implement required trait method `{}.{}`",
+                                ast::type_to_string(target_type),
+                                trait_template.name,
+                                method.name
+                            ));
+                        }
+                    }
+                };
             let expected_parameters = method
                 .parameters
                 .iter()
@@ -565,6 +591,72 @@ impl Monomorphizer {
                         .collect::<Vec<_>>()
                         .join(", "),
                     ast::type_to_string(&actual_return_type)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn synthesize_trait_default_method(
+        &mut self,
+        trait_template: &TraitTemplate,
+        target_type: &Type,
+        method: &ast::TraitMethodSignature,
+    ) -> Result<(), String> {
+        let Some(default_body) = method.default_body.clone() else {
+            return Err(format!(
+                "trait `{}` method `{}` has no default body to synthesize",
+                trait_template.name, method.name
+            ));
+        };
+        let function = Node::FunctionDeclaration {
+            name: method.name.clone(),
+            parameters: method.parameters.clone(),
+            return_type: method.return_type.clone(),
+            body: default_body,
+            lambda: false,
+        };
+
+        let target_type = ast::unwrap_binding_const(target_type);
+        match target_type {
+            Type::Custom(name) => {
+                let template = self.concrete_structs.get_mut(name).ok_or_else(|| {
+                    format!(
+                        "trait default methods currently require struct targets, found `{}`",
+                        ast::type_to_string(target_type)
+                    )
+                })?;
+                if !template.functions.iter().any(|candidate| {
+                    matches!(
+                        candidate,
+                        Node::FunctionDeclaration { name: candidate_name, .. }
+                            if candidate_name == &method.name
+                    )
+                }) {
+                    template.functions.push(function);
+                }
+            }
+            Type::GenericInstance { base, .. } => {
+                let template = self.generic_structs.get_mut(base).ok_or_else(|| {
+                    format!(
+                        "trait default methods currently require struct targets, found `{}`",
+                        ast::type_to_string(target_type)
+                    )
+                })?;
+                if !template.functions.iter().any(|candidate| {
+                    matches!(
+                        candidate,
+                        Node::FunctionDeclaration { name: candidate_name, .. }
+                            if candidate_name == &method.name
+                    )
+                }) {
+                    template.functions.push(function);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "trait default methods currently require struct targets, found `{}`",
+                    ast::type_to_string(target_type)
                 ));
             }
         }

@@ -1687,9 +1687,23 @@ fn resolve_type(
         Node::EnumDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
         Node::GenericStructDeclaration { .. }
         | Node::GenericEnumDeclaration { .. }
-        | Node::TraitDeclaration { .. }
         | Node::ShapeDeclaration { .. }
         | Node::ImplDeclaration { .. } => Ok(ResolveResult::new(Type::Void)),
+        Node::TraitDeclaration { name, methods } => {
+            for method in methods {
+                if let Some(body) = &method.default_body {
+                    resolve_function_body(
+                        global_scope,
+                        symbol_tables,
+                        &method.parameters,
+                        &method.return_type,
+                        body,
+                        Some(Type::Custom(name.clone())),
+                    )?;
+                }
+            }
+            Ok(ResolveResult::new(Type::Void))
+        }
         Node::Export { declaration } => {
             resolve_type(global_scope, symbol_tables, declaration, expected_type_opt)
         }

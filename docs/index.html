@@ -382,6 +382,11 @@ function unwrap(value: Option[int]): int {
                 <p>Traits work both as generic constraints and as runtime interface values. Shapes provide reusable structural bounds.</p>
 <pre><code class="language-skunk">trait Writer {
     function write(mut self, value: int): int;
+
+    function write_twice(mut self, value: int): int {
+        self.write(value);
+        return self.write(value);
+    }
 }
 
 trait Resettable {
@@ -419,16 +424,16 @@ function use_writer_like[T: WriterLike](writer: *T): int {
 }</code></pre>
 <pre><code class="language-skunk">function main(): void {
     writer: Writer = Counter { value: 1 };
-    print(writer.write(4));
-    print(writer.write(7));
+    print(writer.write_twice(4));
 }</code></pre>
                 <ul>
                     <li>Trait conformance is explicit through <code>conform Trait for Type { ... }</code>.</li>
+                    <li>Traits may provide default method bodies, and <code>conform</code> blocks only need to implement the required methods they want to customize.</li>
                     <li>Shapes provide structural bounds, for example <code>T: WriterLike</code>, without introducing a runtime trait value.</li>
                     <li>Conform targets may be concrete or generic, for example <code>conform[T] SizedThing for Box[T] { ... }</code>.</li>
                     <li>Generic bounds stack with <code>+</code>.</li>
                     <li>Trait names may be used as runtime types, such as <code>writer: Writer</code>.</li>
-                    <li>Assigning a concrete struct value to a trait value boxes a runtime copy and stores a vtable for dynamic dispatch.</li>
+                    <li>Assigning an addressable concrete value to a trait value borrows its storage for dynamic dispatch; rvalues still box a runtime value with a vtable.</li>
                 </ul>
             </section>
 
@@ -468,7 +473,7 @@ function main(): void {
                     <li>The unsafe memory layer is intentionally small today: there are no raw pointer trait bounds, no arbitrary pointer arithmetic beyond <code>*byte::offset</code>, and no general <code>unsafe</code> standard library yet.</li>
                     <li>No const struct fields yet.</li>
                     <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
-                    <li>Runtime trait values are a V1 boxed model today. Converting a concrete value to a trait value boxes a copy of that value rather than borrowing it in place.</li>
+                    <li>Runtime trait values still use a simple V1 representation. Lvalues reuse their existing storage, while temporaries and other rvalues are boxed when converted to trait values.</li>
                 </ul>
             </section>
 

@@ -193,6 +193,7 @@ pub struct TraitMethodSignature {
     pub name: String,
     pub parameters: Vec<(String, Type)>,
     pub return_type: Type,
+    pub default_body: Option<Vec<Node>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1213,17 +1214,55 @@ impl PestImpl {
 
     fn create_trait_method_decl(&self, pair: Pair<Rule>) -> TraitMethodSignature {
         assert_eq!(pair.as_rule(), Rule::trait_method_decl);
-        let mut inner_pairs = pair.into_inner();
+        let mut inner_pairs = pair.into_inner().peekable();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let parameters = self.create_param_list(inner_pairs.next().unwrap());
-        let return_type = match inner_pairs.next() {
-            Some(pair) => self.create_type(pair.into_inner().next().unwrap()),
+        let return_type = match inner_pairs.peek() {
+            Some(pair) if pair.as_rule() == Rule::return_type => {
+                self.create_type(inner_pairs.next().unwrap().into_inner().next().unwrap())
+            }
             None => Type::Void,
+            _ => Type::Void,
+        };
+        let default_body = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::trait_method_body)
+        {
+            Some(
+                inner_pairs
+                    .next()
+                    .unwrap()
+                    .into_inner()
+                    .map(|pair| self.create_ast(pair))
+                    .collect(),
+            )
+        } else {
+            None
         };
         TraitMethodSignature {
             name,
             parameters,
             return_type,
+            default_body,
+        }
+    }
+
+    fn create_shape_method_decl(&self, pair: Pair<Rule>) -> TraitMethodSignature {
+        assert_eq!(pair.as_rule(), Rule::shape_method_decl);
+        let mut inner_pairs = pair.into_inner().peekable();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let parameters = self.create_param_list(inner_pairs.next().unwrap());
+        let return_type = match inner_pairs.peek() {
+            Some(pair) if pair.as_rule() == Rule::return_type => {
+                self.create_type(inner_pairs.next().unwrap().into_inner().next().unwrap())
+            }
+            _ => Type::Void,
+        };
+        TraitMethodSignature {
+            name,
+            parameters,
+            return_type,
+            default_body: None,
         }
     }
 
@@ -1232,7 +1271,7 @@ impl PestImpl {
         let mut inner_pairs = pair.into_inner();
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let methods = inner_pairs
-            .map(|p| self.create_trait_method_decl(p))
+            .map(|p| self.create_shape_method_decl(p))
             .collect::<Vec<_>>();
         Node::ShapeDeclaration { name, methods }
     }
@@ -3708,6 +3747,7 @@ mod tests {
                             ("value".to_string(), Type::Int),
                         ],
                         return_type: Type::Int,
+                        default_body: None,
                     }],
                 },
                 Node::StructDeclaration {
@@ -3782,7 +3822,53 @@ mod tests {
                             ("value".to_string(), Type::Int),
                         ],
                         return_type: Type::Int,
+                        default_body: None,
                     }],
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_trait_default_method_declaration() {
+        let source_code = r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+                function write_default(mut self, value: int): int {
+                    return value;
+                }
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::TraitDeclaration {
+                    name: "Writer".to_string(),
+                    methods: vec![
+                        TraitMethodSignature {
+                            name: "write".to_string(),
+                            parameters: vec![
+                                ("self".to_string(), Type::MutSelf),
+                                ("value".to_string(), Type::Int),
+                            ],
+                            return_type: Type::Int,
+                            default_body: None,
+                        },
+                        TraitMethodSignature {
+                            name: "write_default".to_string(),
+                            parameters: vec![
+                                ("self".to_string(), Type::MutSelf),
+                                ("value".to_string(), Type::Int),
+                            ],
+                            return_type: Type::Int,
+                            default_body: Some(vec![Node::Return(Some(Box::new(Node::Access {
+                                nodes: vec![Node::Identifier("value".to_string())],
+                            })))]),
+                        },
+                    ],
                 },
                 Node::EOI,
             ],
@@ -3810,6 +3896,7 @@ mod tests {
                             ("value".to_string(), Type::Int),
                         ],
                         return_type: Type::Int,
+                        default_body: None,
                     }],
                 },
                 Node::EOI,
