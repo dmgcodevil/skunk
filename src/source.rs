@@ -419,6 +419,41 @@ impl ModuleNormalizer {
                     methods,
                 }
             }
+            Node::ShapeDeclaration { name, methods } => {
+                let renamed_name = if top_level && !exported {
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
+                } else {
+                    name.clone()
+                };
+                let methods = methods
+                    .into_iter()
+                    .map(|method| {
+                        Ok(ast::TraitMethodSignature {
+                            name: method.name,
+                            parameters: method
+                                .parameters
+                                .into_iter()
+                                .map(|(param_name, param_type)| {
+                                    self.rename_type(param_type, value_scopes, type_scopes)
+                                        .map(|param_type| (param_name, param_type))
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                            return_type: self.rename_type(
+                                method.return_type,
+                                value_scopes,
+                                type_scopes,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Node::ShapeDeclaration {
+                    name: renamed_name,
+                    methods,
+                }
+            }
             Node::ImplDeclaration {
                 generic_params,
                 generic_bounds,
@@ -883,6 +918,9 @@ impl ModuleNormalizer {
             | Node::FunctionDeclaration { .. }
             | Node::GenericFunctionDeclaration { .. }
             | Node::TraitDeclaration { .. }
+            | Node::ShapeDeclaration { .. }
+            | Node::AttachDeclaration { .. }
+            | Node::ConformDeclaration { .. }
             | Node::ImplDeclaration { .. }
             | Node::StructDeclaration { .. }
             | Node::GenericStructDeclaration { .. }
@@ -1046,7 +1084,8 @@ fn top_level_decl_name(node: &Node) -> Option<(TopLevelDeclKind, String)> {
         | Node::GenericStructDeclaration { name, .. }
         | Node::EnumDeclaration { name, .. }
         | Node::GenericEnumDeclaration { name, .. }
-        | Node::TraitDeclaration { name, .. } => Some((TopLevelDeclKind::Type, name.clone())),
+        | Node::TraitDeclaration { name, .. }
+        | Node::ShapeDeclaration { name, .. } => Some((TopLevelDeclKind::Type, name.clone())),
         _ => None,
     }
 }
@@ -1060,9 +1099,10 @@ fn validate_export_target(node: &Node) -> Result<(), String> {
         | Node::GenericStructDeclaration { .. }
         | Node::EnumDeclaration { .. }
         | Node::GenericEnumDeclaration { .. }
-        | Node::TraitDeclaration { .. } => Ok(()),
+        | Node::TraitDeclaration { .. }
+        | Node::ShapeDeclaration { .. } => Ok(()),
         _ => Err(
-            "`export` supports only top-level variables, functions, structs, enums, and traits"
+            "`export` supports only top-level variables, functions, structs, enums, traits, and shapes"
                 .to_string(),
         ),
     }

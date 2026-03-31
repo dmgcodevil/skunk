@@ -36,6 +36,12 @@ struct TraitTemplate {
 }
 
 #[derive(Clone)]
+struct ShapeTemplate {
+    name: String,
+    methods: Vec<ast::TraitMethodSignature>,
+}
+
+#[derive(Clone)]
 struct ImplTemplate {
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
@@ -47,6 +53,12 @@ struct ImplTemplate {
 struct FunctionSignature {
     parameters: Vec<Type>,
     return_type: Type,
+}
+
+#[derive(Clone, Copy)]
+enum ConstraintKind {
+    Trait,
+    Shape,
 }
 
 #[derive(Default, Clone)]
@@ -102,6 +114,7 @@ struct Monomorphizer {
     generic_enums: HashMap<String, EnumTemplate>,
     concrete_enums: HashMap<String, EnumTemplate>,
     traits: HashMap<String, TraitTemplate>,
+    shapes: HashMap<String, ShapeTemplate>,
     impls: Vec<ImplTemplate>,
     implemented_traits: HashMap<String, HashSet<String>>,
     root_traits: Vec<Node>,
@@ -129,6 +142,7 @@ impl Monomorphizer {
         let mut generic_enums = HashMap::new();
         let mut concrete_enums = HashMap::new();
         let mut traits = HashMap::new();
+        let mut shapes = HashMap::new();
         let mut impls = Vec::new();
         let mut root_traits = Vec::new();
         let mut root_concrete_impls = Vec::new();
@@ -254,6 +268,15 @@ impl Monomorphizer {
                     );
                     root_traits.push(statement.clone());
                 }
+                Node::ShapeDeclaration { name, methods } => {
+                    shapes.insert(
+                        name.clone(),
+                        ShapeTemplate {
+                            name: name.clone(),
+                            methods: methods.clone(),
+                        },
+                    );
+                }
                 Node::ImplDeclaration {
                     generic_params,
                     generic_bounds,
@@ -284,6 +307,7 @@ impl Monomorphizer {
             generic_enums,
             concrete_enums,
             traits,
+            shapes,
             impls,
             implemented_traits: HashMap::new(),
             root_traits,
@@ -548,32 +572,64 @@ impl Monomorphizer {
     }
 
     fn check_trait_bounds(
-        &self,
+        &mut self,
         generic_bounds: &HashMap<String, Vec<String>>,
         substitutions: &HashMap<String, Type>,
         context: &str,
     ) -> Result<(), String> {
-        for (param, trait_names) in generic_bounds {
+        for (param, constraint_names) in generic_bounds {
             let actual_type = substitutions
                 .get(param)
                 .ok_or_else(|| format!("missing type argument `{}` for {}", param, context))?;
-            for trait_name in trait_names {
-                let implemented = self.type_implements_trait(actual_type, trait_name)?;
-                if !implemented {
-                    return Err(format!(
-                        "{} requires `{}` to implement trait `{}`, but `{}` does not",
-                        context,
-                        param,
-                        trait_name,
-                        ast::type_to_string(actual_type)
-                    ));
+            for constraint_name in constraint_names {
+                match self.constraint_kind(constraint_name) {
+                    Some(ConstraintKind::Trait) => {
+                        let implemented = self.type_implements_trait(actual_type, constraint_name)?;
+                        if !implemented {
+                            return Err(format!(
+                                "{} requires `{}` to implement trait `{}`, but `{}` does not",
+                                context,
+                                param,
+                                constraint_name,
+                                ast::type_to_string(actual_type)
+                            ));
+                        }
+                    }
+                    Some(ConstraintKind::Shape) => {
+                        let satisfied = self.type_satisfies_shape(actual_type, constraint_name)?;
+                        if !satisfied {
+                            return Err(format!(
+                                "{} requires `{}` to satisfy shape `{}`, but `{}` does not",
+                                context,
+                                param,
+                                constraint_name,
+                                ast::type_to_string(actual_type)
+                            ));
+                        }
+                    }
+                    None => {
+                        return Err(format!(
+                            "unknown trait or shape `{}` referenced by {}",
+                            constraint_name, context
+                        ))
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    fn type_implements_trait(&self, actual_type: &Type, trait_name: &str) -> Result<bool, String> {
+    fn constraint_kind(&self, name: &str) -> Option<ConstraintKind> {
+        if self.traits.contains_key(name) {
+            Some(ConstraintKind::Trait)
+        } else if self.shapes.contains_key(name) {
+            Some(ConstraintKind::Shape)
+        } else {
+            None
+        }
+    }
+
+    fn type_implements_trait(&mut self, actual_type: &Type, trait_name: &str) -> Result<bool, String> {
         let actual_key = ast::type_to_string(actual_type);
         if self
             .implemented_traits
@@ -584,7 +640,7 @@ impl Monomorphizer {
         }
 
         let mut matched = false;
-        for impl_block in &self.impls {
+        for impl_block in self.impls.clone() {
             if !impl_block.trait_names.iter().any(|name| name == trait_name) {
                 continue;
             }
@@ -622,6 +678,78 @@ impl Monomorphizer {
         }
 
         Ok(matched)
+    }
+
+    fn type_satisfies_shape(&mut self, actual_type: &Type, shape_name: &str) -> Result<bool, String> {
+        let shape = self
+            .shapes
+            .get(shape_name)
+            .ok_or_else(|| format!("unknown shape `{}`", shape_name))?
+            .clone();
+        self.validate_shape_satisfaction(&shape, actual_type)
+            .map(|_| true)
+    }
+
+    fn validate_shape_satisfaction(
+        &mut self,
+        shape: &ShapeTemplate,
+        target_type: &Type,
+    ) -> Result<(), String> {
+        for method in &shape.methods {
+            let Some((_, expected_receiver_type)) = method.parameters.first() else {
+                return Err(format!(
+                    "shape `{}` method `{}` must declare `self` as its first parameter",
+                    shape.name, method.name
+                ));
+            };
+            if !ast::is_self_type(expected_receiver_type) {
+                return Err(format!(
+                    "shape `{}` method `{}` must declare `self` as its first parameter",
+                    shape.name, method.name
+                ));
+            }
+            let (actual_receiver_type, actual_parameters, actual_return_type) = self
+                .lookup_method_signature(target_type, &method.name)
+                .map_err(|_| {
+                    format!(
+                        "type `{}` does not satisfy required shape method `{}.{}`",
+                        ast::type_to_string(target_type),
+                        shape.name,
+                        method.name
+                    )
+                })?;
+            let expected_parameters = method
+                .parameters
+                .iter()
+                .skip(1)
+                .map(|(_, sk_type)| sk_type.clone())
+                .collect::<Vec<_>>();
+            if ast::is_mut_self_type(expected_receiver_type)
+                != ast::is_mut_self_type(&actual_receiver_type)
+                || actual_parameters != expected_parameters
+                || actual_return_type != method.return_type
+            {
+                return Err(format!(
+                    "shape method `{}.{}` expects `({}) -> {}`, but `{}` provides `({}) -> {}`",
+                    shape.name,
+                    method.name,
+                    expected_parameters
+                        .iter()
+                        .map(ast::type_to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ast::type_to_string(&method.return_type),
+                    ast::type_to_string(target_type),
+                    actual_parameters
+                        .iter()
+                        .map(ast::type_to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ast::type_to_string(&actual_return_type)
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_runtime_impls_for_type(
@@ -1193,6 +1321,9 @@ impl Monomorphizer {
             Node::Export { .. } => Err("`export` is only allowed at module scope".to_string()),
             Node::TraitDeclaration { .. } => {
                 Err("`trait` is only allowed at module scope".to_string())
+            }
+            Node::ShapeDeclaration { .. } => {
+                Err("`shape` is only allowed at module scope".to_string())
             }
             Node::ImplDeclaration { .. } => {
                 Err("`impl` is only allowed at module scope".to_string())
@@ -1977,6 +2108,9 @@ impl Monomorphizer {
             | Node::Import { .. }
             | Node::Export { .. }
             | Node::TraitDeclaration { .. }
+            | Node::ShapeDeclaration { .. }
+            | Node::AttachDeclaration { .. }
+            | Node::ConformDeclaration { .. }
             | Node::ImplDeclaration { .. }
             | Node::VariableDeclaration { .. }
             | Node::StructDestructure { .. }

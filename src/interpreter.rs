@@ -2818,7 +2818,9 @@ mod tests {
                          struct Point {
                              x: int;
                              y: int;
+                         }
 
+                         attach Point {
                              function set_x(self, x:int) {
                                  self.x = x;
                              }
@@ -2845,7 +2847,9 @@ mod tests {
                          struct Point {
                              x: int;
                              y: int;
+                         }
 
+                         attach Point {
                              function set_x(self, x:int) {
                                  self.x = x;
                              }
@@ -2858,7 +2862,9 @@ mod tests {
                          struct Line {
                              start: Point;
                              end: Point;
+                         }
 
+                         attach Line {
                              function get_start(self):Point {
                                  return self.start;
                              }
@@ -2898,7 +2904,9 @@ mod tests {
                              struct List {
                                  size:int;
                                  capacity:int;
+                             }
 
+                             attach List {
                                  function has_space(self):boolean {
                                      return self.size > self.capacity;
                                  }
@@ -3105,6 +3113,9 @@ mod tests {
     fn test_struct_lambda() {
         let source_code = r#"
                          struct Foo {
+                         }
+
+                         attach Foo {
                              function f(self): (int) -> int {
                                  return function(i:int): int {
                                      return i;

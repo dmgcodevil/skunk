@@ -29,12 +29,12 @@
                 <a href="#bindings-and-const">Bindings and Const</a>
                 <a href="#functions-and-control-flow">Functions and Control Flow</a>
                 <a href="#arrays-and-slices">Arrays and Slices</a>
-                <a href="#structs-and-methods">Structs and Methods</a>
+                <a href="#structs-and-methods">Structs and Attach</a>
                 <a href="#pointers-allocators-and-arenas">Pointers, Allocators, and Arenas</a>
                 <a href="#unsafe-memory">Unsafe Memory</a>
                 <a href="#generics">Generics</a>
                 <a href="#enums-and-match">Enums and Match</a>
-                <a href="#traits-and-impls">Traits and Impls</a>
+                <a href="#traits-and-impls">Traits, Conform, Shapes</a>
                 <a href="#patterns-and-destructuring">Patterns and Destructuring</a>
                 <a href="#current-limitations">Current Limitations</a>
                 <a href="#design-notes">Design Notes</a>
@@ -228,11 +228,13 @@ print(mid[0]);</code></pre>
             </section>
 
             <section id="structs-and-methods">
-                <h2>Structs and Methods</h2>
-                <p>Structs are product types with named fields and methods.</p>
+                <h2>Structs and Attached Behavior</h2>
+                <p>Structs are data-only product types. Behavior lives in separate <code>attach</code> blocks.</p>
 <pre><code class="language-skunk">struct Counter {
     value: int;
+}
 
+attach Counter {
     function bump(mut self): void {
         self.value = self.value + 1;
     }
@@ -243,6 +245,7 @@ print(mid[0]);</code></pre>
 }</code></pre>
                 <p>Receiver mutability is explicit:</p>
                 <ul>
+                    <li><code>attach Type { ... }</code> adds inherent methods to a type without declaring trait conformance.</li>
                     <li><code>self</code> means the method may read but may not mutate receiver state.</li>
                     <li><code>mut self</code> means the method may mutate receiver state.</li>
                     <li><code>*const T</code> may call only read-only <code>self</code> methods.</li>
@@ -364,8 +367,8 @@ function unwrap(value: Option[int]): int {
             </section>
 
             <section id="traits-and-impls">
-                <h2>Traits and Impls</h2>
-                <p>Traits work both as generic constraints and as runtime interface values.</p>
+                <h2>Traits, Conform, and Shapes</h2>
+                <p>Traits work both as generic constraints and as runtime interface values. Shapes provide reusable structural bounds.</p>
 <pre><code class="language-skunk">trait Writer {
     function write(mut self, value: int): int;
 }
@@ -374,24 +377,34 @@ trait Resettable {
     function reset(mut self): void;
 }
 
+shape WriterLike {
+    function write(mut self, value: int): int;
+}
+
 struct Counter {
     value: int;
+}
 
+conform Writer for Counter {
     function write(mut self, value: int): int {
         self.value = self.value + value;
         return self.value;
     }
+}
 
+conform Resettable for Counter {
     function reset(mut self): void {
         self.value = 0;
     }
 }
 
-impl Writer, Resettable for Counter {}
-
 function use_counter[T: Writer + Resettable](counter: *T): int {
     counter.reset();
     return counter.write(41);
+}
+
+function use_writer_like[T: WriterLike](writer: *T): int {
+    return writer.write(5);
 }</code></pre>
 <pre><code class="language-skunk">function main(): void {
     writer: Writer = Counter { value: 1 };
@@ -399,9 +412,9 @@ function use_counter[T: Writer + Resettable](counter: *T): int {
     print(writer.write(7));
 }</code></pre>
                 <ul>
-                    <li>Trait conformance is explicit through <code>impl Trait for Type</code>.</li>
-                    <li><code>impl Writer, Resettable for Counter {}</code> is grouped syntax sugar.</li>
-                    <li>Impl targets may be concrete or generic, for example <code>impl[T] SizedThing for Box[T] {}</code>.</li>
+                    <li>Trait conformance is explicit through <code>conform Trait for Type { ... }</code>.</li>
+                    <li>Shapes provide structural bounds, for example <code>T: WriterLike</code>, without introducing a runtime trait value.</li>
+                    <li>Conform targets may be concrete or generic, for example <code>conform[T] SizedThing for Box[T] { ... }</code>.</li>
                     <li>Generic bounds stack with <code>+</code>.</li>
                     <li>Trait names may be used as runtime types, such as <code>writer: Writer</code>.</li>
                     <li>Assigning a concrete struct value to a trait value boxes a runtime copy and stores a vtable for dynamic dispatch.</li>

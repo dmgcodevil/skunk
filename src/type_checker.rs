@@ -262,6 +262,7 @@ impl GlobalScope {
                     },
                 );
             }
+            Node::ShapeDeclaration { .. } => {}
             Node::ImplDeclaration {
                 generic_params,
                 generic_bounds: _,
@@ -1687,6 +1688,7 @@ fn resolve_type(
         Node::GenericStructDeclaration { .. }
         | Node::GenericEnumDeclaration { .. }
         | Node::TraitDeclaration { .. }
+        | Node::ShapeDeclaration { .. }
         | Node::ImplDeclaration { .. } => Ok(ResolveResult::new(Type::Void)),
         Node::Export { declaration } => {
             resolve_type(global_scope, symbol_tables, declaration, expected_type_opt)
@@ -2626,7 +2628,9 @@ mod tests {
         struct Point {
             x:int;
             y:int;
+        }
 
+        attach Point {
             function set_x(mut self, x:int) {
                 self.x = x;
             }
@@ -3271,7 +3275,9 @@ mod tests {
         let source_code = r#"
         struct Counter {
             value: int;
+        }
 
+        attach Counter {
             function bump(self): void {
                 self.value = self.value + 1;
             }
@@ -3286,7 +3292,9 @@ mod tests {
         let source_code = r#"
         struct Counter {
             value: int;
+        }
 
+        attach Counter {
             function bump(mut self): void {
                 self.value = self.value + 1;
             }
@@ -3301,7 +3309,9 @@ mod tests {
         let source_code = r#"
         struct Counter {
             value: int;
+        }
 
+        attach Counter {
             function bump(mut self): void {
                 self.value = self.value + 1;
             }

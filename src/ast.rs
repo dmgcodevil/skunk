@@ -3,7 +3,7 @@ use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -36,6 +36,23 @@ pub enum Node {
     TraitDeclaration {
         name: String,
         methods: Vec<TraitMethodSignature>,
+    },
+    ShapeDeclaration {
+        name: String,
+        methods: Vec<TraitMethodSignature>,
+    },
+    AttachDeclaration {
+        generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
+        target_type: Type,
+        functions: Vec<Node>,
+    },
+    ConformDeclaration {
+        generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
+        trait_name: String,
+        target_type: Type,
+        functions: Vec<Node>,
     },
     ImplDeclaration {
         generic_params: Vec<String>,
@@ -347,7 +364,7 @@ impl PestImpl {
 
     pub fn parse(&self, code: &str) -> Result<Node, String> {
         match SkunkParser::parse(Rule::program, code) {
-            Ok(pairs) => Ok(self.create_ast(pairs.clone().next().unwrap())),
+            Ok(pairs) => self.desugar_program(self.create_ast(pairs.clone().next().unwrap())),
             Err(e) => Err(format!("parser failed: {}", e)),
         }
     }
@@ -377,7 +394,9 @@ impl PestImpl {
             Rule::struct_decl => self.create_struct_decl(pair),
             Rule::enum_decl => self.create_enum_decl(pair),
             Rule::trait_decl => self.create_trait_decl(pair),
-            Rule::impl_decl => self.create_impl_decl(pair),
+            Rule::shape_decl => self.create_shape_decl(pair),
+            Rule::attach_decl => self.create_attach_decl(pair),
+            Rule::conform_decl => self.create_conform_decl(pair),
             Rule::var_decl => self.create_var_decl(pair),
             Rule::var_decl_stmt => self.create_var_decl(pair.into_inner().next().unwrap()),
             Rule::struct_destructure => self.create_struct_destructure(pair),
@@ -1132,11 +1151,9 @@ impl PestImpl {
             }
         }
         let mut fields: Vec<(String, Type)> = Vec::new();
-        let mut functions = Vec::new();
         while let Some(p) = inner_pairs.next() {
             match p.as_rule() {
                 Rule::struct_field_decl => fields.push(self.create_struct_field_dec(p)),
-                Rule::func_decl => functions.push(self.create_func_decl(p)),
                 _ => panic!("unsupported rule {}", p),
             }
         }
@@ -1144,7 +1161,7 @@ impl PestImpl {
             Node::StructDeclaration {
                 name,
                 fields,
-                functions,
+                functions: Vec::new(),
             }
         } else {
             Node::GenericStructDeclaration {
@@ -1152,7 +1169,7 @@ impl PestImpl {
                 generic_params,
                 generic_bounds,
                 fields,
-                functions,
+                functions: Vec::new(),
             }
         }
     }
@@ -1210,8 +1227,18 @@ impl PestImpl {
         }
     }
 
-    fn create_impl_decl(&self, pair: Pair<Rule>) -> Node {
-        assert_eq!(pair.as_rule(), Rule::impl_decl);
+    fn create_shape_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::shape_decl);
+        let mut inner_pairs = pair.into_inner();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let methods = inner_pairs
+            .map(|p| self.create_trait_method_decl(p))
+            .collect::<Vec<_>>();
+        Node::ShapeDeclaration { name, methods }
+    }
+
+    fn create_attach_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::attach_decl);
         let mut inner_pairs = pair.into_inner().peekable();
         let (generic_params, generic_bounds) = if inner_pairs
             .peek()
@@ -1221,18 +1248,288 @@ impl PestImpl {
         } else {
             (Vec::new(), HashMap::new())
         };
-        let mut rest = inner_pairs.collect::<Vec<_>>();
-        let target_type = self.create_type(rest.pop().unwrap());
-        let trait_names = rest
-            .into_iter()
-            .map(|p| p.as_str().to_string())
-            .collect();
-        Node::ImplDeclaration {
+        let target_type = self.create_type(inner_pairs.next().unwrap());
+        let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
+        Node::AttachDeclaration {
             generic_params,
             generic_bounds,
-            trait_names,
             target_type,
+            functions,
         }
+    }
+
+    fn create_conform_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::conform_decl);
+        let mut inner_pairs = pair.into_inner().peekable();
+        let (generic_params, generic_bounds) = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
+        {
+            self.create_generic_params(inner_pairs.next().unwrap())
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+        let trait_name = inner_pairs.next().unwrap().as_str().to_string();
+        let target_type = self.create_type(inner_pairs.next().unwrap());
+        let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
+        Node::ConformDeclaration {
+            generic_params,
+            generic_bounds,
+            trait_name,
+            target_type,
+            functions,
+        }
+    }
+
+    fn desugar_program(&self, node: Node) -> Result<Node, String> {
+        let Node::Program { statements } = node else {
+            return Ok(node);
+        };
+
+        let mut declared_structs = HashMap::<String, Vec<String>>::new();
+        for statement in &statements {
+            match statement {
+                Node::StructDeclaration { name, .. } => {
+                    declared_structs.insert(name.clone(), Vec::new());
+                }
+                Node::GenericStructDeclaration {
+                    name,
+                    generic_params,
+                    ..
+                } => {
+                    declared_structs.insert(name.clone(), generic_params.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut merged_functions = HashMap::<String, Vec<Node>>::new();
+        let mut seen_method_names = HashMap::<String, HashSet<String>>::new();
+
+        for statement in &statements {
+            match statement {
+                Node::AttachDeclaration {
+                    generic_params,
+                    generic_bounds,
+                    target_type,
+                    functions,
+                } => {
+                    let target_name = self.validate_behavior_target(
+                        "attach",
+                        generic_params,
+                        generic_bounds,
+                        target_type,
+                        &declared_structs,
+                    )?;
+                    self.merge_behavior_functions(
+                        "attach",
+                        &target_name,
+                        functions,
+                        &mut merged_functions,
+                        &mut seen_method_names,
+                    )?;
+                }
+                Node::ConformDeclaration {
+                    generic_params,
+                    generic_bounds,
+                    trait_name,
+                    target_type,
+                    functions,
+                } => {
+                    let target_name = self.validate_behavior_target(
+                        &format!("conform `{}`", trait_name),
+                        generic_params,
+                        generic_bounds,
+                        target_type,
+                        &declared_structs,
+                    )?;
+                    self.merge_behavior_functions(
+                        &format!("conform `{}`", trait_name),
+                        &target_name,
+                        functions,
+                        &mut merged_functions,
+                        &mut seen_method_names,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        let mut output = Vec::new();
+        for statement in statements {
+            match statement {
+                Node::StructDeclaration { name, fields, .. } => {
+                    output.push(Node::StructDeclaration {
+                        functions: merged_functions.remove(&name).unwrap_or_default(),
+                        name,
+                        fields,
+                    });
+                }
+                Node::GenericStructDeclaration {
+                    name,
+                    generic_params,
+                    generic_bounds,
+                    fields,
+                    ..
+                } => {
+                    output.push(Node::GenericStructDeclaration {
+                        functions: merged_functions.remove(&name).unwrap_or_default(),
+                        name,
+                        generic_params,
+                        generic_bounds,
+                        fields,
+                    });
+                }
+                Node::AttachDeclaration { .. } => {}
+                Node::ConformDeclaration {
+                    generic_params,
+                    generic_bounds,
+                    trait_name,
+                    target_type,
+                    ..
+                } => {
+                    output.push(Node::ImplDeclaration {
+                        generic_params,
+                        generic_bounds,
+                        trait_names: vec![trait_name],
+                        target_type,
+                    });
+                }
+                other => output.push(other),
+            }
+        }
+
+        Ok(Node::Program { statements: output })
+    }
+
+    fn validate_behavior_target(
+        &self,
+        kind: &str,
+        generic_params: &[String],
+        generic_bounds: &HashMap<String, Vec<String>>,
+        target_type: &Type,
+        declared_structs: &HashMap<String, Vec<String>>,
+    ) -> Result<String, String> {
+        let (target_name, declared_generic_params) = match target_type {
+            Type::Custom(name) => {
+                let declared = declared_structs.get(name).ok_or_else(|| {
+                    format!("`{}` target `{}` must name an existing struct type", kind, name)
+                })?;
+                (name.clone(), declared.clone())
+            }
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => {
+                let declared = declared_structs.get(base).ok_or_else(|| {
+                    format!("`{}` target `{}` must name an existing struct type", kind, base)
+                })?;
+                if generic_params.is_empty() {
+                    return Err(format!(
+                        "`{}` on concrete generic instance `{}` is not supported yet",
+                        kind,
+                        type_to_string(target_type)
+                    ));
+                }
+                let expected_arguments = generic_params
+                    .iter()
+                    .cloned()
+                    .map(Type::Custom)
+                    .collect::<Vec<_>>();
+                if type_arguments != &expected_arguments {
+                    return Err(format!(
+                        "`{}` generic target `{}` must use its declared generic parameters directly",
+                        kind,
+                        type_to_string(target_type)
+                    ));
+                }
+                (base.clone(), declared.clone())
+            }
+            other => {
+                return Err(format!(
+                    "`{}` target must be a struct type, found `{}`",
+                    kind,
+                    type_to_string(other)
+                ))
+            }
+        };
+
+        if declared_generic_params.is_empty() {
+            if !generic_params.is_empty() {
+                return Err(format!(
+                    "`{}` target `{}` is not generic, so it cannot declare generic parameters",
+                    kind, target_name
+                ));
+            }
+        } else if generic_params != declared_generic_params {
+            return Err(format!(
+                "`{}` target `{}` must declare generic parameters as `[{}]`",
+                kind,
+                target_name,
+                declared_generic_params.join(", ")
+            ));
+        }
+
+        if kind == "attach" && !generic_bounds.is_empty() {
+            return Err("`attach` does not support generic bounds yet".to_string());
+        }
+
+        Ok(target_name)
+    }
+
+    fn merge_behavior_functions(
+        &self,
+        kind: &str,
+        target_name: &str,
+        functions: &[Node],
+        merged_functions: &mut HashMap<String, Vec<Node>>,
+        seen_method_names: &mut HashMap<String, HashSet<String>>,
+    ) -> Result<(), String> {
+        let seen = seen_method_names.entry(target_name.to_string()).or_default();
+        let output = merged_functions.entry(target_name.to_string()).or_default();
+        for function in functions {
+            match function {
+                Node::FunctionDeclaration {
+                    name,
+                    parameters,
+                    lambda: false,
+                    ..
+                } => {
+                    let Some((_, receiver_type)) = parameters.first() else {
+                        return Err(format!(
+                            "`{}` method `{}` on `{}` must declare `self` as its first parameter",
+                            kind, name, target_name
+                        ));
+                    };
+                    if !is_self_type(receiver_type) {
+                        return Err(format!(
+                            "`{}` method `{}` on `{}` must declare `self` as its first parameter",
+                            kind, name, target_name
+                        ));
+                    }
+                    if !seen.insert(name.clone()) {
+                        return Err(format!(
+                            "duplicate attached method `{}` on `{}`",
+                            name, target_name
+                        ));
+                    }
+                    output.push(function.clone());
+                }
+                Node::GenericFunctionDeclaration { name, .. } => {
+                    return Err(format!(
+                        "generic methods are not supported yet in `{}` blocks: `{}`",
+                        kind, name
+                    ))
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported node in `{}` block on `{}`: `{:?}`",
+                        kind, target_name, other
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 
     fn create_enum_variant_decl(&self, pair: Pair<Rule>) -> EnumVariant {
@@ -2169,9 +2466,11 @@ mod tests {
         struct Point {
             x: int;
             y: int;
+        }
 
-            function distance(): int {
-                return x - y;
+        attach Point {
+            function distance(self): int {
+                return self.x - self.y;
             }
         }
         "#;
@@ -2186,12 +2485,12 @@ mod tests {
                         ]),
                         functions: [Node::FunctionDeclaration {
                             name: "distance".to_string(),
-                            parameters: [].to_vec(),
+                            parameters: [("self".to_string(), Type::SkSelf)].to_vec(),
                             return_type: Type::Int,
                             body: Vec::from([Node::Return(Some(Box::new(Node::BinaryOp {
-                                left: Box::new(access_var("x")),
+                                left: Box::new(field_access("self", "x")),
                                 operator: Operator::Subtract,
-                                right: Box::new(access_var("y"))
+                                right: Box::new(field_access("self", "y"))
                             })))]),
                             lambda: false,
                         }]
@@ -2856,6 +3155,9 @@ mod tests {
     fn test_struct_member_function_empty_params() {
         let source_code = r#"
             struct Point {
+            }
+
+            attach Point {
                 function f(self) {
                 }
             }
@@ -2867,6 +3169,9 @@ mod tests {
     fn test_struct_member_function_with_params() {
         let source_code = r#"
             struct Point {
+            }
+
+            attach Point {
                 function f(self, i:int) {
                 }
             }
@@ -2878,6 +3183,9 @@ mod tests {
     fn test_struct_member_function_with_mut_self() {
         let source_code = r#"
             struct Point {
+            }
+
+            attach Point {
                 function f(mut self, i:int) {
                 }
             }
@@ -2911,7 +3219,10 @@ mod tests {
     fn test_struct_static_function() {
         let source_code = r#"
             struct Point {
-                function f() {
+            }
+
+            attach Point {
+                function f(self) {
                 }
             }
         "#;
@@ -2922,7 +3233,10 @@ mod tests {
     fn test_struct_static_function_with_params() {
         let source_code = r#"
             struct Point {
-                function f(i:int) {
+            }
+
+            attach Point {
+                function f(self, i:int) {
                 }
             }
         "#;
@@ -2933,12 +3247,10 @@ mod tests {
     fn test_struct_static_function_call() {
         let source_code = r#"
             struct Point {
-                function new():Point {
-                    return Point{};
-                }
+                x: int;
             }
 
-           Point::new();
+           Point::size_of();
         "#;
 
         println!("{:?}", parse(source_code))
@@ -3378,7 +3690,9 @@ mod tests {
                 function write(self, value: int): int;
             }
 
-            impl Writer for TextWriter {}
+            struct TextWriter {}
+
+            conform Writer for TextWriter {}
         "#;
 
         let expected_ast = Node::Program {
@@ -3393,6 +3707,11 @@ mod tests {
                         ],
                         return_type: Type::Int,
                     }],
+                },
+                Node::StructDeclaration {
+                    name: "TextWriter".to_string(),
+                    fields: vec![],
+                    functions: vec![],
                 },
                 Node::ImplDeclaration {
                     generic_params: vec![],
@@ -3410,11 +3729,22 @@ mod tests {
     #[test]
     fn test_generic_impl_declaration() {
         let source_code = r#"
-            impl[T] Writer for Box[T] {}
+            struct Box[T] {
+                value: T;
+            }
+
+            conform[T] Writer for Box[T] {}
         "#;
 
         let expected_ast = Node::Program {
             statements: vec![
+                Node::GenericStructDeclaration {
+                    name: "Box".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::new(),
+                    fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    functions: vec![],
+                },
                 Node::ImplDeclaration {
                     generic_params: vec!["T".to_string()],
                     generic_bounds: HashMap::new(),
@@ -3443,6 +3773,34 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    methods: vec![TraitMethodSignature {
+                        name: "write".to_string(),
+                        parameters: vec![
+                            ("self".to_string(), Type::MutSelf),
+                            ("value".to_string(), Type::Int),
+                        ],
+                        return_type: Type::Int,
+                    }],
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_shape_declaration() {
+        let source_code = r#"
+            shape WriterLike {
+                function write(mut self, value: int): int;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::ShapeDeclaration {
+                    name: "WriterLike".to_string(),
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),
                         parameters: vec![

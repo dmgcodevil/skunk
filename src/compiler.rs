@@ -3711,7 +3711,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
             }
             Node::EOI => {}
             Node::EnumDeclaration { .. } => {}
-            Node::TraitDeclaration { .. } | Node::ImplDeclaration { .. } => {}
+            Node::TraitDeclaration { .. }
+            | Node::ShapeDeclaration { .. }
+            | Node::ImplDeclaration { .. } => {}
             Node::StructDeclaration {
                 name,
                 functions: struct_functions,
@@ -4154,7 +4156,9 @@ mod tests {
             struct Point {
                 x: int;
                 y: int;
+            }
 
+            attach Point {
                 function sum(self): int {
                     return self.x + self.y;
                 }
@@ -4337,7 +4341,9 @@ mod tests {
             struct Point {
                 x: int;
                 y: int;
+            }
 
+            attach Point {
                 function set_x(mut self, x: int): void {
                     self.x = x;
                 }
@@ -4365,7 +4371,9 @@ mod tests {
             r#"
             struct Counter {
                 value: int;
+            }
 
+            attach Counter {
                 function bump(mut self): void {
                     self.value = self.value + 1;
                 }
@@ -4443,7 +4451,9 @@ mod tests {
             r#"
             struct Counter {
                 value: int;
+            }
 
+            attach Counter {
                 function bump(mut self): void {
                     self.value = self.value + 1;
                 }
@@ -4468,7 +4478,9 @@ mod tests {
             r#"
             struct Point {
                 x: int;
+            }
 
+            attach Point {
                 function get(self): int {
                     return self.x;
                 }
@@ -4602,7 +4614,9 @@ mod tests {
             r#"
             struct Foo {
                 factor: int;
+            }
 
+            attach Foo {
                 function make(self): (int) -> int {
                     return function(i: int): int {
                         return self.factor + i;
@@ -4628,7 +4642,9 @@ mod tests {
             struct Point {
                 x: int;
                 y: int;
+            }
 
+            attach Point {
                 function sum(self): int {
                     return self.x + self.y;
                 }
@@ -4687,7 +4703,9 @@ mod tests {
             r#"
             struct Box[T] {
                 value: T;
+            }
 
+            attach[T] Box[T] {
                 function get(self): T {
                     return self.value;
                 }
@@ -5086,18 +5104,20 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            conform Writer for Counter {
                 function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
                 }
+            }
 
+            conform Resettable for Counter {
                 function reset(mut self): void {
                     self.value = 0;
                 }
             }
-
-            impl Writer, Resettable for Counter {}
 
             function use_counter[T: Writer + Resettable](counter: *T): int {
                 counter.reset();
@@ -5119,6 +5139,43 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_shape_bound_program() {
+        let stdout = compile_and_run(
+            r#"
+            shape WriterLike {
+                function write(mut self, value: int): int;
+            }
+
+            struct BufferWriter {
+                value: int;
+            }
+
+            attach BufferWriter {
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            function use_writer_like[T: WriterLike](writer: *T): int {
+                return writer.write(5);
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                writer: *BufferWriter = BufferWriter::create(heap);
+                writer.value = 7;
+                print(use_writer_like(writer));
+                heap.destroy(writer);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "12\n");
+    }
+
+    #[test]
     fn runs_compiled_trait_object_dynamic_dispatch_program() {
         let stdout = compile_and_run(
             r#"
@@ -5128,14 +5185,14 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            conform Writer for Counter {
                 function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
                 }
             }
-
-            impl Writer for Counter {}
 
             function main(): void {
                 writer: Writer = Counter { value: 1 };
@@ -5159,14 +5216,14 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            conform Writer for Counter {
                 function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
                 }
             }
-
-            impl Writer for Counter {}
 
             function use_writer(writer: Writer): int {
                 return writer.write(9);
@@ -5194,14 +5251,14 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            conform Writer for Counter {
                 function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
                 }
             }
-
-            impl Writer for Counter {}
 
             function create_writer(): Writer {
                 return Counter { value: 10 };
@@ -5229,7 +5286,9 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            conform Writer for Counter {
                 function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;
@@ -5239,8 +5298,6 @@ mod tests {
             struct Plain {
                 value: int;
             }
-
-            impl Writer for Counter {}
 
             function main(): void {
                 writer: Writer = Plain { value: 1 };
@@ -5380,13 +5437,13 @@ mod tests {
 
             struct Box[T] {
                 value: T;
+            }
 
+            conform[T] SizedThing for Box[T] {
                 function size(self): int {
                     return 1;
                 }
             }
-
-            impl[T] SizedThing for Box[T] {}
 
             function measure[T: SizedThing](value: T): int {
                 return value.size();
@@ -5431,13 +5488,13 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            conform Writer for Counter {
                 function write(self, value: int): int {
                     return self.value + value;
                 }
             }
-
-            impl Writer for Counter {}
 
             function main(): void {}
             "#,
@@ -5459,7 +5516,9 @@ mod tests {
 
             struct Counter {
                 value: int;
+            }
 
+            attach Counter {
                 function write(mut self, value: int): int {
                     self.value = self.value + value;
                     return self.value;

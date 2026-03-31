@@ -1,65 +1,59 @@
-struct Point {
-    x: int;
-    y: int;
-
-    function sum(self): int {
-        return self.x + self.y;
-    }
+trait Writer {
+    function write(mut self, value: int): int;
 }
 
-struct Stats {
+shape WriterLike {
+    function write(mut self, value: int): int;
+}
+
+struct ConsoleWriter {
     total: int;
-    first: int;
-    last: int;
+}
 
-    function score(self): int {
-        return self.total + self.first + self.last;
+attach ConsoleWriter {
+    function reset(mut self): void {
+        self.total = 0;
     }
 }
 
-function sum(values: []int): int {
-    total: int = 0;
-
-    for (i: int = 0; i < values.len; i = i + 1) {
-        total = total + values[i];
+conform Writer for ConsoleWriter {
+    function write(mut self, value: int): int {
+        self.total = self.total + value;
+        return self.total;
     }
-
-    return total;
 }
 
-function copy_into(dst: []int, src: []int): void {
-    for (i: int = 0; i < src.len; i = i + 1) {
-        dst[i] = src[i];
+struct BufferWriter {
+    total: int;
+}
+
+attach BufferWriter {
+    function write(mut self, value: int): int {
+        self.total = self.total + value;
+        return self.total;
     }
+}
+
+function save[T: WriterLike](writer: *T, value: int): int {
+    return writer.write(value);
 }
 
 function main(): void {
-    fixed: [5]int = [3, 6, 9, 12, 15];
-    middle: []int = fixed[1:4];
-
     heap: Allocator = System::allocator();
-    arena: Arena = Arena::init(heap);
-    alloc: Allocator = arena.allocator();
 
-    point: *Point = Point::create(alloc);
-    point.x = middle[0];
-    point.y = middle[2];
+    console: *ConsoleWriter = ConsoleWriter::create(heap);
+    console.total = 1;
+    print(save(console, 4));
+    console.reset();
+    print(save(console, 9));
 
-    heap_values: []int = []int::alloc(alloc, middle.len);
-    copy_into(heap_values, middle);
+    buffer: *BufferWriter = BufferWriter::create(heap);
+    buffer.total = 10;
+    print(save(buffer, 5));
 
-    stats: Stats = Stats {
-        total: sum(heap_values),
-        first: heap_values[0],
-        last: heap_values[heap_values.len - 1]
-    };
+    writer: Writer = ConsoleWriter { total: 3 };
+    print(writer.write(2));
 
-    print(fixed.len);
-    print(middle.len);
-    print(point.sum());
-    print(stats.score());
-
-    alloc.destroy(point);
-    alloc.free(heap_values);
-    arena.deinit();
+    heap.destroy(console);
+    heap.destroy(buffer);
 }

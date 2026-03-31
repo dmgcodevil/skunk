@@ -3,7 +3,9 @@ module app.geometry;
 struct Point {
     x: int;
     y: int;
+}
 
+attach Point {
     function magnitude_hint(self): int {
         return self.x + self.y;
     }
