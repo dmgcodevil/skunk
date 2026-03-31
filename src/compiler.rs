@@ -5004,6 +5004,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_assigning_to_const_struct_field() {
+        let result = compile_and_run(
+            r#"
+            struct Counter {
+                const value: int;
+            }
+
+            attach Counter {
+                function reset(mut self): void {
+                    self.value = 0;
+                }
+            }
+
+            function main(): void {
+                counter: Counter = Counter { value: 7 };
+                counter.reset();
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot assign through const-qualified target `int`"));
+    }
+
+    #[test]
     fn rejects_reassigning_const_parameter() {
         let result = compile_and_run(
             r#"

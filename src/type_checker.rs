@@ -301,6 +301,7 @@ impl GlobalScope {
 fn is_assignable(global_scope: &GlobalScope, expected: &Type, actual: &Type) -> bool {
     let expected = unwrap_binding_const(expected);
     let actual = unwrap_binding_const(actual);
+    let actual = unwrap_const_view(actual);
     if expected == actual || is_numeric_assignable(expected, actual) {
         return true;
     }
@@ -3389,6 +3390,39 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_const_struct_field_cannot_be_assigned() {
+        let source_code = r#"
+        struct Counter {
+            const value: int;
+        }
+
+        attach Counter {
+            function reset(mut self): void {
+                self.value = 0;
+            }
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
+    }
+
+    #[test]
+    fn test_const_struct_field_can_be_copied_out() {
+        let source_code = r#"
+        struct Counter {
+            const value: int;
+        }
+
+        function read(counter: Counter): int {
+            current: int = counter.value;
+            return current;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
     }
 
     #[test]

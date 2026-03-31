@@ -93,7 +93,7 @@ unsafe_block      = { "unsafe" ~ "{" ~ statement* ~ "}" }
 param_list        = { (param_decl ~ ("," ~ param_decl)*) }
 param_type_list   = { (_type ~ ("," ~ _type)*) }
 struct_decl       = { "struct" ~ IDENTIFIER ~ generic_params? ~ "{" ~ struct_field_decl* ~ "}" }
-struct_field_decl = { IDENTIFIER ~ ":" ~ _type ~ ";" }
+struct_field_decl = { const_kw? ~ IDENTIFIER ~ ":" ~ _type ~ ";" }
 enum_decl         = { "enum" ~ IDENTIFIER ~ generic_params? ~ "{" ~ enum_variant_decl* ~ "}" }
 enum_variant_decl = { IDENTIFIER ~ ("(" ~ _type ~ ("," ~ _type)* ~ ")")? ~ ";" }
 

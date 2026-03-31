@@ -1585,9 +1585,20 @@ impl PestImpl {
     }
 
     fn create_struct_field_dec(&self, pair: Pair<Rule>) -> (String, Type) {
-        let mut inner_pairs = pair.into_inner();
+        let mut inner_pairs = pair.into_inner().peekable();
+        let is_const = inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::const_kw);
+        if is_const {
+            inner_pairs.next();
+        }
         let field_name = inner_pairs.next().unwrap().as_str().to_string();
-        let field_type = self.create_type(inner_pairs.next().unwrap());
+        let mut field_type = self.create_type(inner_pairs.next().unwrap());
+        if is_const {
+            field_type = Type::Const {
+                inner: Box::new(field_type),
+            };
+        }
         (field_name, field_type)
     }
 
@@ -2491,6 +2502,37 @@ mod tests {
                             ("i".to_string(), Type::Int),
                             ("s".to_string(), Type::String),
                             ("b".to_string(), Type::Boolean),
+                        ]),
+                        functions: [].to_vec()
+                    },
+                    Node::EOI
+                ])
+            },
+            parse(source_code)
+        )
+    }
+
+    #[test]
+    fn test_struct_decl_with_const_field() {
+        let source_code = r#"
+        struct Foo {
+            const i: int;
+            s: string;
+        }
+        "#;
+        assert_eq!(
+            Node::Program {
+                statements: Vec::from([
+                    Node::StructDeclaration {
+                        name: "Foo".to_string(),
+                        fields: Vec::from([
+                            (
+                                "i".to_string(),
+                                Type::Const {
+                                    inner: Box::new(Type::Int)
+                                }
+                            ),
+                            ("s".to_string(), Type::String),
                         ]),
                         functions: [].to_vec()
                     },
