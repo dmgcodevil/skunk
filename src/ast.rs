@@ -1495,21 +1495,23 @@ impl PestImpl {
                     lambda: false,
                     ..
                 } => {
-                    let Some((_, receiver_type)) = parameters.first() else {
-                        return Err(format!(
-                            "`{}` method `{}` on `{}` must declare `self` as its first parameter",
-                            kind, name, target_name
-                        ));
-                    };
-                    if !is_self_type(receiver_type) {
-                        return Err(format!(
-                            "`{}` method `{}` on `{}` must declare `self` as its first parameter",
-                            kind, name, target_name
-                        ));
+                    if kind != "attach" {
+                        let Some((_, receiver_type)) = parameters.first() else {
+                            return Err(format!(
+                                "`{}` method `{}` on `{}` must declare `self` as its first parameter",
+                                kind, name, target_name
+                            ));
+                        };
+                        if !is_self_type(receiver_type) {
+                            return Err(format!(
+                                "`{}` method `{}` on `{}` must declare `self` as its first parameter",
+                                kind, name, target_name
+                            ));
+                        }
                     }
                     if !seen.insert(name.clone()) {
                         return Err(format!(
-                            "duplicate attached method `{}` on `{}`",
+                            "duplicate attached function `{}` on `{}`",
                             name, target_name
                         ));
                     }

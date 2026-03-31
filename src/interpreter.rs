@@ -1960,6 +1960,40 @@ pub fn evaluate_node(
                     dimensions: int_dimensions.clone(),
                 })
             }
+            Type::Custom(struct_name) => {
+                let global_environment_ref = global_environment.borrow();
+                let struct_def = global_environment_ref
+                    .get_struct(struct_name)
+                    .unwrap_or_else(|| panic!("unknown struct `{}`", struct_name));
+                let function = struct_def
+                    .functions
+                    .get(name)
+                    .unwrap_or_else(|| {
+                        panic!("unknown static function `{}` on `{}`", name, struct_name)
+                    });
+                if function
+                    .parameters
+                    .first()
+                    .is_some_and(|parameter| ast::is_self_type(&parameter.sk_type))
+                {
+                    panic!(
+                        "attached receiver method `{}` cannot be called as `{}::{}`",
+                        name, struct_name, name
+                    );
+                }
+                stack.borrow_mut().create_frame_push(name.to_string());
+                let result = evaluate_function(
+                    stack,
+                    arguments,
+                    &function.parameters,
+                    &function.return_type,
+                    &function.body,
+                    global_environment,
+                );
+                drop(global_environment_ref);
+                stack.borrow_mut().pop();
+                result
+            }
             _ => panic!("unsupported static function call type"),
         },
         Node::If {
@@ -3128,6 +3162,28 @@ mod tests {
         let program = ast::parse(source_code);
         let res = evaluate(&program);
         assert_eq!(Value::Integer(1), res.get_value());
+    }
+
+    #[test]
+    fn test_static_attached_function() {
+        let source_code = r#"
+                         struct Point {
+                             x: int;
+                             y: int;
+                         }
+
+                         attach Point {
+                             function new(x:int, y:int): Point {
+                                 return Point { x: x, y: y };
+                             }
+                         }
+
+                         point: Point = Point::new(4, 5);
+                         point.x + point.y;
+                         "#;
+        let program = ast::parse(source_code);
+        let res = evaluate(&program);
+        assert_eq!(Value::Integer(9), res.get_value());
     }
 
     #[test]

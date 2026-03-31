@@ -11,6 +11,10 @@ struct ConsoleWriter {
 }
 
 attach ConsoleWriter {
+    function new(total: int): ConsoleWriter {
+        return ConsoleWriter { total: total };
+    }
+
     function reset(mut self): void {
         self.total = 0;
     }
@@ -28,6 +32,10 @@ struct BufferWriter {
 }
 
 attach BufferWriter {
+    function new(total: int): BufferWriter {
+        return BufferWriter { total: total };
+    }
+
     function write(mut self, value: int): int {
         self.total = self.total + value;
         return self.total;
@@ -51,7 +59,10 @@ function main(): void {
     buffer.total = 10;
     print(save(buffer, 5));
 
-    writer: Writer = ConsoleWriter { total: 3 };
+    local_buffer: BufferWriter = BufferWriter::new(10);
+    print(local_buffer.write(5));
+
+    writer: Writer = ConsoleWriter::new(3);
     print(writer.write(2));
 
     heap.destroy(console);

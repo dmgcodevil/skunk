@@ -1418,6 +1418,20 @@ impl<'a> FunctionCompiler<'a> {
             Type::Custom(enum_name) if self.enums.contains_key(enum_name) => {
                 self.compile_enum_constructor(enum_name, name, arguments)
             }
+            Type::Custom(struct_name) if name != "create" && self.structs.contains_key(struct_name) => {
+                let signature_key = format!("{}::{}", struct_name, name);
+                let signature = self
+                    .signatures
+                    .get(&signature_key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown static function `{}` on `{}` in LLVM backend",
+                            name, struct_name
+                        )
+                    })?;
+                self.compile_direct_call(&signature_key, &signature, arguments, "static function")
+            }
             Type::Custom(_)
             | Type::Byte
             | Type::Short
@@ -3729,9 +3743,12 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                     } = function
                     {
                         let mut parameter_types = Vec::new();
+                        let has_receiver = parameters
+                            .first()
+                            .is_some_and(|(_, param_type)| ast::is_self_type(param_type));
                         let mut compile_params = Vec::new();
-                        for (param_name, param_type) in parameters {
-                            if ast::is_self_type(param_type) {
+                        for (index, (param_name, param_type)) in parameters.iter().enumerate() {
+                            if has_receiver && index == 0 {
                                 continue;
                             }
                             parameter_types.push(llvm_type(param_type, &structs, &enums, &traits)?);
@@ -3749,14 +3766,19 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                                 parameters: parameter_types,
                             },
                         );
-                        let mut method_params = vec![("self".to_string(), Type::Custom(name.clone()))];
-                        method_params.extend(compile_params);
                         functions.push(FunctionPlan {
                             symbol_name,
-                            parameters: method_params,
+                            parameters: if has_receiver {
+                                let mut method_params =
+                                    vec![("self".to_string(), Type::Custom(name.clone()))];
+                                method_params.extend(compile_params);
+                                method_params
+                            } else {
+                                compile_params
+                            },
                             return_type: return_type.clone(),
                             body: body.clone(),
-                            is_method: true,
+                            is_method: has_receiver,
                         });
                     }
                 }
@@ -4366,6 +4388,42 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_static_attached_function_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            attach Point {
+                function new(x: int, y: int): Point {
+                    return Point { x: x, y: y };
+                }
+
+                function origin(): Point {
+                    return Point { x: 0, y: 0 };
+                }
+
+                function sum(self): int {
+                    return self.x + self.y;
+                }
+            }
+
+            function main(): void {
+                point: Point = Point::new(4, 9);
+                origin: Point = Point::origin();
+                print(point.sum());
+                print(origin.sum());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "13\n0\n");
+    }
+
+    #[test]
     fn runs_compiled_mut_self_method_program() {
         let stdout = compile_and_run(
             r#"
@@ -4730,6 +4788,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "42\ndone\n");
+    }
+
+    #[test]
+    fn runs_compiled_generic_static_attached_function_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Box[T] {
+                value: T;
+            }
+
+            attach[T] Box[T] {
+                function wrap(value: T): Box[T] {
+                    return Box[T] { value: value };
+                }
+
+                function get(self): T {
+                    return self.value;
+                }
+            }
+
+            function main(): void {
+                int_box: Box[int] = Box[int]::wrap(41);
+                string_box: Box[string] = Box[string]::wrap("ok");
+                print(int_box.get() + 1);
+                print(string_box.get());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "42\nok\n");
     }
 
     #[test]

@@ -2290,6 +2290,57 @@ fn resolve_type(
                 }
                 Type::Custom(_) | Type::GenericInstance { .. } => {
                     if name != "create" {
+                        if let Type::Custom(custom_name) = _type {
+                        if let Some(struct_symbol) = global_scope.structs.get(custom_name) {
+                            if let Some(function_symbol) = struct_symbol.functions.get(name) {
+                                if let Type::Function {
+                                    parameters,
+                                    return_type,
+                                } = &function_symbol.sk_type
+                                {
+                                    if !parameters.first().is_some_and(is_self_type) {
+                                        if arguments.len() != parameters.len() {
+                                            return Err(format!(
+                                                "error {}:{}: static function `{}` expects {} argument(s), got {}",
+                                                metadata.span.line,
+                                                metadata.span.start,
+                                                name,
+                                                parameters.len(),
+                                                arguments.len()
+                                            ));
+                                        }
+                                        for (argument, parameter_type) in
+                                            arguments.iter().zip(parameters.iter())
+                                        {
+                                            let arg_type = resolve_type(
+                                                global_scope,
+                                                symbol_tables,
+                                                argument,
+                                                Some(parameter_type),
+                                            )?;
+                                            if !is_assignable(
+                                                global_scope,
+                                                parameter_type,
+                                                &arg_type.sk_type,
+                                            ) {
+                                                return Err(format!(
+                                                    "error {}:{}: static function `{}` expected `{}` but got `{}`",
+                                                    metadata.span.line,
+                                                    metadata.span.start,
+                                                    name,
+                                                    type_to_string(parameter_type),
+                                                    type_to_string(&arg_type.sk_type)
+                                                ));
+                                            }
+                                        }
+                                        return Ok(ResolveResult::new(return_type.deref().clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
+                    if name != "create" {
                         return Err(format!(
                             "error {}:{}: type does not support static method `{}`",
                             metadata.span.line, metadata.span.start, name

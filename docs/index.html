@@ -235,6 +235,10 @@ print(mid[0]);</code></pre>
 }
 
 attach Counter {
+    function new(value: int): Counter {
+        return Counter { value: value };
+    }
+
     function bump(mut self): void {
         self.value = self.value + 1;
     }
@@ -242,10 +246,17 @@ attach Counter {
     function get(self): int {
         return self.value;
     }
+}
+
+function main(): void {
+    counter: Counter = Counter::new(4);
+    counter.bump();
+    print(counter.get());
 }</code></pre>
                 <p>Receiver mutability is explicit:</p>
                 <ul>
                     <li><code>attach Type { ... }</code> adds inherent methods to a type without declaring trait conformance.</li>
+                    <li>Attached functions without <code>self</code> are called with <code>Type::name(...)</code> and work well for constructors and factories.</li>
                     <li><code>self</code> means the method may read but may not mutate receiver state.</li>
                     <li><code>mut self</code> means the method may mutate receiver state.</li>
                     <li><code>*const T</code> may call only read-only <code>self</code> methods.</li>

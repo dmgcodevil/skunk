@@ -1673,6 +1673,33 @@ impl Monomorphizer {
                         }
                     }
                     Type::Custom(_) | Type::GenericInstance { .. }
+                        if self.lookup_enum_variant(&internal_type, name)?.is_none() =>
+                    {
+                        let (parameter_types, return_type) =
+                            self.lookup_static_function_signature(&internal_type, name)?;
+                        if arguments.len() != parameter_types.len() {
+                            return Err(format!(
+                                "static function `{}::{}` expects {} argument(s), got {}",
+                                ast::type_to_string(&internal_type),
+                                name,
+                                parameter_types.len(),
+                                arguments.len()
+                            ));
+                        }
+                        for (argument, parameter_type) in arguments.iter().zip(parameter_types.iter())
+                        {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                Some(parameter_type),
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
+                        }
+                        return_type
+                    }
+                    Type::Custom(_) | Type::GenericInstance { .. }
                         if self.lookup_enum_variant(&internal_type, name)?.is_some() =>
                     {
                         let payload_types =
@@ -2886,6 +2913,98 @@ impl Monomorphizer {
             }
             other => Err(format!(
                 "method lookup requires a struct receiver, found `{}`",
+                ast::type_to_string(other)
+            )),
+        }
+    }
+
+    fn lookup_static_function_signature(
+        &mut self,
+        target_type: &Type,
+        function_name: &str,
+    ) -> Result<(Vec<Type>, Type), String> {
+        match target_type {
+            Type::Custom(name) => {
+                let template = self
+                    .concrete_structs
+                    .get(name)
+                    .ok_or_else(|| format!("unknown struct `{}`", name))?;
+                let function = template
+                    .functions
+                    .iter()
+                    .find_map(|function| match function {
+                        Node::FunctionDeclaration {
+                            name,
+                            parameters,
+                            return_type,
+                            ..
+                        } if name == function_name
+                            && !parameters
+                                .first()
+                                .is_some_and(|(_, sk_type)| ast::is_self_type(sk_type)) =>
+                        {
+                            Some((parameters.clone(), return_type.clone()))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        format!("unknown static function `{}` on `{}`", function_name, name)
+                    })?;
+                Ok((
+                    function
+                        .0
+                        .into_iter()
+                        .map(|(_, sk_type)| sk_type)
+                        .collect(),
+                    function.1,
+                ))
+            }
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => {
+                let template = self
+                    .generic_structs
+                    .get(base)
+                    .ok_or_else(|| format!("unknown generic struct `{}`", base))?;
+                let substitutions = template
+                    .generic_params
+                    .iter()
+                    .cloned()
+                    .zip(type_arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                let function = template
+                    .functions
+                    .iter()
+                    .find_map(|function| match function {
+                        Node::FunctionDeclaration {
+                            name,
+                            parameters,
+                            return_type,
+                            ..
+                        } if name == function_name
+                            && !parameters
+                                .first()
+                                .is_some_and(|(_, sk_type)| ast::is_self_type(sk_type)) =>
+                        {
+                            Some((parameters.clone(), return_type.clone()))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        format!("unknown static function `{}` on `{}`", function_name, base)
+                    })?;
+                Ok((
+                    function
+                        .0
+                        .into_iter()
+                        .map(|(_, sk_type)| self.apply_substitutions(&sk_type, &substitutions))
+                        .collect(),
+                    self.apply_substitutions(&function.1, &substitutions),
+                ))
+            }
+            other => Err(format!(
+                "static function lookup requires a struct type, found `{}`",
                 ast::type_to_string(other)
             )),
         }
