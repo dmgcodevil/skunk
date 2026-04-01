@@ -32,6 +32,7 @@
                 <a href="#structs-and-methods">Structs and Attach</a>
                 <a href="#pointers-allocators-and-arenas">Pointers, Allocators, and Arenas</a>
                 <a href="#unsafe-memory">Unsafe Memory</a>
+                <a href="#windowed-2d">Windowed 2D</a>
                 <a href="#generics">Generics</a>
                 <a href="#enums-and-match">Enums and Match</a>
                 <a href="#traits-and-impls">Traits, Conform, Shapes</a>
@@ -341,6 +342,38 @@ function main(): void {
                     <li><code>*T::cast(ptr)</code> reinterprets one pointer type as another pointer type.</li>
                     <li><code>*byte::offset(ptr, n)</code> performs byte-wise pointer offsetting.</li>
                     <li><code>Memory::copy(dst, src, count)</code> and <code>Memory::set(dst, value, count)</code> operate on raw bytes.</li>
+                </ul>
+            </section>
+
+            <section id="windowed-2d">
+                <h2>Windowed 2D</h2>
+                <p>Skunk now includes a small window/input/drawing runtime for simple 2D programs. The current implementation is macOS-first and is aimed at rectangle-based games and visual prototypes.</p>
+<pre><code class="language-skunk">function main(): void {
+    window: Window = Window::create(800, 600, "Skunk");
+
+    for (; window.is_open(); ) {
+        window.poll();
+
+        if (Keyboard::is_down(window, 'q')) {
+            window.close();
+        }
+
+        window.clear(Color::rgb(8, 12, 24));
+        window.draw_rect(120.0, 140.0, 96.0, 64.0, Color::white());
+        window.present();
+    }
+
+    window.deinit();
+}</code></pre>
+                <ul>
+                    <li><code>Window::create(width, height, title)</code> creates a native window handle.</li>
+                    <li><code>window.poll()</code> pumps OS events so keyboard and close state stay current.</li>
+                    <li><code>window.is_open()</code>, <code>window.close()</code>, and <code>window.deinit()</code> control the window lifetime.</li>
+                    <li><code>window.clear(color)</code> fills the framebuffer and <code>window.draw_rect(x, y, w, h, color)</code> draws clipped solid rectangles.</li>
+                    <li><code>window.present()</code> shows the current frame and updates <code>window.delta_time()</code>.</li>
+                    <li><code>Keyboard::is_down(window, 'w')</code> currently uses character keys; arrow keys and richer input enums can come later.</li>
+                    <li><code>Color::rgb(r, g, b)</code>, <code>Color::rgba(r, g, b, a)</code>, and constants like <code>Color::white()</code> pack colors for drawing.</li>
+                    <li>The repository now includes <code>examples/pong.skunk</code> as a complete example built on this API.</li>
                 </ul>
             </section>
 

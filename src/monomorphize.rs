@@ -1779,6 +1779,86 @@ impl Monomorphizer {
                     Type::Custom(system_name) if system_name == "System" && name == "allocator" => {
                         Type::Allocator
                     }
+                    Type::Custom(window_name) if window_name == "Window" && name == "create" => {
+                        if arguments.len() != 3 {
+                            return Err("Window::create expects width, height, and title".to_string());
+                        }
+                        let expected_types = [
+                            Type::Int,
+                            Type::Int,
+                            Type::String,
+                        ];
+                        for (argument, expected_type) in arguments.iter().zip(expected_types.iter()) {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                Some(expected_type),
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
+                        }
+                        Type::Custom("Window".to_string())
+                    }
+                    Type::Custom(color_name) if color_name == "Color" => {
+                        match name.as_str() {
+                            "black" | "white" | "red" | "green" | "blue" => {
+                                if !arguments.is_empty() {
+                                    return Err(format!(
+                                        "Color::{} expects no arguments",
+                                        name
+                                    ));
+                                }
+                                Type::Custom("Color".to_string())
+                            }
+                            "rgb" | "rgba" => {
+                                let expected_len = if name == "rgb" { 3 } else { 4 };
+                                if arguments.len() != expected_len {
+                                    return Err(format!(
+                                        "Color::{} expects {} arguments",
+                                        name, expected_len
+                                    ));
+                                }
+                                for argument in arguments {
+                                    let (argument, _) = self.transform_expr(
+                                        argument,
+                                        env,
+                                        Some(&Type::Int),
+                                        substitutions,
+                                        self_type.clone(),
+                                    )?;
+                                    output_args.push(argument);
+                                }
+                                Type::Custom("Color".to_string())
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "unsupported static call during monomorphization: `Color::{}`",
+                                    name
+                                ))
+                            }
+                        }
+                    }
+                    Type::Custom(keyboard_name) if keyboard_name == "Keyboard" && name == "is_down" => {
+                        if arguments.len() != 2 {
+                            return Err("Keyboard::is_down expects window and key".to_string());
+                        }
+                        let expected_types = [
+                            Type::Custom("Window".to_string()),
+                            Type::Char,
+                        ];
+                        for (argument, expected_type) in arguments.iter().zip(expected_types.iter()) {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                Some(expected_type),
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
+                        }
+                        Type::Boolean
+                    }
                     Type::Custom(memory_name) if memory_name == "Memory" => {
                         match name.as_str() {
                             "copy" | "set" => {
@@ -2117,6 +2197,106 @@ impl Monomorphizer {
                                         method_name
                                     ));
                                 }
+                                if matches!(&current_type, Type::Custom(name) if name == "Window") {
+                                    let mut output_args = Vec::<Vec<Node>>::new();
+                                    let return_type = match method_name.as_str() {
+                                        "is_open" => {
+                                            if arguments.len() != 1 || !arguments[0].is_empty() {
+                                                return Err(format!(
+                                                    "error {}:{}: Window.is_open expects no arguments",
+                                                    call_metadata.span.line, call_metadata.span.start
+                                                ));
+                                            }
+                                            Type::Boolean
+                                        }
+                                        "poll" | "present" | "close" | "deinit" => {
+                                            if arguments.len() != 1 || !arguments[0].is_empty() {
+                                                return Err(format!(
+                                                    "error {}:{}: Window.{} expects no arguments",
+                                                    call_metadata.span.line, call_metadata.span.start, method_name
+                                                ));
+                                            }
+                                            Type::Void
+                                        }
+                                        "delta_time" => {
+                                            if arguments.len() != 1 || !arguments[0].is_empty() {
+                                                return Err(format!(
+                                                    "error {}:{}: Window.delta_time expects no arguments",
+                                                    call_metadata.span.line, call_metadata.span.start
+                                                ));
+                                            }
+                                            Type::Double
+                                        }
+                                        "clear" => {
+                                            if arguments.len() != 1 || arguments[0].len() != 1 {
+                                                return Err(format!(
+                                                    "error {}:{}: Window.clear expects one color argument",
+                                                    call_metadata.span.line, call_metadata.span.start
+                                                ));
+                                            }
+                                            let (argument, _) = self.transform_expr(
+                                                &arguments[0][0],
+                                                env,
+                                                Some(&Type::Custom("Color".to_string())),
+                                                substitutions,
+                                                self_type.clone(),
+                                            )?;
+                                            output_args.push(vec![argument]);
+                                            Type::Void
+                                        }
+                                        "draw_rect" => {
+                                            if arguments.len() != 1 || arguments[0].len() != 5 {
+                                                return Err(format!(
+                                                    "error {}:{}: Window.draw_rect expects x, y, width, height, and color",
+                                                    call_metadata.span.line, call_metadata.span.start
+                                                ));
+                                            }
+                                            let mut output_group = Vec::new();
+                                            for argument in arguments[0].iter().take(4) {
+                                                let (argument, _) = self.transform_expr(
+                                                    argument,
+                                                    env,
+                                                    Some(&Type::Double),
+                                                    substitutions,
+                                                    self_type.clone(),
+                                                )?;
+                                                output_group.push(argument);
+                                            }
+                                            let (color, _) = self.transform_expr(
+                                                &arguments[0][4],
+                                                env,
+                                                Some(&Type::Custom("Color".to_string())),
+                                                substitutions,
+                                                self_type.clone(),
+                                            )?;
+                                            output_group.push(color);
+                                            output_args.push(output_group);
+                                            Type::Void
+                                        }
+                                        _ => {
+                                            return Err(format!(
+                                                "error {}:{}: no method named `{}` found for Window",
+                                                call_metadata.span.line, call_metadata.span.start, method_name
+                                            ))
+                                        }
+                                    };
+                                    current_type = return_type;
+                                    output_nodes.push(Node::MemberAccess {
+                                        member: Box::new(Node::FunctionCall {
+                                            name: method_name.clone(),
+                                            type_arguments: Vec::new(),
+                                            arguments: if output_args.is_empty() {
+                                                arguments.clone()
+                                            } else {
+                                                output_args
+                                            },
+                                            metadata: call_metadata.clone(),
+                                        }),
+                                        metadata: metadata.clone(),
+                                    });
+                                    continue;
+                                }
+
                                 if current_type == Type::Allocator {
                                     let mut output_args = Vec::<Vec<Node>>::new();
                                     let return_type = match method_name.as_str() {

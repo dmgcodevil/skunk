@@ -28,6 +28,13 @@ cargo run -- compile path/to/main.skunk ./out
 ./out
 ```
 
+A new macOS-first window/input runtime is also available for simple 2D programs. The repository includes a playable Pong example:
+
+```bash
+cargo run -- compile examples/pong.skunk ./pong
+./pong
+```
+
 The legacy interpreter path still exists:
 
 ```bash

@@ -18,6 +18,7 @@ enum LlvmType {
     PtrI8,
     Allocator,
     Arena,
+    Window,
     TraitObject(String),
     Struct(String),
     Enum(String),
@@ -56,6 +57,7 @@ impl LlvmType {
             LlvmType::PtrI8 => "ptr".to_string(),
             LlvmType::Allocator => "ptr".to_string(),
             LlvmType::Arena => "ptr".to_string(),
+            LlvmType::Window => "ptr".to_string(),
             LlvmType::TraitObject(name) => format!("%trait.{}", sanitize_name(name)),
             LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
             LlvmType::Enum(name) => format!("%enum.{}", sanitize_name(name)),
@@ -232,7 +234,11 @@ fn llvm_type(
             return_type: Box::new(llvm_type(return_type, structs, enums, traits)?),
         }),
         Type::Custom(name) => {
-            if structs.contains_key(name) {
+            if name == "Color" {
+                Ok(LlvmType::I32)
+            } else if name == "Window" {
+                Ok(LlvmType::Window)
+            } else if structs.contains_key(name) {
                 Ok(LlvmType::Struct(name.clone()))
             } else if enums.contains_key(name) {
                 Ok(LlvmType::Enum(name.clone()))
@@ -1070,6 +1076,7 @@ impl<'a> FunctionCompiler<'a> {
             }
             LlvmType::Allocator
             | LlvmType::Arena
+            | LlvmType::Window
             | LlvmType::TraitObject(_)
             | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => {
@@ -1117,11 +1124,23 @@ impl<'a> FunctionCompiler<'a> {
             }),
             Node::Literal(Literal::Float(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::F32,
-                value: value.to_string(),
+                value: {
+                    let mut formatted = value.to_string();
+                    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+                        formatted.push_str(".0");
+                    }
+                    formatted
+                },
             }),
             Node::Literal(Literal::Double(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::F64,
-                value: value.to_string(),
+                value: {
+                    let mut formatted = value.to_string();
+                    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+                        formatted.push_str(".0");
+                    }
+                    formatted
+                },
             }),
             Node::Literal(Literal::Boolean(value)) => Ok(ExprValue {
                 llvm_type: LlvmType::I1,
@@ -1409,6 +1428,138 @@ impl<'a> FunctionCompiler<'a> {
                         ))
                     }
                 }
+            }
+            Type::Custom(color_name) if color_name == "Color" => match name {
+                "black" | "white" | "red" | "green" | "blue" => {
+                    if !arguments.is_empty() {
+                        return Err(format!("Color::{} expects no arguments", name));
+                    }
+                    let value = match name {
+                        "black" => 0xFF000000u32,
+                        "white" => 0xFFFFFFFFu32,
+                        "red" => 0xFFFF0000u32,
+                        "green" => 0xFF00FF00u32,
+                        "blue" => 0xFF0000FFu32,
+                        _ => unreachable!(),
+                    };
+                    Ok(ExprValue {
+                        llvm_type: LlvmType::I32,
+                        value: value.to_string(),
+                    })
+                }
+                "rgb" | "rgba" => {
+                    let expected_args = if name == "rgb" { 3 } else { 4 };
+                    if arguments.len() != expected_args {
+                        return Err(format!(
+                            "Color::{} expects {} integer argument(s)",
+                            name, expected_args
+                        ));
+                    }
+                    let mut channels = Vec::with_capacity(expected_args);
+                    for argument in arguments {
+                        let channel =
+                            self.compile_expr_with_expected(argument, Some(&LlvmType::I32))?;
+                        let channel = self.coerce_expr(channel, &LlvmType::I32, "Color channel")?;
+                        let masked = self.next_temp();
+                        self.emit_line(format!(
+                            "{} = and i32 {}, 255",
+                            masked, channel.value
+                        ));
+                        channels.push(masked);
+                    }
+                    let alpha = if name == "rgb" {
+                        "255".to_string()
+                    } else {
+                        channels[3].clone()
+                    };
+                    let shifted_alpha = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = shl i32 {}, 24",
+                        shifted_alpha, alpha
+                    ));
+                    let shifted_red = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = shl i32 {}, 16",
+                        shifted_red, channels[0]
+                    ));
+                    let shifted_green = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = shl i32 {}, 8",
+                        shifted_green, channels[1]
+                    ));
+                    let with_red = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = or i32 {}, {}",
+                        with_red, shifted_alpha, shifted_red
+                    ));
+                    let with_green = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = or i32 {}, {}",
+                        with_green, with_red, shifted_green
+                    ));
+                    let full = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = or i32 {}, {}",
+                        full, with_green, channels[2]
+                    ));
+                    Ok(ExprValue {
+                        llvm_type: LlvmType::I32,
+                        value: full,
+                    })
+                }
+                _ => Err(format!(
+                    "LLVM backend does not support static function call `Color::{}` yet",
+                    name
+                )),
+            },
+            Type::Custom(window_name) if window_name == "Window" => {
+                if name != "create" {
+                    return Err(format!(
+                        "LLVM backend does not support static function call `Window::{}` yet",
+                        name
+                    ));
+                }
+                if arguments.len() != 3 {
+                    return Err("Window::create expects width, height, and title".to_string());
+                }
+                let width =
+                    self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::I32))?;
+                let width = self.coerce_expr(width, &LlvmType::I32, "Window::create width")?;
+                let height =
+                    self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I32))?;
+                let height =
+                    self.coerce_expr(height, &LlvmType::I32, "Window::create height")?;
+                let title =
+                    self.compile_expr_with_expected(&arguments[2], Some(&LlvmType::PtrI8))?;
+                let title = self.coerce_expr(title, &LlvmType::PtrI8, "Window::create title")?;
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call ptr @skunk_window_create(i32 {}, i32 {}, ptr {})",
+                    temp, width.value, height.value, title.value
+                ));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::Window,
+                    value: temp,
+                })
+            }
+            Type::Custom(keyboard_name) if keyboard_name == "Keyboard" && name == "is_down" => {
+                if arguments.len() != 2 {
+                    return Err("Keyboard::is_down expects window and key".to_string());
+                }
+                let window =
+                    self.compile_expr_with_expected(&arguments[0], Some(&LlvmType::Window))?;
+                let window = self.coerce_expr(window, &LlvmType::Window, "Keyboard::is_down window")?;
+                let key = self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::Char16))?;
+                let key = self.coerce_expr(key, &LlvmType::Char16, "Keyboard::is_down key")?;
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call i1 @skunk_keyboard_is_down(ptr {}, i16 {})",
+                    temp, window.value, key.value
+                ));
+                Ok(ExprValue {
+                    llvm_type: LlvmType::I1,
+                    value: temp,
+                })
             }
             Type::Pointer { target_type } if name == "cast" => {
                 if !self.unsafe_allowed() {
@@ -2262,6 +2413,151 @@ impl<'a> FunctionCompiler<'a> {
                     }))
                 }
                 _ => Err(format!("unknown Arena method `{}`", method_name)),
+            };
+        }
+
+        if receiver_type == LlvmType::Window {
+            if arguments.len() != 1 {
+                return Err(format!(
+                    "Window method `{}` expects exactly one argument list",
+                    method_name
+                ));
+            }
+            let method_args = &arguments[0];
+            let window_value = self.compile_expr(&Node::Access {
+                nodes: receiver_nodes.to_vec(),
+            })?;
+            return match method_name {
+                "is_open" => {
+                    if !method_args.is_empty() {
+                        return Err("Window.is_open expects no arguments".to_string());
+                    }
+                    let temp = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = call i1 @skunk_window_is_open(ptr {})",
+                        temp, window_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::I1,
+                        value: temp,
+                    }))
+                }
+                "poll" => {
+                    if !method_args.is_empty() {
+                        return Err("Window.poll expects no arguments".to_string());
+                    }
+                    self.emit_line(format!(
+                        "call void @skunk_window_poll(ptr {})",
+                        window_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                "clear" => {
+                    if method_args.len() != 1 {
+                        return Err("Window.clear expects one color argument".to_string());
+                    }
+                    let color =
+                        self.compile_expr_with_expected(&method_args[0], Some(&LlvmType::I32))?;
+                    let color = self.coerce_expr(color, &LlvmType::I32, "Window.clear color")?;
+                    self.emit_line(format!(
+                        "call void @skunk_window_clear(ptr {}, i32 {})",
+                        window_value.value, color.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                "draw_rect" => {
+                    if method_args.len() != 5 {
+                        return Err(
+                            "Window.draw_rect expects x, y, width, height, and color".to_string()
+                        );
+                    }
+                    let x =
+                        self.compile_expr_with_expected(&method_args[0], Some(&LlvmType::F64))?;
+                    let x = self.coerce_expr(x, &LlvmType::F64, "Window.draw_rect x")?;
+                    let y =
+                        self.compile_expr_with_expected(&method_args[1], Some(&LlvmType::F64))?;
+                    let y = self.coerce_expr(y, &LlvmType::F64, "Window.draw_rect y")?;
+                    let width =
+                        self.compile_expr_with_expected(&method_args[2], Some(&LlvmType::F64))?;
+                    let width =
+                        self.coerce_expr(width, &LlvmType::F64, "Window.draw_rect width")?;
+                    let height =
+                        self.compile_expr_with_expected(&method_args[3], Some(&LlvmType::F64))?;
+                    let height =
+                        self.coerce_expr(height, &LlvmType::F64, "Window.draw_rect height")?;
+                    let color =
+                        self.compile_expr_with_expected(&method_args[4], Some(&LlvmType::I32))?;
+                    let color =
+                        self.coerce_expr(color, &LlvmType::I32, "Window.draw_rect color")?;
+                    self.emit_line(format!(
+                        "call void @skunk_window_draw_rect(ptr {}, double {}, double {}, double {}, double {}, i32 {})",
+                        window_value.value, x.value, y.value, width.value, height.value, color.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                "present" => {
+                    if !method_args.is_empty() {
+                        return Err("Window.present expects no arguments".to_string());
+                    }
+                    self.emit_line(format!(
+                        "call void @skunk_window_present(ptr {})",
+                        window_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                "delta_time" => {
+                    if !method_args.is_empty() {
+                        return Err("Window.delta_time expects no arguments".to_string());
+                    }
+                    let temp = self.next_temp();
+                    self.emit_line(format!(
+                        "{} = call double @skunk_window_delta_time(ptr {})",
+                        temp, window_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::F64,
+                        value: temp,
+                    }))
+                }
+                "close" => {
+                    if !method_args.is_empty() {
+                        return Err("Window.close expects no arguments".to_string());
+                    }
+                    self.emit_line(format!(
+                        "call void @skunk_window_close(ptr {})",
+                        window_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                "deinit" => {
+                    if !method_args.is_empty() {
+                        return Err("Window.deinit expects no arguments".to_string());
+                    }
+                    self.emit_line(format!(
+                        "call void @skunk_window_deinit(ptr {})",
+                        window_value.value
+                    ));
+                    Ok(Some(ExprValue {
+                        llvm_type: LlvmType::Void,
+                        value: "void".to_string(),
+                    }))
+                }
+                _ => Err(format!("unknown Window method `{}`", method_name)),
             };
         }
 
@@ -3262,6 +3558,10 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: LlvmType::Arena,
                 value: "null".to_string(),
             },
+            LlvmType::Window => ExprValue {
+                llvm_type: LlvmType::Window,
+                value: "null".to_string(),
+            },
             LlvmType::TraitObject(_) => ExprValue {
                 llvm_type: llvm_type.clone(),
                 value: "zeroinitializer".to_string(),
@@ -3736,6 +4036,7 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::PtrI8
             | LlvmType::Allocator
             | LlvmType::Arena
+            | LlvmType::Window
             | LlvmType::TraitObject(_)
             | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => 8,
@@ -3782,6 +4083,7 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::PtrI8
             | LlvmType::Allocator
             | LlvmType::Arena
+            | LlvmType::Window
             | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => 8,
             LlvmType::TraitObject(_) => 16,
@@ -3864,9 +4166,17 @@ pub fn compile_to_executable(
     })?;
 
     let runtime_c_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_runtime.c");
-    let status = Command::new("clang")
-        .arg(&llvm_ir_path)
-        .arg(&runtime_c_path)
+    let runtime_window_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_window_runtime.m");
+    let mut command = Command::new("clang");
+    command.arg(&llvm_ir_path).arg(&runtime_c_path);
+    if cfg!(target_os = "macos") {
+        command
+            .arg(&runtime_window_path)
+            .arg("-framework")
+            .arg("Cocoa");
+    }
+    let status = command
         .arg("-O2")
         .arg("-o")
         .arg(output_path)
@@ -4168,6 +4478,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         }
         LlvmType::Allocator
         | LlvmType::Arena
+        | LlvmType::Window
         | LlvmType::TraitObject(_)
         | LlvmType::Reference { .. }
         | LlvmType::Pointer { .. } => {
@@ -4203,6 +4514,16 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let _ = writeln!(ir, "declare ptr @skunk_alloc_buffer(ptr, i64, i32)");
     let _ = writeln!(ir, "declare void @skunk_alloc_destroy(ptr, ptr)");
     let _ = writeln!(ir, "declare void @skunk_alloc_free(ptr, ptr)");
+    let _ = writeln!(ir, "declare ptr @skunk_window_create(i32, i32, ptr)");
+    let _ = writeln!(ir, "declare i1 @skunk_window_is_open(ptr)");
+    let _ = writeln!(ir, "declare void @skunk_window_poll(ptr)");
+    let _ = writeln!(ir, "declare void @skunk_window_clear(ptr, i32)");
+    let _ = writeln!(ir, "declare void @skunk_window_draw_rect(ptr, double, double, double, double, i32)");
+    let _ = writeln!(ir, "declare void @skunk_window_present(ptr)");
+    let _ = writeln!(ir, "declare double @skunk_window_delta_time(ptr)");
+    let _ = writeln!(ir, "declare void @skunk_window_close(ptr)");
+    let _ = writeln!(ir, "declare void @skunk_window_deinit(ptr)");
+    let _ = writeln!(ir, "declare i1 @skunk_keyboard_is_down(ptr, i16)");
     let _ = writeln!(ir);
     for layout in traits.values() {
         let _ = writeln!(
@@ -4317,6 +4638,40 @@ mod tests {
 
         let artifact = compile_to_executable(&program, &source_path, &output_path)?;
         let output = Command::new(&artifact.binary_path)
+            .output()
+            .map_err(|err| format!("failed to run compiled test binary: {}", err))?;
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&artifact.llvm_ir_path);
+        let _ = fs::remove_file(&artifact.binary_path);
+
+        if !output.status.success() {
+            return Err(format!(
+                "compiled program exited with status {}",
+                output.status
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn compile_and_run_with_env(source: &str, env_vars: &[(&str, &str)]) -> Result<String, String> {
+        let program = ast::parse(source);
+        let program = monomorphize::prepare_program(&program)?;
+        type_checker::check(&program)?;
+
+        let id = Uuid::new_v4().to_string();
+        let source_path = env::temp_dir().join(format!("skunk_compiler_test_{}.skunk", id));
+        let output_path = env::temp_dir().join(format!("skunk_compiler_test_{}", id));
+        fs::write(&source_path, source)
+            .map_err(|err| format!("failed to write test source: {}", err))?;
+
+        let artifact = compile_to_executable(&program, &source_path, &output_path)?;
+        let mut command = Command::new(&artifact.binary_path);
+        for (key, value) in env_vars {
+            command.env(key, value);
+        }
+        let output = command
             .output()
             .map_err(|err| format!("failed to run compiled test binary: {}", err))?;
 
@@ -5956,6 +6311,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "123\n7\n7\n");
+    }
+
+    #[test]
+    fn runs_compiled_headless_window_program() {
+        let stdout = compile_and_run_with_env(
+            r#"
+            function main(): void {
+                window: Window = Window::create(96, 64, "Headless");
+                print(window.is_open());
+                window.poll();
+                window.clear(Color::black());
+                window.draw_rect(4.0, 6.0, 18.0, 10.0, Color::white());
+                window.present();
+                print(Keyboard::is_down(window, 'w'));
+                print(window.delta_time() > 0.0);
+                window.close();
+                print(window.is_open());
+                window.deinit();
+            }
+            "#,
+            &[("SKUNK_WINDOW_HEADLESS", "1")],
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "true\nfalse\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn runs_headless_pong_example() {
+        let stdout = compile_and_run_with_env(
+            include_str!("../examples/pong.skunk"),
+            &[("SKUNK_WINDOW_HEADLESS", "1")],
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "0\n5\n");
     }
 
     #[test]

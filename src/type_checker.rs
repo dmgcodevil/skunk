@@ -1004,6 +1004,128 @@ fn resolve_access(
                 _ => Err("arena member access expects a function call".to_string()),
             },
             Type::Custom(type_name) => {
+                if type_name == "Window" {
+                    return match member.deref() {
+                        Node::Identifier(field_name) => Err(format!(
+                            "error {}:{}: no field `{}` on Window",
+                            metadata.span.line, metadata.span.start, field_name
+                        )),
+                        Node::FunctionCall {
+                            name,
+                            arguments,
+                            metadata,
+                            ..
+                        } => {
+                            if arguments.len() != 1 {
+                                return Err(format!(
+                                    "error {}:{}: Window.{} expects exactly one argument list",
+                                    metadata.span.line, metadata.span.start, name
+                                ));
+                            }
+                            let method_args = &arguments[0];
+                            let return_type = match name.as_str() {
+                                "is_open" => {
+                                    if !method_args.is_empty() {
+                                        return Err(format!(
+                                            "error {}:{}: Window.is_open expects no arguments",
+                                            metadata.span.line, metadata.span.start
+                                        ));
+                                    }
+                                    Type::Boolean
+                                }
+                                "poll" | "present" | "close" | "deinit" => {
+                                    if !method_args.is_empty() {
+                                        return Err(format!(
+                                            "error {}:{}: Window.{} expects no arguments",
+                                            metadata.span.line, metadata.span.start, name
+                                        ));
+                                    }
+                                    Type::Void
+                                }
+                                "delta_time" => {
+                                    if !method_args.is_empty() {
+                                        return Err(format!(
+                                            "error {}:{}: Window.delta_time expects no arguments",
+                                            metadata.span.line, metadata.span.start
+                                        ));
+                                    }
+                                    Type::Double
+                                }
+                                "clear" => {
+                                    if method_args.len() != 1 {
+                                        return Err(format!(
+                                            "error {}:{}: Window.clear expects one color argument",
+                                            metadata.span.line, metadata.span.start
+                                        ));
+                                    }
+                                    let color_type = resolve_type(
+                                        global_scope,
+                                        symbol_tables,
+                                        &method_args[0],
+                                        Some(&Type::Custom("Color".to_string())),
+                                    )?;
+                                    if color_type.sk_type != Type::Custom("Color".to_string()) {
+                                        return Err(format!(
+                                            "error {}:{}: Window.clear expects a Color argument",
+                                            metadata.span.line, metadata.span.start
+                                        ));
+                                    }
+                                    Type::Void
+                                }
+                                "draw_rect" => {
+                                    if method_args.len() != 5 {
+                                        return Err(format!(
+                                            "error {}:{}: Window.draw_rect expects x, y, width, height, and color",
+                                            metadata.span.line, metadata.span.start
+                                        ));
+                                    }
+                                    for argument in method_args.iter().take(4) {
+                                        let arg_type = resolve_type(
+                                            global_scope,
+                                            symbol_tables,
+                                            argument,
+                                            Some(&Type::Double),
+                                        )?;
+                                        if !is_numeric_type(&arg_type.sk_type) {
+                                            return Err(format!(
+                                                "error {}:{}: Window.draw_rect numeric arguments must be numbers",
+                                                metadata.span.line, metadata.span.start
+                                            ));
+                                        }
+                                    }
+                                    let color_type = resolve_type(
+                                        global_scope,
+                                        symbol_tables,
+                                        &method_args[4],
+                                        Some(&Type::Custom("Color".to_string())),
+                                    )?;
+                                    if color_type.sk_type != Type::Custom("Color".to_string()) {
+                                        return Err(format!(
+                                            "error {}:{}: Window.draw_rect expects a Color argument",
+                                            metadata.span.line, metadata.span.start
+                                        ));
+                                    }
+                                    Type::Void
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "error {}:{}: no method named `{}` found for Window",
+                                        metadata.span.line, metadata.span.start, name
+                                    ))
+                                }
+                            };
+                            resolve_access(
+                                global_scope,
+                                symbol_tables,
+                                return_type,
+                                i + 1,
+                                access_nodes,
+                            )
+                        }
+                        _ => Err("window member access expects a function call".to_string()),
+                    };
+                }
+
                 if global_scope.traits.contains_key(&type_name) {
                     match member.deref() {
                         Node::Identifier(field_name) => Err(format!(
@@ -2471,6 +2593,137 @@ fn resolve_type(
                         ));
                     }
                     return Ok(ResolveResult::new(Type::Allocator));
+                }
+                Type::Custom(custom_name) if custom_name == "Window" => {
+                    if name != "create" {
+                        return Err(format!(
+                            "error {}:{}: Window does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
+                    if arguments.len() != 3 {
+                        return Err(format!(
+                            "error {}:{}: Window::create expects width, height, and title",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let width = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[0],
+                        Some(&Type::Int),
+                    )?;
+                    if !is_integral_type(&width.sk_type) {
+                        return Err(format!(
+                            "error {}:{}: Window::create width must be an integer",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let height = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[1],
+                        Some(&Type::Int),
+                    )?;
+                    if !is_integral_type(&height.sk_type) {
+                        return Err(format!(
+                            "error {}:{}: Window::create height must be an integer",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let title = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[2],
+                        Some(&Type::String),
+                    )?;
+                    if title.sk_type != Type::String {
+                        return Err(format!(
+                            "error {}:{}: Window::create title must be a string",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    return Ok(ResolveResult::new(Type::Custom("Window".to_string())));
+                }
+                Type::Custom(custom_name) if custom_name == "Color" => match name.as_str() {
+                    "black" | "white" | "red" | "green" | "blue" => {
+                        if !arguments.is_empty() {
+                            return Err(format!(
+                                "error {}:{}: Color::{} expects no arguments",
+                                metadata.span.line, metadata.span.start, name
+                            ));
+                        }
+                        return Ok(ResolveResult::new(Type::Custom("Color".to_string())));
+                    }
+                    "rgb" | "rgba" => {
+                        let expected_args = if name == "rgb" { 3 } else { 4 };
+                        if arguments.len() != expected_args {
+                            return Err(format!(
+                                "error {}:{}: Color::{} expects {} integer arguments",
+                                metadata.span.line, metadata.span.start, name, expected_args
+                            ));
+                        }
+                        for argument in arguments {
+                            let arg_type = resolve_type(
+                                global_scope,
+                                symbol_tables,
+                                argument,
+                                Some(&Type::Int),
+                            )?;
+                            if !is_integral_type(&arg_type.sk_type) {
+                                return Err(format!(
+                                    "error {}:{}: Color::{} arguments must be integers",
+                                    metadata.span.line, metadata.span.start, name
+                                ));
+                            }
+                        }
+                        return Ok(ResolveResult::new(Type::Custom("Color".to_string())));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "error {}:{}: Color does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ))
+                    }
+                },
+                Type::Custom(custom_name) if custom_name == "Keyboard" => {
+                    if name != "is_down" {
+                        return Err(format!(
+                            "error {}:{}: Keyboard does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
+                    if arguments.len() != 2 {
+                        return Err(format!(
+                            "error {}:{}: Keyboard::is_down expects window and key",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let window = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[0],
+                        Some(&Type::Custom("Window".to_string())),
+                    )?;
+                    if window.sk_type != Type::Custom("Window".to_string()) {
+                        return Err(format!(
+                            "error {}:{}: Keyboard::is_down expects a Window value",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    let key = resolve_type(
+                        global_scope,
+                        symbol_tables,
+                        &arguments[1],
+                        Some(&Type::Char),
+                    )?;
+                    if key.sk_type != Type::Char {
+                        return Err(format!(
+                            "error {}:{}: Keyboard::is_down expects a char key",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    return Ok(ResolveResult::new(Type::Boolean));
                 }
                 Type::Custom(custom_name) if global_scope.enums.contains_key(custom_name) => {
                     let enum_symbol = global_scope.enums.get(custom_name).unwrap();
