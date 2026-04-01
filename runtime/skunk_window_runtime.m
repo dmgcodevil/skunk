@@ -151,7 +151,11 @@ static void skunk_update_key_state(SkunkWindow *window, NSEvent *event, bool is_
     );
 
     CGRect bounds = CGRectMake(0, 0, skunkWindow->width, skunkWindow->height);
+    CGContextSaveGState(context);
+    CGContextTranslateCTM(context, 0.0, bounds.size.height);
+    CGContextScaleCTM(context, 1.0, -1.0);
     CGContextDrawImage(context, bounds, image);
+    CGContextRestoreGState(context);
 
     CGImageRelease(image);
     CGDataProviderRelease(provider);
