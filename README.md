@@ -60,6 +60,10 @@ Then install `editors/vscode/skunk/dist/dmgcodevil.skunk-0.0.3.vsix` from VS Cod
 ## In This Repository
 
 - [docs/index.html](docs/index.html): Skunk Language Reference
+- [docs/compiler-booklet.html](docs/compiler-booklet.html): print-friendly compiler booklet with diagrams and a worked example
+- [docs/compiler-notebook.md](docs/compiler-notebook.md): compiler notebook, Part 1
+- [docs/compiler-notebook-part2.md](docs/compiler-notebook-part2.md): compiler notebook, Part 2
+- [docs/compiler-notebook-part3.md](docs/compiler-notebook-part3.md): compiler notebook, Part 3, focused on extending the language/compiler
 - [docs/pointers-and-allocators.md](docs/pointers-and-allocators.md): pointer and allocator design note
 - [docs/language-development.md](docs/language-development.md): development contract
 - [`examples/`](examples): runnable sample programs

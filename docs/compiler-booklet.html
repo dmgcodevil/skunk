@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Skunk Compiler Notebook</title>
+    <meta name="description" content="A gentle, printable guide to how the Skunk compiler is built.">
+    <link rel="stylesheet" href="booklet.css">
+</head>
+<body>
+    <div class="book-shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <p class="eyebrow">Printable Guide</p>
+                <h1>Skunk Compiler Notebook</h1>
+                <p>A slow-ramp tour of the compiler for readers who are new to compilers and LLVM.</p>
+            </div>
+
+            <div class="sidebar-actions">
+                <button class="button" type="button" onclick="window.print()">Print / Save PDF</button>
+                <a class="button secondary" href="./compiler-notebook.md">Open Part 1 Markdown</a>
+                <a class="button secondary" href="./compiler-notebook-part2.md">Open Part 2 Markdown</a>
+                <a class="button secondary" href="./compiler-notebook-part3.md">Open Part 3 Markdown</a>
+            </div>
+
+            <nav class="toc" aria-label="Booklet contents">
+                <a href="#start">How To Read This</a>
+                <a href="#pipeline">The Whole Pipeline</a>
+                <a href="#parsing">Parsing And AST</a>
+                <a href="#loading">Modules And Normalization</a>
+                <a href="#monomorphize">Monomorphization</a>
+                <a href="#type-checking">Type Checking</a>
+                <a href="#backend">LLVM, Layouts, And Runtime</a>
+                <a href="#worked-example">Worked Example</a>
+                <a href="#extending-skunk">Extending Skunk</a>
+                <a href="#reading-order">Reading Order</a>
+                <a href="#contributing">How To Contribute</a>
+            </nav>
+
+            <div class="sidebar-note">
+                <p>Human-designed.</p>
+                <p>AI-implemented.</p>
+                <p>Best read with the repo open beside it.</p>
+            </div>
+        </aside>
+
+        <main class="content">
+            <header class="hero">
+                <span class="badge">Compiler Onboarding</span>
+                <h1>Skunk, Explained As A Pipeline</h1>
+                <p class="lead">
+                    This booklet is meant to be printed, annotated, and read slowly. It starts from the top-level story of the compiler, then follows one tiny Skunk program through parsing, checking, layouts, IR generation, and native build.
+                </p>
+
+                <div class="hero-grid">
+                    <div class="callout">
+                        <h2>Who It Is For</h2>
+                        <p>Someone who is new to compiler architecture, new to LLVM, and wants to learn this codebase without being thrown into the deepest file first.</p>
+                    </div>
+                    <div class="callout warm">
+                        <h2>Best Way To Use It</h2>
+                        <p>Read one chapter, then open the linked file and inspect the exact function names mentioned there. This guide is a map, not a replacement for reading code.</p>
+                    </div>
+                </div>
+            </header>
+
+            <section id="start" class="chapter">
+                <h2>How To Read This</h2>
+                <p>
+                    The most important idea in this whole booklet is that Skunk is a pipeline. Each stage receives a program in one form and hands a more useful form to the next stage. If you always know which stage you are in, the compiler stops feeling like a pile of unrelated files.
+                </p>
+                <p>
+                    The second important idea is that not every program exercises every pass equally. A tiny non-generic program will mostly glide through monomorphization. A generic one will make that pass much more interesting. That is normal.
+                </p>
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>main</code> in <code>src/main.rs</code></li>
+                        <li><code>load_program</code> in <code>src/source.rs</code></li>
+                        <li><code>prepare_program</code> in <code>src/monomorphize.rs</code></li>
+                        <li><code>check</code> in <code>src/type_checker.rs</code></li>
+                        <li><code>compile_to_executable</code> in <code>src/compiler.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="pipeline" class="chapter">
+                <h2>The Whole Pipeline</h2>
+                <p>
+                    The high-level path through the compiler is short enough to memorize. That is helpful, because it lets you classify almost every file by its role in the bigger machine.
+                </p>
+
+                <div class="diagram-flow" aria-label="compiler pipeline diagram">
+                    <div class="flow-line">
+                        <div class="flow-node">Source Files</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-node">One Loaded Program</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-node">Parsed AST</div>
+                    </div>
+                    <div class="flow-line">
+                        <div class="flow-node">Prepared / Monomorphized Program</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-node">Type-Checked Program</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-node">LLVM IR</div>
+                    </div>
+                    <div class="flow-line">
+                        <div class="flow-node">Runtime + Clang</div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-node">Native Executable</div>
+                    </div>
+                </div>
+
+                <div class="diagram-grid">
+                    <div class="diagram-card">
+                        <strong>Front End</strong>
+                        <p>Loading, grammar, AST construction, and semantic checks live mostly here.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Middle Preparation</strong>
+                        <p>Monomorphization makes generic programs more concrete before later passes.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Back End</strong>
+                        <p>Layouts, lowering, runtime linkage, and native build happen here.</p>
+                    </div>
+                </div>
+
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>main</code> in <code>src/main.rs</code></li>
+                        <li><code>compile_to_llvm_ir</code> and <code>compile_to_executable</code> in <code>src/compiler.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="parsing" class="chapter">
+                <h2>Parsing And AST</h2>
+                <p>
+                    Skunk parsing is split into two layers. <code>src/grammar.pest</code> describes which source forms are valid. <code>src/ast.rs</code> turns those grammar matches into the compiler's internal tree of <code>Node</code> values.
+                </p>
+                <p>
+                    This matters because the rest of the compiler does not want to reason about raw strings. It wants to reason about named constructs like <code>StructDeclaration</code>, <code>FunctionDeclaration</code>, <code>StructInitialization</code>, and <code>Access</code>.
+                </p>
+                <pre><code>source text
+  "Point { x: 20, y: 22 }"
+
+grammar match
+  recognized as a struct initialization
+
+AST
+  Node::StructInitialization {
+      _type: Point,
+      fields: [("x", 20), ("y", 22)]
+  }</code></pre>
+
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>PestImpl::parse</code> in <code>src/ast.rs</code></li>
+                        <li><code>create_ast</code> in <code>src/ast.rs</code></li>
+                        <li><code>create_primary</code>, <code>create_access</code>, and <code>create_struct_init</code> in <code>src/ast.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="loading" class="chapter">
+                <h2>Modules And Normalization</h2>
+                <p>
+                    <code>src/source.rs</code> is where the compiler stops thinking in terms of "one file the user opened" and starts thinking in terms of "one program the compiler can analyze."
+                </p>
+                <p>
+                    The source loader resolves imports, validates module declarations, detects cycles, and uses the module normalizer to rename private symbols when needed. That makes later global passes much simpler.
+                </p>
+                <div class="reading-card">
+                    <strong>Mental model</strong>
+                    <p class="small">This file turns many source files into one merged, safer program tree.</p>
+                </div>
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>load_program</code> in <code>src/source.rs</code></li>
+                        <li><code>ProgramLoader::load_file</code> and <code>ProgramLoader::module_path</code> in <code>src/source.rs</code></li>
+                        <li><code>ModuleNormalizer::normalize</code> in <code>src/source.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="monomorphize" class="chapter">
+                <h2>Monomorphization</h2>
+                <p>
+                    Generics are comfortable for programmers and inconvenient for backends. Skunk's answer is a preparation pass in <code>src/monomorphize.rs</code> that turns generic templates into concrete specialized program pieces when needed.
+                </p>
+                <p>
+                    The pass is easiest to understand if you think in terms of recipes and finished dishes. A generic function is a recipe. A monomorphized concrete function is one finished dish for one concrete set of type arguments.
+                </p>
+                <div class="diagram-grid">
+                    <div class="diagram-card">
+                        <strong>Collect</strong>
+                        <p>Gather generic templates and concrete declarations.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Decide</strong>
+                        <p>Figure out which concrete instances are actually needed.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Emit</strong>
+                        <p>Produce a prepared program with concrete declarations ready for later passes.</p>
+                    </div>
+                </div>
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>prepare_program</code> in <code>src/monomorphize.rs</code></li>
+                        <li><code>Monomorphizer::new</code> and <code>Monomorphizer::prepare</code> in <code>src/monomorphize.rs</code></li>
+                        <li><code>apply_substitutions</code>, <code>specialized_struct_name</code>, and <code>specialized_function_name</code> in <code>src/monomorphize.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="type-checking" class="chapter">
+                <h2>Type Checking</h2>
+                <p>
+                    The type checker is where the compiler shifts from "this parses" to "this is a legal Skunk program."
+                </p>
+                <p>
+                    The public entry point is <code>check</code>. The most important recursive engine under it is <code>resolve_type</code>. It walks expressions, determines the type they produce, and validates whether the operations used are allowed.
+                </p>
+                <p>
+                    One especially valuable helper in this file is <code>resolve_access</code>, because many language rules come together in access chains like <code>self.x</code>, <code>ptr.*</code>, <code>slice[0]</code>, or <code>window.draw_rect(...)</code>.
+                </p>
+                <div class="worked-example">
+                    <strong>What type checking proves</strong>
+                    <ul>
+                        <li>The names used by the program exist.</li>
+                        <li>The operations on those names make sense.</li>
+                        <li>Assignments are legal.</li>
+                        <li>Returns match declared function types.</li>
+                        <li>Bounds and trait relationships are satisfied.</li>
+                    </ul>
+                </div>
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>check</code> in <code>src/type_checker.rs</code></li>
+                        <li><code>resolve_type</code>, <code>resolve_access</code>, and <code>is_assignable</code> in <code>src/type_checker.rs</code></li>
+                        <li><code>GlobalScope::add</code> and <code>SymbolTables</code> in <code>src/type_checker.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="backend" class="chapter">
+                <h2>LLVM, Layouts, And Runtime</h2>
+                <p>
+                    The backend in <code>src/compiler.rs</code> is where language concepts become storage and instructions. Its own internal vocabulary is <code>LlvmType</code>.
+                </p>
+                <p>
+                    This file also contains the layout structures that describe how values live in memory: <code>StructLayout</code>, <code>EnumLayout</code>, <code>TraitLayout</code>, and <code>TraitMethodLayout</code>.
+                </p>
+                <p>
+                    <code>compile_to_llvm_ir</code> emits textual LLVM IR. Then <code>compile_to_executable</code> writes the IR to disk and invokes <code>clang</code> along with the runtime support files.
+                </p>
+                <div class="diagram-grid">
+                    <div class="diagram-card">
+                        <strong>Layouts</strong>
+                        <p>Describe memory shape so the backend knows where fields and payloads live.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Lowering</strong>
+                        <p>Translate statements and expressions into LLVM instructions.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Runtime Linkage</strong>
+                        <p>Pull in support code from <code>runtime/</code> when the compiled program needs it.</p>
+                    </div>
+                </div>
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>LlvmType</code> and <code>llvm_type</code> in <code>src/compiler.rs</code></li>
+                        <li><code>collect_struct_layouts</code>, <code>collect_enum_layouts</code>, and <code>collect_trait_layouts</code> in <code>src/compiler.rs</code></li>
+                        <li><code>compile_statement</code>, <code>compile_expr_with_expected</code>, <code>compile_struct_literal</code>, and <code>coerce_expr</code> in <code>src/compiler.rs</code></li>
+                        <li><code>compile_to_llvm_ir</code> and <code>compile_to_executable</code> in <code>src/compiler.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="worked-example" class="chapter">
+                <h2>Worked Example: One Tiny Program Through The Compiler</h2>
+                <p>
+                    The best way to make the pipeline feel real is to trace one small program through it. Here is the example used in Part 2 of the notebook:
+                </p>
+                <pre><code>struct Point {
+    x: int;
+    y: int;
+}
+
+attach Point {
+    function sum(self): int {
+        return self.x + self.y;
+    }
+}
+
+function main(): int {
+    p: Point = Point { x: 20, y: 22 };
+    return p.sum();
+}</code></pre>
+
+                <h3>Step 1: Parse It</h3>
+                <p>
+                    The parser recognizes a struct declaration, an attach declaration, and a main function. The method body becomes a nested expression tree rather than a flat string.
+                </p>
+
+                <h3>Step 2: Load It</h3>
+                <p>
+                    Because this example has no imports, <code>load_program</code> has little visible work to do. But it still wraps the result as one coherent program node.
+                </p>
+
+                <h3>Step 3: Prepare It</h3>
+                <p>
+                    Because this example is non-generic, monomorphization mostly passes it through. That is a useful lesson in itself: not every pass dramatically changes every program.
+                </p>
+
+                <h3>Step 4: Type-Check It</h3>
+                <p>
+                    The checker proves that <code>Point</code> exists, the fields are legal, the struct literal initializes valid fields with assignable types, and <code>p.sum()</code> returns an <code>int</code>.
+                </p>
+
+                <h3>Step 5: Build Layouts</h3>
+                <pre><code>StructLayout("Point")
+  field 0 -> x : i32
+  field 1 -> y : i32</code></pre>
+
+                <h3>Step 6: Emit LLVM IR</h3>
+                <p>
+                    The backend lowers the struct literal, method body, and return path into LLVM IR. You do not need to master LLVM syntax to understand the shape: build a value, access its fields, add them, and return the result.
+                </p>
+
+                <h3>Step 7: Link The Binary</h3>
+                <p>
+                    Finally the compiler writes a <code>.ll</code> file and asks <code>clang</code> to produce a native executable, linking runtime support as needed.
+                </p>
+
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>create_struct_init</code> and <code>create_access</code> in <code>src/ast.rs</code></li>
+                        <li><code>resolve_access</code> and <code>resolve_type</code> in <code>src/type_checker.rs</code></li>
+                        <li><code>collect_struct_layouts</code>, <code>compile_struct_literal</code>, and <code>compile_expr_with_expected</code> in <code>src/compiler.rs</code></li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="extending-skunk" class="chapter">
+                <h2>Extending Skunk</h2>
+                <p>
+                    If Parts 1 and 2 teach you how to read the compiler, Part 3 teaches you how to change it. The key idea is to stop thinking of a feature as one edit and start thinking of it as a path through the pipeline.
+                </p>
+                <div class="diagram-grid">
+                    <div class="diagram-card">
+                        <strong>Syntax Path</strong>
+                        <p>Grammar, AST construction, and maybe tests are often enough for small syntax sugar features.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Semantic Path</strong>
+                        <p>Type checking becomes central when the feature changes meaning, validity rules, or inferred types.</p>
+                    </div>
+                    <div class="diagram-card">
+                        <strong>Runtime Path</strong>
+                        <p>Backend lowering and native runtime support matter when the feature requires execution-time behavior.</p>
+                    </div>
+                </div>
+                <div class="worked-example">
+                    <strong>Beginner feature checklist</strong>
+                    <ul>
+                        <li>Start with one tiny example program.</li>
+                        <li>Decide whether the feature is syntax sugar or a new semantic kind of thing.</li>
+                        <li>Touch only the stages that actually need to know about it.</li>
+                        <li>Add parser, type-checker, and compiler/runtime tests as needed.</li>
+                        <li>Update docs and examples so the feature is teachable, not just implemented.</li>
+                    </ul>
+                </div>
+                <div class="code-map">
+                    <strong>Read next in code</strong>
+                    <ul>
+                        <li><code>src/grammar.pest</code> and <code>src/ast.rs</code> for syntax</li>
+                        <li><code>src/type_checker.rs</code> for meaning and rules</li>
+                        <li><code>src/compiler.rs</code> and <code>runtime/</code> for execution behavior</li>
+                        <li><a href="./compiler-notebook-part3.md">Open Part 3</a> for the full extending guide</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="reading-order" class="chapter">
+                <h2>Recommended Reading Order</h2>
+                <p>Read the compiler in this order if you want the architecture before the details:</p>
+                <ol>
+                    <li><code>src/main.rs</code></li>
+                    <li><code>src/source.rs</code></li>
+                    <li><code>src/ast.rs</code></li>
+                    <li><code>src/type_checker.rs</code></li>
+                    <li><code>src/compiler.rs</code></li>
+                </ol>
+                <p>Then go deeper with:</p>
+                <ol>
+                    <li><code>src/grammar.pest</code></li>
+                    <li><code>src/monomorphize.rs</code></li>
+                    <li><code>src/interpreter.rs</code></li>
+                    <li><code>runtime/skunk_runtime.c</code></li>
+                    <li><code>runtime/skunk_window_runtime.m</code></li>
+                </ol>
+            </section>
+
+            <section id="contributing" class="appendix">
+                <h2>How To Contribute Without Getting Lost</h2>
+                <p>
+                    Do not try to understand every file before changing anything. Pick one feature, identify which stage first sees it, and trace only the stages that need to know about it.
+                </p>
+                <p>
+                    A good beginner rhythm is:
+                </p>
+                <ul>
+                    <li>Start with one tiny example program.</li>
+                    <li>Find its syntax in the grammar and AST.</li>
+                    <li>See how the type checker validates it.</li>
+                    <li>See how the backend lowers it.</li>
+                    <li>Add or update a focused test.</li>
+                </ul>
+                <p class="small">
+                    The markdown versions of this guide are here: <a href="./compiler-notebook.md">Part 1</a>, <a href="./compiler-notebook-part2.md">Part 2</a>, and <a href="./compiler-notebook-part3.md">Part 3</a>.
+                </p>
+                <div class="chapter-nav">
+                    <a href="./index.html">Language Reference</a>
+                    <a href="./compiler-notebook.md">Part 1 Markdown</a>
+                    <a href="./compiler-notebook-part2.md">Part 2 Markdown</a>
+                    <a href="./compiler-notebook-part3.md">Part 3 Markdown</a>
+                </div>
+            </section>
+        </main>
+    </div>
+</body>
+</html>

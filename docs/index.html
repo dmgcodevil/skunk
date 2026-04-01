@@ -23,6 +23,7 @@
             <nav id="doc-nav" class="doc-nav" aria-label="Reference navigation">
                 <a href="#overview">Overview</a>
                 <a href="#status">Status</a>
+                <a href="#compiler-notebook">Compiler Notebook</a>
                 <a href="#toolchain">Toolchain</a>
                 <a href="#programs-and-modules">Programs and Modules</a>
                 <a href="#types">Types</a>
@@ -76,6 +77,17 @@
                     <li>Source-level syntax is defined in <code>src/grammar.pest</code>.</li>
                     <li>Implemented behavior is backed by parser, type-checker, source-loader, and compiler tests.</li>
                     <li>This page documents the currently implemented language surface rather than future ideas.</li>
+                </ul>
+            </section>
+
+            <section id="compiler-notebook">
+                <h2>Compiler Notebook</h2>
+                <p>If you are new to compilers or new to LLVM, the repository now includes a slower, beginner-oriented guide to how Skunk is built.</p>
+                <ul>
+                    <li><a href="compiler-booklet.html">Compiler booklet</a>: print-friendly HTML guide with diagrams and a worked example traced through the pipeline.</li>
+                    <li><a href="compiler-notebook.md">Compiler notebook, Part 1</a>: high-level introduction to the architecture and reading order.</li>
+                    <li><a href="compiler-notebook-part2.md">Compiler notebook, Part 2</a>: one small Skunk program followed through parsing, checking, layouts, LLVM lowering, and native build.</li>
+                    <li><a href="compiler-notebook-part3.md">Compiler notebook, Part 3</a>: practical guide to extending Skunk feature by feature.</li>
                 </ul>
             </section>
 
@@ -528,7 +540,6 @@ function main(): void {
                 <ul>
                     <li>No user-defined allocators yet. The current allocator and arena model is still runtime-provided.</li>
                     <li>The unsafe memory layer is intentionally small today: there are no raw pointer trait bounds, no arbitrary pointer arithmetic beyond <code>*byte::offset</code>, and no general <code>unsafe</code> standard library yet.</li>
-                    <li>No const struct fields yet.</li>
                     <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
                     <li>Runtime trait values still use a simple V1 representation. Lvalues reuse their existing storage, while temporaries and other rvalues are boxed when converted to trait values.</li>
                 </ul>
@@ -538,6 +549,10 @@ function main(): void {
                 <h2>Design Notes</h2>
                 <p>The language reference should stay focused on implemented behavior. For deeper design context, see the supporting notes in this repository.</p>
                 <ul>
+                    <li><a href="compiler-booklet.html">Compiler booklet</a></li>
+                    <li><a href="compiler-notebook.md">Compiler notebook, Part 1</a></li>
+                    <li><a href="compiler-notebook-part2.md">Compiler notebook, Part 2</a></li>
+                    <li><a href="compiler-notebook-part3.md">Compiler notebook, Part 3</a></li>
                     <li><a href="pointers-and-allocators.md">Pointer and allocator design</a></li>
                     <li><a href="language-development.md">Language development contract</a></li>
                 </ul>
