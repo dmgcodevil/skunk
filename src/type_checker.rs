@@ -1635,6 +1635,11 @@ fn resolve_function_body(
     Ok(())
 }
 
+/// Recursively resolves and validates the type of one AST node.
+///
+/// This is the main internal engine for semantic checking. It walks statements
+/// and expressions, validates usage against the current symbol tables, and
+/// returns the inferred or validated type for the node.
 fn resolve_type(
     global_scope: &GlobalScope,
     symbol_tables: &mut SymbolTables,
@@ -2666,6 +2671,10 @@ fn resolve_type(
     }
 }
 
+/// Type-checks a fully loaded and monomorphized program.
+///
+/// Successful completion means the program is semantically valid enough for the
+/// interpreter and LLVM backend to consume.
 pub fn check(node: &Node) -> Result<(), String> {
     let mut var_tables = SymbolTables::new();
     var_tables.add(SymbolTable::new());

@@ -363,6 +363,9 @@ impl PestImpl {
         }
     }
 
+    /// Parses a full Skunk source file and returns the post-desugaring AST.
+    ///
+    /// This is the main parser entry point used by the public [`parse`] helper.
     pub fn parse(&self, code: &str) -> Result<Node, String> {
         match SkunkParser::parse(Rule::program, code) {
             Ok(pairs) => self.desugar_program(self.create_ast(pairs.clone().next().unwrap())),
@@ -370,6 +373,10 @@ impl PestImpl {
         }
     }
 
+    /// Dispatches a Pest parse node into the matching AST constructor.
+    ///
+    /// Most parser features eventually flow through this method, so it is a
+    /// useful starting point when adding syntax.
     fn create_ast(&self, pair: Pair<Rule>) -> Node {
         let r = pair.as_rule();
         match r {
@@ -465,6 +472,10 @@ impl PestImpl {
         Node::UnsafeBlock { statements }
     }
 
+    /// Parses the lowest-precedence "primary" expression forms.
+    ///
+    /// This is where unary operators are lowered into dedicated AST nodes before
+    /// the Pratt parser combines them with surrounding operators.
     fn create_primary(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::primary);
         let mut primary_inner_pairs = pair.into_inner();
@@ -636,6 +647,12 @@ impl PestImpl {
         nodes
     }
 
+    /// Builds a normalized access chain such as `value`, `point.x`, or
+    /// `writer.write(1)`.
+    ///
+    /// Accesses are represented as a flat list of steps so later compiler
+    /// passes can reuse the same traversal logic for reads, writes, and method
+    /// dispatch.
     fn create_access(&self, pair: Pair<Rule>) -> Node {
         let mut nodes: Vec<Node> = Vec::new();
         let mut inner_pairs = pair.into_inner();
@@ -706,6 +723,11 @@ impl PestImpl {
         }
     }
 
+    /// Parses a struct literal and stores each field as an explicit
+    /// `(field_name, expression)` pair.
+    ///
+    /// If you add syntactic sugar for struct literals, this is usually the best
+    /// place to desugar it so the type checker and compiler can stay simple.
     fn create_struct_init(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
         let struct_type = self.create_type(inner_pairs.next().unwrap());
@@ -1584,6 +1606,11 @@ impl PestImpl {
         }
     }
 
+    /// Parses one struct field declaration.
+    ///
+    /// Field-level `const` is represented by wrapping the field type in
+    /// [`Type::Const`], which lets later passes reuse the existing readonly
+    /// type machinery.
     fn create_struct_field_dec(&self, pair: Pair<Rule>) -> (String, Type) {
         let mut inner_pairs = pair.into_inner().peekable();
         let is_const = inner_pairs
@@ -1776,10 +1803,15 @@ impl PestImpl {
     }
 }
 
+/// Parses Skunk source code into a desugared AST and panics on invalid input.
+///
+/// Tests in this module prefer this helper because they expect parsing to
+/// succeed and compare directly against concrete AST shapes.
 pub fn parse(input: &str) -> Node {
     PestImpl::new().parse(input).unwrap()
 }
 
+/// Renders a type into the surface-language spelling used in diagnostics.
 pub fn type_to_string(t: &Type) -> String {
     match t {
         Type::Void => "void".to_string(),
@@ -1991,6 +2023,7 @@ pub fn strip_const_view(t: &Type) -> Type {
     }
 }
 
+/// Decodes a quoted Skunk string literal into its runtime string contents.
 pub fn parse_string_literal(literal: &str) -> Result<String, String> {
     let inner = literal
         .strip_prefix('"')

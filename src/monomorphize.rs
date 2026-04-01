@@ -98,6 +98,8 @@ impl Env {
     }
 }
 
+/// Expands generics and synthesizes any derived program structure needed before
+/// type checking and code generation.
 pub fn prepare_program(node: &Node) -> Result<Node, String> {
     let Node::Program { statements } = node else {
         return Ok(node.clone());

@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Loads the entry source file, resolves imports, normalizes module-private
+/// names, and returns one merged program AST.
 pub fn load_program(entry_path: &Path) -> Result<Node, String> {
     let entry_path = fs::canonicalize(entry_path)
         .map_err(|err| format!("failed to resolve `{}`: {}", entry_path.display(), err))?;

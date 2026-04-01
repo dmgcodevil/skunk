@@ -1019,6 +1019,11 @@ impl<'a> FunctionCompiler<'a> {
         self.compile_expr_with_expected(node, None)
     }
 
+    /// Compiles an expression while optionally using an expected target type to
+    /// guide lowering decisions.
+    ///
+    /// This is the main expression entry point used by variable initializers,
+    /// assignments, returns, and struct field construction.
     fn compile_expr_with_expected(
         &mut self,
         node: &Node,
@@ -1870,6 +1875,10 @@ impl<'a> FunctionCompiler<'a> {
         }
     }
 
+    /// Lowers a typed struct literal into an LLVM aggregate value.
+    ///
+    /// Field expressions are compiled one by one and inserted into a
+    /// zero-initialized aggregate using the resolved struct layout.
     fn compile_struct_literal(
         &mut self,
         struct_name: &str,
@@ -3242,6 +3251,10 @@ impl<'a> FunctionCompiler<'a> {
         Ok(())
     }
 
+    /// Converts a compiled expression into an expected LLVM type when the
+    /// language permits an implicit coercion.
+    ///
+    /// Numeric widening and trait-object coercions both flow through here.
     fn coerce_expr(
         &mut self,
         value: ExprValue,
@@ -3693,6 +3706,7 @@ pub struct CompiledArtifact {
     pub binary_path: PathBuf,
 }
 
+/// Compiles a checked Skunk program into LLVM IR and a native executable.
 pub fn compile_to_executable(
     program: &Node,
     source_path: &Path,
@@ -3738,6 +3752,8 @@ pub fn compile_to_executable(
     })
 }
 
+/// Lowers a checked Skunk program into textual LLVM IR without invoking the
+/// system linker.
 pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let statements = match program {
         Node::Program { statements } => statements,

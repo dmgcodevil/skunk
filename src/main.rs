@@ -16,6 +16,7 @@ enum CommandKind {
     Compile { output: Option<PathBuf> },
 }
 
+/// Parses the command line into a high-level command and source path.
 fn parse_cli(args: &[String]) -> Result<(CommandKind, &str), String> {
     match args.len() {
         2 => Ok((CommandKind::Interpret, &args[1])),
@@ -47,6 +48,8 @@ fn parse_cli(args: &[String]) -> Result<(CommandKind, &str), String> {
     }
 }
 
+/// Chooses the default binary path for `skunk compile` when the caller does not
+/// provide one explicitly.
 fn default_output_path(source_path: &Path) -> PathBuf {
     let stem = source_path
         .file_stem()
