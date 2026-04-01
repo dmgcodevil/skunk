@@ -386,7 +386,11 @@ impl ModuleNormalizer {
                     lambda,
                 }
             }
-            Node::TraitDeclaration { name, methods } => {
+            Node::TraitDeclaration {
+                name,
+                supertraits,
+                methods,
+            } => {
                 let renamed_name = if top_level && !exported {
                     self.type_renames
                         .get(&name)
@@ -395,6 +399,10 @@ impl ModuleNormalizer {
                 } else {
                     name.clone()
                 };
+                let supertraits = supertraits
+                    .into_iter()
+                    .map(|name| self.rename_type_name(&name, type_scopes))
+                    .collect::<Vec<_>>();
                 let methods = methods
                     .into_iter()
                     .map(|method| {
@@ -431,6 +439,7 @@ impl ModuleNormalizer {
                     .collect::<Result<Vec<_>, String>>()?;
                 Node::TraitDeclaration {
                     name: renamed_name,
+                    supertraits,
                     methods,
                 }
             }

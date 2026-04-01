@@ -32,6 +32,7 @@ struct EnumTemplate {
 #[derive(Clone)]
 struct TraitTemplate {
     name: String,
+    supertraits: Vec<String>,
     methods: Vec<ast::TraitMethodSignature>,
 }
 
@@ -260,11 +261,16 @@ impl Monomorphizer {
                     );
                     root_statements.push(statement.clone());
                 }
-                Node::TraitDeclaration { name, methods } => {
+                Node::TraitDeclaration {
+                    name,
+                    supertraits,
+                    methods,
+                } => {
                     traits.insert(
                         name.clone(),
                         TraitTemplate {
                             name: name.clone(),
+                            supertraits: supertraits.clone(),
                             methods: methods.clone(),
                         },
                     );
@@ -330,6 +336,7 @@ impl Monomorphizer {
     }
 
     fn prepare(&mut self) -> Result<Node, String> {
+        self.validate_traits()?;
         self.validate_impls()?;
         let mut output = Vec::<Node>::new();
         output.extend(self.root_traits.clone());
@@ -417,6 +424,102 @@ impl Monomorphizer {
         Ok(Node::Program { statements: output })
     }
 
+    fn validate_traits(&self) -> Result<(), String> {
+        for trait_name in self.traits.keys() {
+            let mut visiting = Vec::new();
+            let _ = self.collect_trait_methods(trait_name, &mut visiting)?;
+        }
+        Ok(())
+    }
+
+    fn collect_trait_methods(
+        &self,
+        trait_name: &str,
+        visiting: &mut Vec<String>,
+    ) -> Result<Vec<ast::TraitMethodSignature>, String> {
+        if visiting.iter().any(|name| name == trait_name) {
+            visiting.push(trait_name.to_string());
+            return Err(format!(
+                "cyclic supertrait relationship detected: {}",
+                visiting.join(" -> ")
+            ));
+        }
+        let trait_template = self
+            .traits
+            .get(trait_name)
+            .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
+        visiting.push(trait_name.to_string());
+        let mut methods = Vec::new();
+        let mut seen = HashSet::new();
+        for supertrait in &trait_template.supertraits {
+            for method in self.collect_trait_methods(supertrait, visiting)? {
+                if seen.insert(method.name.clone()) {
+                    methods.push(method);
+                }
+            }
+        }
+        for method in &trait_template.methods {
+            if !seen.insert(method.name.clone()) {
+                return Err(format!(
+                    "trait `{}` declares duplicate inherited method `{}`",
+                    trait_name, method.name
+                ));
+            }
+            methods.push(method.clone());
+        }
+        visiting.pop();
+        Ok(methods)
+    }
+
+    fn collect_trait_ancestors(
+        &self,
+        trait_name: &str,
+        visiting: &mut Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        if visiting.iter().any(|name| name == trait_name) {
+            visiting.push(trait_name.to_string());
+            return Err(format!(
+                "cyclic supertrait relationship detected: {}",
+                visiting.join(" -> ")
+            ));
+        }
+        let trait_template = self
+            .traits
+            .get(trait_name)
+            .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
+        visiting.push(trait_name.to_string());
+        let mut ancestors = Vec::new();
+        let mut seen = HashSet::new();
+        for supertrait in &trait_template.supertraits {
+            if seen.insert(supertrait.clone()) {
+                ancestors.push(supertrait.clone());
+            }
+            for ancestor in self.collect_trait_ancestors(supertrait, visiting)? {
+                if seen.insert(ancestor.clone()) {
+                    ancestors.push(ancestor);
+                }
+            }
+        }
+        visiting.pop();
+        Ok(ancestors)
+    }
+
+    fn trait_extends(&self, child: &str, ancestor: &str) -> Result<bool, String> {
+        if child == ancestor {
+            return Ok(true);
+        }
+        Ok(self
+            .collect_trait_ancestors(child, &mut Vec::new())?
+            .iter()
+            .any(|name| name == ancestor))
+    }
+
+    fn implied_trait_names(&self, trait_name: &str) -> Result<Vec<String>, String> {
+        let mut names = vec![trait_name.to_string()];
+        names.extend(self.collect_trait_ancestors(trait_name, &mut Vec::new())?);
+        Ok(names)
+    }
+
     fn validate_impls(&mut self) -> Result<(), String> {
         let impls = self.impls.clone();
         for impl_block in impls {
@@ -430,6 +533,8 @@ impl Monomorphizer {
                     .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
                 self.validate_trait_implementation(&trait_template, &impl_block.target_type)?;
                 if impl_block.generic_params.is_empty() {
+                    let implied_traits =
+                        self.collect_trait_ancestors(&trait_name, &mut Vec::new())?;
                     let implemented = self
                         .implemented_traits
                         .entry(target_key.clone())
@@ -442,6 +547,18 @@ impl Monomorphizer {
                     }
                     self.generated_impl_keys
                         .insert(format!("{}=>{}", trait_name, target_key));
+                    for implied_trait in implied_traits {
+                        implemented.insert(implied_trait.clone());
+                        let implied_key = format!("{}=>{}", implied_trait, target_key);
+                        if self.generated_impl_keys.insert(implied_key) {
+                            self.generated_impls.push(Node::ImplDeclaration {
+                                generic_params: Vec::new(),
+                                generic_bounds: HashMap::new(),
+                                trait_names: vec![implied_trait],
+                                target_type: impl_block.target_type.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -522,7 +639,7 @@ impl Monomorphizer {
         trait_template: &TraitTemplate,
         target_type: &Type,
     ) -> Result<(), String> {
-        for method in &trait_template.methods {
+        for method in self.collect_trait_methods(&trait_template.name, &mut Vec::new())? {
             let Some((_, expected_receiver_type)) = method.parameters.first() else {
                 return Err(format!(
                     "trait `{}` method `{}` must declare `self` as its first parameter",
@@ -543,7 +660,7 @@ impl Monomorphizer {
                             self.synthesize_trait_default_method(
                                 trait_template,
                                 target_type,
-                                method,
+                                &method,
                             )?;
                             self.lookup_method_signature(target_type, &method.name).map_err(
                                 |_| {
@@ -735,7 +852,11 @@ impl Monomorphizer {
 
         let mut matched = false;
         for impl_block in self.impls.clone() {
-            if !impl_block.trait_names.iter().any(|name| name == trait_name) {
+            if !impl_block
+                .trait_names
+                .iter()
+                .any(|name| self.trait_extends(name, trait_name).unwrap_or(false))
+            {
                 continue;
             }
             if impl_block.generic_params.is_empty() {
@@ -881,16 +1002,18 @@ impl Monomorphizer {
             }
 
             for trait_name in impl_block.trait_names {
-                let key = format!("{}=>{}", trait_name, concrete_key);
-                if !self.generated_impl_keys.insert(key) {
-                    continue;
+                for implied_trait in self.implied_trait_names(&trait_name)? {
+                    let key = format!("{}=>{}", implied_trait, concrete_key);
+                    if !self.generated_impl_keys.insert(key) {
+                        continue;
+                    }
+                    self.generated_impls.push(Node::ImplDeclaration {
+                        generic_params: Vec::new(),
+                        generic_bounds: HashMap::new(),
+                        trait_names: vec![implied_trait],
+                        target_type: concrete_type.clone(),
+                    });
                 }
-                self.generated_impls.push(Node::ImplDeclaration {
-                    generic_params: Vec::new(),
-                    generic_bounds: HashMap::new(),
-                    trait_names: vec![trait_name],
-                    target_type: concrete_type.clone(),
-                });
             }
         }
         Ok(())

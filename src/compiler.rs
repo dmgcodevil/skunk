@@ -354,51 +354,100 @@ fn collect_trait_layouts(
     structs: &HashMap<String, StructLayout>,
     enums: &HashMap<String, EnumLayout>,
 ) -> Result<HashMap<String, TraitLayout>, String> {
-    let mut layouts = statements
+    let trait_decls = statements
         .iter()
         .filter_map(|statement| match statement {
-            Node::TraitDeclaration { name, .. } => Some((
-                name.clone(),
-                TraitLayout {
-                    name: name.clone(),
-                    methods: Vec::new(),
-                },
-            )),
+            Node::TraitDeclaration {
+                name,
+                supertraits,
+                methods,
+            } => Some((name.clone(), (supertraits.clone(), methods.clone()))),
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    for statement in statements {
-        let Node::TraitDeclaration { name, methods } = statement else {
-            continue;
-        };
-        let method_layouts = methods
-            .iter()
-            .map(|method| {
-                let receiver_type = method
+    fn build_trait_layout(
+        trait_name: &str,
+        trait_decls: &HashMap<String, (Vec<String>, Vec<ast::TraitMethodSignature>)>,
+        structs: &HashMap<String, StructLayout>,
+        enums: &HashMap<String, EnumLayout>,
+        layouts: &mut HashMap<String, TraitLayout>,
+        visiting: &mut Vec<String>,
+    ) -> Result<TraitLayout, String> {
+        if let Some(layout) = layouts.get(trait_name) {
+            return Ok(layout.clone());
+        }
+        if visiting.iter().any(|name| name == trait_name) {
+            visiting.push(trait_name.to_string());
+            return Err(format!(
+                "cyclic supertrait relationship detected: {}",
+                visiting.join(" -> ")
+            ));
+        }
+        let (supertraits, methods) = trait_decls
+            .get(trait_name)
+            .cloned()
+            .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
+        visiting.push(trait_name.to_string());
+        let mut method_layouts = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for supertrait in supertraits {
+            let layout = build_trait_layout(
+                &supertrait,
+                trait_decls,
+                structs,
+                enums,
+                layouts,
+                visiting,
+            )?;
+            for method in layout.methods {
+                if seen.insert(method.name.clone()) {
+                    method_layouts.push(method);
+                }
+            }
+        }
+        for method in methods {
+            let receiver_type = method
+                .parameters
+                .first()
+                .map(|(_, ty)| ty.clone())
+                .ok_or_else(|| format!("trait method `{}` is missing self", method.name))?;
+            if !seen.insert(method.name.clone()) {
+                return Err(format!(
+                    "trait `{}` declares duplicate inherited method `{}`",
+                    trait_name, method.name
+                ));
+            }
+            method_layouts.push(TraitMethodLayout {
+                name: method.name.clone(),
+                receiver_is_mut: matches!(receiver_type, Type::MutSelf),
+                return_type: llvm_type(&method.return_type, structs, enums, layouts)?,
+                parameters: method
                     .parameters
-                    .first()
-                    .map(|(_, ty)| ty.clone())
-                    .ok_or_else(|| format!("trait method `{}` is missing self", method.name))?;
-                Ok(TraitMethodLayout {
-                    name: method.name.clone(),
-                    receiver_is_mut: matches!(receiver_type, Type::MutSelf),
-                    return_type: llvm_type(&method.return_type, structs, enums, &layouts)?,
-                    parameters: method
-                        .parameters
-                        .iter()
-                        .skip(1)
-                        .map(|(_, ty)| llvm_type(ty, structs, enums, &layouts))
-                        .collect::<Result<Vec<_>, String>>()?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        layouts.insert(
-            name.clone(),
-            TraitLayout {
-                name: name.clone(),
-                methods: method_layouts,
-            },
-        );
+                    .iter()
+                    .skip(1)
+                    .map(|(_, ty)| llvm_type(ty, structs, enums, layouts))
+                    .collect::<Result<Vec<_>, String>>()?,
+            });
+        }
+        visiting.pop();
+        let layout = TraitLayout {
+            name: trait_name.to_string(),
+            methods: method_layouts,
+        };
+        layouts.insert(trait_name.to_string(), layout.clone());
+        Ok(layout)
+    }
+
+    let mut layouts = HashMap::new();
+    for trait_name in trait_decls.keys() {
+        build_trait_layout(
+            trait_name,
+            &trait_decls,
+            structs,
+            enums,
+            &mut layouts,
+            &mut Vec::new(),
+        )?;
     }
     Ok(layouts)
 }
@@ -5520,6 +5569,55 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "7\n14\n");
+    }
+
+    #[test]
+    fn runs_compiled_supertrait_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Readable {
+                function value(self): int;
+            }
+
+            trait Writer: Readable {
+                function write(mut self, value: int): int;
+            }
+
+            struct Counter {
+                value: int;
+            }
+
+            conform Writer for Counter {
+                function value(self): int {
+                    return self.value;
+                }
+
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            function read_once[T: Readable](counter: *T): int {
+                return counter.value();
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                counter: *Counter = Counter::create(heap);
+                counter.value = 5;
+                print(read_once(counter));
+
+                readable: Readable = Counter { value: 9 };
+                print(readable.value());
+
+                heap.destroy(counter);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "5\n9\n");
     }
 
     #[test]

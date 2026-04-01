@@ -35,6 +35,7 @@ pub enum Node {
     },
     TraitDeclaration {
         name: String,
+        supertraits: Vec<String>,
         methods: Vec<TraitMethodSignature>,
     },
     ShapeDeclaration {
@@ -1226,12 +1227,29 @@ impl PestImpl {
 
     fn create_trait_decl(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::trait_decl);
-        let mut inner_pairs = pair.into_inner();
+        let mut inner_pairs = pair.into_inner().peekable();
         let name = inner_pairs.next().unwrap().as_str().to_string();
+        let supertraits = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::supertrait_bounds)
+        {
+            inner_pairs
+                .next()
+                .unwrap()
+                .into_inner()
+                .map(|pair| pair.as_str().to_string())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let methods = inner_pairs
             .map(|p| self.create_trait_method_decl(p))
             .collect::<Vec<_>>();
-        Node::TraitDeclaration { name, methods }
+        Node::TraitDeclaration {
+            name,
+            supertraits,
+            methods,
+        }
     }
 
     fn create_trait_method_decl(&self, pair: Pair<Rule>) -> TraitMethodSignature {
@@ -3815,6 +3833,7 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    supertraits: vec![],
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),
                         parameters: vec![
@@ -3890,6 +3909,7 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    supertraits: vec![],
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),
                         parameters: vec![
@@ -3922,6 +3942,7 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    supertraits: vec![],
                     methods: vec![
                         TraitMethodSignature {
                             name: "write".to_string(),
@@ -3964,6 +3985,50 @@ mod tests {
             statements: vec![
                 Node::ShapeDeclaration {
                     name: "WriterLike".to_string(),
+                    methods: vec![TraitMethodSignature {
+                        name: "write".to_string(),
+                        parameters: vec![
+                            ("self".to_string(), Type::MutSelf),
+                            ("value".to_string(), Type::Int),
+                        ],
+                        return_type: Type::Int,
+                        default_body: None,
+                    }],
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_trait_supertraits_declaration() {
+        let source_code = r#"
+            trait Resettable {
+                function reset(mut self): void;
+            }
+
+            trait Writer: Resettable + Flushable {
+                function write(mut self, value: int): int;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::TraitDeclaration {
+                    name: "Resettable".to_string(),
+                    supertraits: vec![],
+                    methods: vec![TraitMethodSignature {
+                        name: "reset".to_string(),
+                        parameters: vec![("self".to_string(), Type::MutSelf)],
+                        return_type: Type::Void,
+                        default_body: None,
+                    }],
+                },
+                Node::TraitDeclaration {
+                    name: "Writer".to_string(),
+                    supertraits: vec!["Resettable".to_string(), "Flushable".to_string()],
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),
                         parameters: vec![

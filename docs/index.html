@@ -382,8 +382,12 @@ function unwrap(value: Option[int]): int {
 
             <section id="traits-and-impls">
                 <h2>Traits, Conform, and Shapes</h2>
-                <p>Traits work both as generic constraints and as runtime interface values. Shapes provide reusable structural bounds.</p>
-<pre><code class="language-skunk">trait Writer {
+                <p>Traits work both as generic constraints and as runtime interface values. Traits may extend other traits, and shapes provide reusable structural bounds.</p>
+<pre><code class="language-skunk">trait Readable {
+    function value(self): int;
+}
+
+trait Writer: Readable {
     function write(mut self, value: int): int;
 
     function write_twice(mut self, value: int): int {
@@ -405,6 +409,10 @@ struct Counter {
 }
 
 conform Writer for Counter {
+    function value(self): int {
+        return self.value;
+    }
+
     function write(mut self, value: int): int {
         self.value = self.value + value;
         return self.value;
@@ -431,6 +439,7 @@ function use_writer_like[T: WriterLike](writer: *T): int {
 }</code></pre>
                 <ul>
                     <li>Trait conformance is explicit through <code>conform Trait for Type { ... }</code>.</li>
+                    <li>Traits may extend other traits with <code>trait Writer: Readable { ... }</code>; implementing the child trait also satisfies the parent traits.</li>
                     <li>Traits may provide default method bodies, and <code>conform</code> blocks only need to implement the required methods they want to customize.</li>
                     <li>Shapes provide structural bounds, for example <code>T: WriterLike</code>, without introducing a runtime trait value.</li>
                     <li>Conform targets may be concrete or generic, for example <code>conform[T] SizedThing for Box[T] { ... }</code>.</li>

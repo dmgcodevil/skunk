@@ -37,6 +37,7 @@ struct EnumSymbol {
 #[derive(Debug, PartialEq, Clone)]
 struct TraitSymbol {
     name: String,
+    supertraits: Vec<String>,
     methods: HashMap<String, Symbol>,
 }
 
@@ -151,6 +152,18 @@ fn func_decl_node_to_symbol(node: &Node) -> Symbol {
                 return_type: Box::new(return_type.clone()),
             },
         },
+        Node::GenericFunctionDeclaration {
+            name,
+            parameters,
+            return_type,
+            ..
+        } => Symbol {
+            name: name.to_string(),
+            sk_type: Type::Function {
+                parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+                return_type: Box::new(return_type.clone()),
+            },
+        },
         _ => panic!("expected function declaration"),
     }
 }
@@ -231,15 +244,21 @@ impl GlobalScope {
                     },
                 );
             }
-            Node::FunctionDeclaration { name, .. } => {
+            Node::FunctionDeclaration { name, .. }
+            | Node::GenericFunctionDeclaration { name, .. } => {
                 self.functions
                     .insert(name.clone(), func_decl_node_to_symbol(node));
             }
-            Node::TraitDeclaration { name, methods } => {
+            Node::TraitDeclaration {
+                name,
+                supertraits,
+                methods,
+            } => {
                 self.traits.insert(
                     name.clone(),
                     TraitSymbol {
                         name: name.clone(),
+                        supertraits: supertraits.clone(),
                         methods: methods
                             .iter()
                             .map(|method| {
@@ -343,13 +362,87 @@ fn is_assignable(global_scope: &GlobalScope, expected: &Type, actual: &Type) -> 
                 && is_assignable(global_scope, expected_elem, actual_elem)
         }
         (Type::Custom(expected_name), _) if global_scope.traits.contains_key(expected_name) => {
-            global_scope
-                .implemented_traits
-                .get(&type_to_string(actual))
-                .is_some_and(|traits| traits.contains(expected_name))
+            type_implements_trait(global_scope, actual, expected_name, &mut Vec::new())
         }
         _ => false,
     }
+}
+
+fn trait_extends(
+    global_scope: &GlobalScope,
+    child: &str,
+    ancestor: &str,
+    visiting: &mut Vec<String>,
+) -> bool {
+    if child == ancestor {
+        return true;
+    }
+    if visiting.iter().any(|name| name == child) {
+        return false;
+    }
+    let Some(trait_symbol) = global_scope.traits.get(child) else {
+        return false;
+    };
+    visiting.push(child.to_string());
+    let result = trait_symbol
+        .supertraits
+        .iter()
+        .any(|supertrait| trait_extends(global_scope, supertrait, ancestor, visiting));
+    visiting.pop();
+    result
+}
+
+fn type_implements_trait(
+    global_scope: &GlobalScope,
+    actual: &Type,
+    expected_trait: &str,
+    visiting: &mut Vec<String>,
+) -> bool {
+    global_scope
+        .implemented_traits
+        .get(&type_to_string(actual))
+        .is_some_and(|traits| {
+            traits.iter().any(|trait_name| {
+                trait_name == expected_trait
+                    || trait_extends(global_scope, trait_name, expected_trait, visiting)
+            })
+        })
+}
+
+fn collect_trait_methods(
+    global_scope: &GlobalScope,
+    trait_name: &str,
+    visiting: &mut Vec<String>,
+) -> Result<HashMap<String, Symbol>, String> {
+    if visiting.iter().any(|name| name == trait_name) {
+        visiting.push(trait_name.to_string());
+        return Err(format!(
+            "cyclic supertrait relationship detected: {}",
+            visiting.join(" -> ")
+        ));
+    }
+    let trait_symbol = global_scope
+        .traits
+        .get(trait_name)
+        .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
+    visiting.push(trait_name.to_string());
+    let mut methods = HashMap::new();
+    for supertrait in &trait_symbol.supertraits {
+        for (name, symbol) in collect_trait_methods(global_scope, supertrait, visiting)? {
+            methods.insert(name, symbol);
+        }
+    }
+    for (name, symbol) in &trait_symbol.methods {
+        if methods.contains_key(name) {
+            return Err(format!(
+                "trait `{}` declares duplicate inherited method `{}`",
+                trait_name, name
+            ));
+        }
+        methods.insert(name.clone(), symbol.clone());
+    }
+    visiting.pop();
+    Ok(methods)
 }
 
 fn is_zero_initializable_type(sk_type: &Type) -> bool {
@@ -873,7 +966,7 @@ fn resolve_access(
                 _ => Err("arena member access expects a function call".to_string()),
             },
             Type::Custom(type_name) => {
-                if let Some(trait_symbol) = global_scope.traits.get(&type_name) {
+                if global_scope.traits.contains_key(&type_name) {
                     match member.deref() {
                         Node::Identifier(field_name) => Err(format!(
                             "error {}:{}: no field `{}` on trait object `{}`",
@@ -885,7 +978,9 @@ fn resolve_access(
                             arguments,
                             metadata,
                         } => {
-                            let method_symbol = trait_symbol.methods.get(name).ok_or_else(|| {
+                            let methods =
+                                collect_trait_methods(global_scope, &type_name, &mut Vec::new())?;
+                            let method_symbol = methods.get(name).ok_or_else(|| {
                                 format!(
                                     "error {}:{}: no method named `{}` found for trait `{}`",
                                     metadata.span.line,
@@ -1695,7 +1790,20 @@ fn resolve_type(
         | Node::GenericEnumDeclaration { .. }
         | Node::ShapeDeclaration { .. }
         | Node::ImplDeclaration { .. } => Ok(ResolveResult::new(Type::Void)),
-        Node::TraitDeclaration { name, methods } => {
+        Node::TraitDeclaration {
+            name,
+            supertraits,
+            methods,
+        } => {
+            for supertrait in supertraits {
+                if !global_scope.traits.contains_key(supertrait) {
+                    return Err(format!(
+                        "trait `{}` extends unknown trait `{}`",
+                        name, supertrait
+                    ));
+                }
+            }
+            let _ = collect_trait_methods(global_scope, name, &mut Vec::new())?;
             for method in methods {
                 if let Some(body) = &method.default_body {
                     resolve_function_body(
@@ -1733,6 +1841,14 @@ fn resolve_type(
                 return_type: Box::new(return_type.clone()),
             }))
         }
+        Node::GenericFunctionDeclaration {
+            parameters,
+            return_type,
+            ..
+        } => Ok(ResolveResult::new(Type::Function {
+            parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+            return_type: Box::new(return_type.clone()),
+        })),
         Node::VariableDeclaration {
             var_type,
             name,
@@ -3432,6 +3548,51 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_supertrait_bound_is_satisfied_by_child_trait_impl() {
+        let source_code = r#"
+        trait Readable {
+            function value(self): int;
+        }
+
+        trait Writer: Readable {
+            function write(mut self, value: int): int;
+        }
+
+        struct Counter {
+            value: int;
+        }
+
+        conform Writer for Counter {
+            function value(self): int {
+                return self.value;
+            }
+
+            function write(mut self, value: int): int {
+                self.value = self.value + value;
+                return self.value;
+            }
+        }
+
+        function read_once[T: Readable](counter: *T): int {
+            return counter.value();
+        }
+        "#;
+        let program = ast::parse(source_code);
+        check(&program).unwrap();
+    }
+
+    #[test]
+    fn test_unknown_supertrait_is_rejected() {
+        let source_code = r#"
+        trait Writer: Readable {
+            function write(mut self, value: int): int;
+        }
+        "#;
+        let program = ast::parse(source_code);
+        assert!(check(&program).is_err());
     }
 
     #[test]
