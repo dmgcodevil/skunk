@@ -1,0 +1,93 @@
+{
+  "Main Function": {
+    "prefix": "main",
+    "body": [
+      "function main(): void {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Create a Skunk main function"
+  },
+  "Function": {
+    "prefix": "fn",
+    "body": [
+      "function ${1:name}(${2}): ${3:void} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Create a Skunk function"
+  },
+  "Struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:Name} {",
+      "\t${2:field}: ${3:int};",
+      "}"
+    ],
+    "description": "Create a data-only struct"
+  },
+  "Trait": {
+    "prefix": "trait",
+    "body": [
+      "trait ${1:Name} {",
+      "\tfunction ${2:method}(${3:mut self}): ${4:void};",
+      "}"
+    ],
+    "description": "Create a trait declaration"
+  },
+  "Trait Default Method": {
+    "prefix": "trait-default",
+    "body": [
+      "trait ${1:Name} {",
+      "\tfunction ${2:required}(${3:mut self}): ${4:void};",
+      "",
+      "\tfunction ${5:default_method}(${6:mut self}): ${7:void} {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Create a trait with a default method"
+  },
+  "Shape": {
+    "prefix": "shape",
+    "body": [
+      "shape ${1:Name} {",
+      "\tfunction ${2:method}(${3:mut self}): ${4:void};",
+      "}"
+    ],
+    "description": "Create a shape declaration"
+  },
+  "Attach": {
+    "prefix": "attach",
+    "body": [
+      "attach ${1:Type} {",
+      "\tfunction ${2:name}(${3:self}): ${4:void} {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Create an attach block"
+  },
+  "Conform": {
+    "prefix": "conform",
+    "body": [
+      "conform ${1:Trait} for ${2:Type} {",
+      "\tfunction ${3:name}(${4:self}): ${5:void} {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Create a conform block"
+  },
+  "Match": {
+    "prefix": "match",
+    "body": [
+      "match (${1:value}) {",
+      "\tcase ${2:Pattern}: {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Create a match expression"
+  }
+}

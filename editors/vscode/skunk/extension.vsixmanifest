@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Id="dmgcodevil.skunk" Version="0.0.3" Language="en-US" Publisher="dmgcodevil" />
+    <DisplayName>Skunk</DisplayName>
+    <Description xml:space="preserve">Syntax highlighting, basic autocompletion, snippets, and formatting support for the Skunk language.</Description>
+    <Tags>skunk language formatter snippets</Tags>
+    <Categories>Programming Languages,Formatters,Snippets</Categories>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="^1.84.0" />
+    </Properties>
+  </Metadata>
+  <Installation>
+    <InstallationTarget Id="Microsoft.VisualStudio.Code" />
+  </Installation>
+  <Dependencies />
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />
+    <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />
+  </Assets>
+</PackageManifest>

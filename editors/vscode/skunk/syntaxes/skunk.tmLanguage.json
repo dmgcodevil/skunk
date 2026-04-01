@@ -1,0 +1,280 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Skunk",
+  "scopeName": "source.skunk",
+  "fileTypes": [
+    "skunk"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#chars"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.skunk",
+          "begin": "//",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.skunk"
+            }
+          },
+          "end": "$"
+        },
+        {
+          "name": "comment.block.skunk",
+          "begin": "/\\*",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.begin.skunk"
+            }
+          },
+          "end": "\\*/",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.end.skunk"
+            }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.skunk",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.skunk"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.skunk"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.skunk",
+              "match": "\\\\(?:[nrt0\"'\\\\])"
+            }
+          ]
+        }
+      ]
+    },
+    "chars": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.skunk",
+          "begin": "'",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.skunk"
+            }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.skunk"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.skunk",
+              "match": "\\\\(?:[nrt0\"'\\\\])"
+            }
+          ]
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.skunk",
+          "match": "\\b(?:if|else|for|in|match|case|return|unsafe)\\b"
+        },
+        {
+          "name": "keyword.declaration.skunk",
+          "match": "\\b(?:module|import|export|struct|enum|trait|shape|attach|conform|function)\\b"
+        },
+        {
+          "name": "storage.modifier.skunk",
+          "match": "\\b(?:const|mut|self)\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "name": "meta.declaration.function.skunk",
+          "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.function.skunk"
+            },
+            "2": {
+              "name": "entity.name.function.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.struct.skunk",
+          "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.struct.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.enum.skunk",
+          "match": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.enum.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.trait.skunk",
+          "match": "\\b(trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.trait.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.shape.skunk",
+          "match": "\\b(shape)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.shape.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.attach.skunk",
+          "match": "\\b(attach)\\s+(?:\\[[^\\]]+\\]\\s+)?([A-Za-z_][A-Za-z0-9_]*(?:\\[[^\\]]+\\])?)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.struct.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.conform.skunk",
+          "match": "\\b(conform)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(for)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\[[^\\]]+\\])?)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.trait.skunk"
+            },
+            "3": {
+              "name": "keyword.control.skunk"
+            },
+            "4": {
+              "name": "entity.name.type.struct.skunk"
+            }
+          }
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.builtin.skunk",
+          "match": "\\b(?:byte|short|int|long|float|double|string|boolean|bool|char|void|Allocator|Arena)\\b"
+        },
+        {
+          "name": "support.class.builtin.skunk",
+          "match": "\\b(?:System|Memory)\\b"
+        },
+        {
+          "name": "entity.name.type.skunk",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.skunk",
+          "match": "\\b(?:true|false)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.skunk",
+          "match": "\\b\\d+\\.\\d+(?:[Ff])?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.long.skunk",
+          "match": "\\b\\d+[Ll]\\b"
+        },
+        {
+          "name": "constant.numeric.integer.skunk",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.skunk",
+          "match": "::|->|\\.\\*|\\+|\\-|\\*|/|%|\\^|&&|\\|\\||<=|<|>=|>|==|!=|=|&|:"
+        },
+        {
+          "name": "punctuation.separator.skunk",
+          "match": "[{}()\\[\\],.;]"
+        }
+      ]
+    }
+  }
+}

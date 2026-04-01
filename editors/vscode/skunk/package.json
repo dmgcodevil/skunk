@@ -1,0 +1,54 @@
+{
+  "name": "skunk",
+  "displayName": "Skunk",
+  "description": "Syntax highlighting, basic autocompletion, snippets, and formatting support for the Skunk language.",
+  "version": "0.0.3",
+  "publisher": "dmgcodevil",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Snippets"
+  ],
+  "activationEvents": [
+    "onLanguage:skunk"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "skunk",
+        "aliases": [
+          "Skunk",
+          "skunk"
+        ],
+        "extensions": [
+          ".skunk"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "skunk",
+        "scopeName": "source.skunk",
+        "path": "./syntaxes/skunk.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "skunk",
+        "path": "./snippets/skunk.code-snippets"
+      }
+    ],
+    "configurationDefaults": {
+      "[skunk]": {
+        "editor.defaultFormatter": "dmgcodevil.skunk",
+        "editor.wordBasedSuggestions": "matchingDocuments"
+      }
+    }
+  }
+}
