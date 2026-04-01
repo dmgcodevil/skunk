@@ -820,12 +820,20 @@ impl PestImpl {
             }
             _ => Type::Void,
         };
+        if let Some(peeked) = inner_pairs.peek() {
+            if peeked.as_rule() == Rule::where_clause {
+                generic_bounds = self.merge_generic_bounds(
+                    generic_bounds,
+                    self.create_where_clause(inner_pairs.next().unwrap()),
+                );
+            }
+        }
         let mut body: Vec<Node> = Vec::new();
         while let Some(statement) = inner_pairs.next() {
             body.push(self.create_ast(statement))
         }
         if let Identifier(s) = name {
-            if generic_params.is_empty() {
+            if generic_params.is_empty() && generic_bounds.is_empty() {
                 Node::FunctionDeclaration {
                     name: s,
                     parameters,
@@ -1174,6 +1182,14 @@ impl PestImpl {
                     self.create_generic_params(inner_pairs.next().unwrap());
             }
         }
+        if let Some(peeked) = inner_pairs.peek() {
+            if peeked.as_rule() == Rule::where_clause {
+                generic_bounds = self.merge_generic_bounds(
+                    generic_bounds,
+                    self.create_where_clause(inner_pairs.next().unwrap()),
+                );
+            }
+        }
         let mut fields: Vec<(String, Type)> = Vec::new();
         while let Some(p) = inner_pairs.next() {
             match p.as_rule() {
@@ -1181,7 +1197,7 @@ impl PestImpl {
                 _ => panic!("unsupported rule {}", p),
             }
         }
-        if generic_params.is_empty() {
+        if generic_params.is_empty() && generic_bounds.is_empty() {
             Node::StructDeclaration {
                 name,
                 fields,
@@ -1210,10 +1226,18 @@ impl PestImpl {
                     self.create_generic_params(inner_pairs.next().unwrap());
             }
         }
+        if let Some(peeked) = inner_pairs.peek() {
+            if peeked.as_rule() == Rule::where_clause {
+                generic_bounds = self.merge_generic_bounds(
+                    generic_bounds,
+                    self.create_where_clause(inner_pairs.next().unwrap()),
+                );
+            }
+        }
         let variants = inner_pairs
             .map(|p| self.create_enum_variant_decl(p))
             .collect::<Vec<_>>();
-        if generic_params.is_empty() {
+        if generic_params.is_empty() && generic_bounds.is_empty() {
             Node::EnumDeclaration { name, variants }
         } else {
             Node::GenericEnumDeclaration {
@@ -1319,7 +1343,7 @@ impl PestImpl {
     fn create_attach_decl(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::attach_decl);
         let mut inner_pairs = pair.into_inner().peekable();
-        let (generic_params, generic_bounds) = if inner_pairs
+        let (generic_params, mut generic_bounds) = if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
         {
@@ -1328,6 +1352,15 @@ impl PestImpl {
             (Vec::new(), HashMap::new())
         };
         let target_type = self.create_type(inner_pairs.next().unwrap());
+        if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::where_clause)
+        {
+            generic_bounds = self.merge_generic_bounds(
+                generic_bounds,
+                self.create_where_clause(inner_pairs.next().unwrap()),
+            );
+        }
         let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
         Node::AttachDeclaration {
             generic_params,
@@ -1340,7 +1373,7 @@ impl PestImpl {
     fn create_conform_decl(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::conform_decl);
         let mut inner_pairs = pair.into_inner().peekable();
-        let (generic_params, generic_bounds) = if inner_pairs
+        let (generic_params, mut generic_bounds) = if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
         {
@@ -1350,6 +1383,15 @@ impl PestImpl {
         };
         let trait_name = inner_pairs.next().unwrap().as_str().to_string();
         let target_type = self.create_type(inner_pairs.next().unwrap());
+        if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::where_clause)
+        {
+            generic_bounds = self.merge_generic_bounds(
+                generic_bounds,
+                self.create_where_clause(inner_pairs.next().unwrap()),
+            );
+        }
         let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
         Node::ConformDeclaration {
             generic_params,
@@ -1393,6 +1435,7 @@ impl PestImpl {
                     target_type,
                     functions,
                 } => {
+                    self.validate_declared_generic_bounds("attach", generic_params, generic_bounds)?;
                     let target_name = self.validate_behavior_target(
                         "attach",
                         generic_params,
@@ -1415,6 +1458,11 @@ impl PestImpl {
                     target_type,
                     functions,
                 } => {
+                    self.validate_declared_generic_bounds(
+                        &format!("conform `{}`", trait_name),
+                        generic_params,
+                        generic_bounds,
+                    )?;
                     let target_name = self.validate_behavior_target(
                         &format!("conform `{}`", trait_name),
                         generic_params,
@@ -1451,6 +1499,11 @@ impl PestImpl {
                     fields,
                     ..
                 } => {
+                    self.validate_declared_generic_bounds(
+                        &format!("struct `{}`", name),
+                        &generic_params,
+                        &generic_bounds,
+                    )?;
                     output.push(Node::GenericStructDeclaration {
                         functions: merged_functions.remove(&name).unwrap_or_default(),
                         name,
@@ -1467,11 +1520,58 @@ impl PestImpl {
                     target_type,
                     ..
                 } => {
+                    self.validate_declared_generic_bounds(
+                        &format!("conform `{}`", trait_name),
+                        &generic_params,
+                        &generic_bounds,
+                    )?;
                     output.push(Node::ImplDeclaration {
                         generic_params,
                         generic_bounds,
                         trait_names: vec![trait_name],
                         target_type,
+                    });
+                }
+                Node::GenericEnumDeclaration {
+                    name,
+                    generic_params,
+                    generic_bounds,
+                    variants,
+                } => {
+                    self.validate_declared_generic_bounds(
+                        &format!("enum `{}`", name),
+                        &generic_params,
+                        &generic_bounds,
+                    )?;
+                    output.push(Node::GenericEnumDeclaration {
+                        name,
+                        generic_params,
+                        generic_bounds,
+                        variants,
+                    });
+                }
+                Node::GenericFunctionDeclaration {
+                    name,
+                    generic_params,
+                    generic_bounds,
+                    parameters,
+                    return_type,
+                    body,
+                    lambda,
+                } => {
+                    self.validate_declared_generic_bounds(
+                        &format!("function `{}`", name),
+                        &generic_params,
+                        &generic_bounds,
+                    )?;
+                    output.push(Node::GenericFunctionDeclaration {
+                        name,
+                        generic_params,
+                        generic_bounds,
+                        parameters,
+                        return_type,
+                        body,
+                        lambda,
                     });
                 }
                 other => output.push(other),
@@ -1795,6 +1895,57 @@ impl PestImpl {
             params.push(name);
         }
         (params, bounds)
+    }
+
+    fn create_where_clause(&self, pair: Pair<Rule>) -> HashMap<String, Vec<String>> {
+        assert_eq!(pair.as_rule(), Rule::where_clause);
+        let mut bounds = HashMap::new();
+        for predicate in pair.into_inner() {
+            let mut inner_pairs = predicate.into_inner();
+            let name = inner_pairs.next().unwrap().as_str().to_string();
+            let trait_bounds = inner_pairs.map(|p| p.as_str().to_string()).collect::<Vec<_>>();
+            bounds.insert(name, trait_bounds);
+        }
+        bounds
+    }
+
+    fn merge_generic_bounds(
+        &self,
+        mut generic_bounds: HashMap<String, Vec<String>>,
+        additional_bounds: HashMap<String, Vec<String>>,
+    ) -> HashMap<String, Vec<String>> {
+        for (param, bounds) in additional_bounds {
+            let entry = generic_bounds.entry(param).or_default();
+            for bound in bounds {
+                if !entry.iter().any(|existing| existing == &bound) {
+                    entry.push(bound);
+                }
+            }
+        }
+        generic_bounds
+    }
+
+    fn validate_declared_generic_bounds(
+        &self,
+        kind: &str,
+        generic_params: &[String],
+        generic_bounds: &HashMap<String, Vec<String>>,
+    ) -> Result<(), String> {
+        for param in generic_bounds.keys() {
+            if !generic_params.iter().any(|declared| declared == param) {
+                if generic_params.is_empty() {
+                    return Err(format!(
+                        "`{}` uses generic bounds but does not declare generic parameters",
+                        kind
+                    ));
+                }
+                return Err(format!(
+                    "`{}` declares bounds for unknown generic parameter `{}`",
+                    kind, param
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn create_qualified_name(&self, pair: Pair<Rule>) -> String {
@@ -4075,6 +4226,111 @@ mod tests {
         };
 
         assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_function_where_clause() {
+        let source_code = r#"
+            function save[T](value: T): T where T: Writer + Flushable {
+                return value;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericFunctionDeclaration {
+                    name: "save".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::from([(
+                        "T".to_string(),
+                        vec!["Writer".to_string(), "Flushable".to_string()],
+                    )]),
+                    parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    return_type: Type::Custom("T".to_string()),
+                    body: vec![Node::Return(Some(Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("value".to_string())],
+                    })))],
+                    lambda: false,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_function_merges_inline_and_where_bounds() {
+        let source_code = r#"
+            function save[T: Writer](value: T): T where T: Flushable + Writer {
+                return value;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericFunctionDeclaration {
+                    name: "save".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::from([(
+                        "T".to_string(),
+                        vec!["Writer".to_string(), "Flushable".to_string()],
+                    )]),
+                    parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    return_type: Type::Custom("T".to_string()),
+                    body: vec![Node::Return(Some(Box::new(Node::Access {
+                        nodes: vec![Node::Identifier("value".to_string())],
+                    })))],
+                    lambda: false,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_struct_where_clause() {
+        let source_code = r#"
+            struct Box[T] where T: Writer {
+                value: T;
+            }
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::GenericStructDeclaration {
+                    name: "Box".to_string(),
+                    generic_params: vec!["T".to_string()],
+                    generic_bounds: HashMap::from([(
+                        "T".to_string(),
+                        vec!["Writer".to_string()],
+                    )]),
+                    fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
+                    functions: vec![],
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_where_clause_requires_declared_generic_params() {
+        let source_code = r#"
+            function save(value: int): int where T: Writer {
+                return value;
+            }
+        "#;
+
+        assert!(
+            PestImpl::new()
+                .parse(source_code)
+                .unwrap_err()
+                .contains("does not declare generic parameters")
+        );
     }
 
     #[test]

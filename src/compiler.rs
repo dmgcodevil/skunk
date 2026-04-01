@@ -5384,6 +5384,55 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_where_clause_trait_bound_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            trait Resettable {
+                function reset(mut self): void;
+            }
+
+            struct Counter {
+                value: int;
+            }
+
+            conform Writer for Counter {
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            conform Resettable for Counter {
+                function reset(mut self): void {
+                    self.value = 0;
+                }
+            }
+
+            function use_counter[T](counter: *T): int
+            where T: Writer + Resettable {
+                counter.reset();
+                return counter.write(41);
+            }
+
+            function main(): void {
+                heap: Allocator = System::allocator();
+                counter: *Counter = Counter::create(heap);
+                counter.value = 9;
+                print(use_counter(counter));
+                heap.destroy(counter);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "41\n");
+    }
+
+    #[test]
     fn runs_compiled_shape_bound_program() {
         let stdout = compile_and_run(
             r#"

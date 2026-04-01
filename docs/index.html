@@ -430,6 +430,11 @@ function use_counter[T: Writer + Resettable](counter: *T): int {
     return counter.write(41);
 }
 
+function save[T](value: T): T
+where T: Writer + Resettable {
+    return value;
+}
+
 function use_writer_like[T: WriterLike](writer: *T): int {
     return writer.write(5);
 }</code></pre>
@@ -443,7 +448,8 @@ function use_writer_like[T: WriterLike](writer: *T): int {
                     <li>Traits may provide default method bodies, and <code>conform</code> blocks only need to implement the required methods they want to customize.</li>
                     <li>Shapes provide structural bounds, for example <code>T: WriterLike</code>, without introducing a runtime trait value.</li>
                     <li>Conform targets may be concrete or generic, for example <code>conform[T] SizedThing for Box[T] { ... }</code>.</li>
-                    <li>Generic bounds stack with <code>+</code>.</li>
+                    <li>Generic bounds can stay inline with <code>function save[T: Writer](...)</code> or move into a <code>where</code> clause for longer signatures.</li>
+                    <li>Bounds stack with <code>+</code>, for example <code>where T: Writer + Resettable</code>.</li>
                     <li>Trait names may be used as runtime types, such as <code>writer: Writer</code>.</li>
                     <li>Assigning an addressable concrete value to a trait value borrows its storage for dynamic dispatch; rvalues still box a runtime value with a vtable.</li>
                 </ul>
