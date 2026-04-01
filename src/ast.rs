@@ -258,6 +258,7 @@ pub enum UnaryOperator {
     Minus,
     Negate,
     AddressOf,
+    AddressOfMut,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -282,6 +283,10 @@ pub enum Type {
         elem_type: Box<Type>,
         dimensions: Vec<Node>,
     },
+    Reference {
+        target_type: Box<Type>,
+        mutable: bool,
+    },
     Pointer {
         target_type: Box<Type>,
     },
@@ -305,6 +310,7 @@ pub enum Type {
 
 enum TypePrefix {
     Pointer,
+    Reference(bool),
     Slice,
     Array(Node),
 }
@@ -511,6 +517,10 @@ impl PestImpl {
                     },
                     Rule::address_of => Node::UnaryOp {
                         operator: UnaryOperator::AddressOf,
+                        operand: Box::new(self.create_ast(unary_operand_pair)),
+                    },
+                    Rule::address_of_mut => Node::UnaryOp {
+                        operator: UnaryOperator::AddressOfMut,
                         operand: Box::new(self.create_ast(unary_operand_pair)),
                     },
                     _ => panic!("unsupported unary operator {:?}", unary_op_pair),
@@ -863,6 +873,9 @@ impl PestImpl {
         if let Some(inner) = inner.next() {
             match inner.as_rule() {
                 Rule::pointer_prefix => TypePrefix::Pointer,
+                Rule::reference_prefix => {
+                    TypePrefix::Reference(inner.into_inner().next().is_some())
+                }
                 Rule::expression => TypePrefix::Array(self.create_ast(inner)),
                 _ => TypePrefix::Slice,
             }
@@ -896,6 +909,12 @@ impl PestImpl {
                 TypePrefix::Slice => {
                     current = Type::Slice {
                         elem_type: Box::new(current),
+                    };
+                }
+                TypePrefix::Reference(mutable) => {
+                    current = Type::Reference {
+                        target_type: Box::new(current),
+                        mutable,
                     };
                 }
                 TypePrefix::Pointer => {
@@ -2004,6 +2023,16 @@ pub fn type_to_string(t: &Type) -> String {
                 .map(|dim| format!("[{}]", type_expr_to_string(dim)))
                 .collect::<String>();
             format!("{}{}", prefix, type_to_string(elem_type))
+        }
+        Type::Reference {
+            target_type,
+            mutable,
+        } => {
+            if *mutable {
+                format!("&mut {}", type_to_string(target_type))
+            } else {
+                format!("&{}", type_to_string(target_type))
+            }
         }
         Type::Pointer { target_type } => format!("*{}", type_to_string(target_type)),
         Type::Slice { elem_type } => format!("[]{}", type_to_string(elem_type)),
@@ -3761,6 +3790,40 @@ mod tests {
                     name: "point_ptr".to_string(),
                     var_type: Type::Pointer {
                         target_type: Box::new(Type::Custom("Point".to_string())),
+                    },
+                    value: None,
+                    metadata: Metadata::EMPTY,
+                },
+                Node::EOI,
+            ],
+        };
+
+        assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_reference_types() {
+        let source_code = r#"
+            point_ref: &Point;
+            point_mut_ref: &mut Point;
+        "#;
+
+        let expected_ast = Node::Program {
+            statements: vec![
+                Node::VariableDeclaration {
+                    name: "point_ref".to_string(),
+                    var_type: Type::Reference {
+                        target_type: Box::new(Type::Custom("Point".to_string())),
+                        mutable: false,
+                    },
+                    value: None,
+                    metadata: Metadata::EMPTY,
+                },
+                Node::VariableDeclaration {
+                    name: "point_mut_ref".to_string(),
+                    var_type: Type::Reference {
+                        target_type: Box::new(Type::Custom("Point".to_string())),
+                        mutable: true,
                     },
                     value: None,
                     metadata: Metadata::EMPTY,

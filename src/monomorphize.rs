@@ -604,6 +604,9 @@ impl Monomorphizer {
                 }
             }
             Type::Array { elem_type, .. } => self.validate_impl_target_type(elem_type, generic_params),
+            Type::Reference { target_type, .. } => {
+                self.validate_impl_target_type(target_type, generic_params)
+            }
             Type::Pointer { target_type } => {
                 self.validate_impl_target_type(target_type, generic_params)
             }
@@ -1874,6 +1877,13 @@ impl Monomorphizer {
                             target_type: target_type.clone(),
                         }
                     }
+                    Type::Reference { .. } if name == "cast" || name == "offset" => {
+                        return Err(format!(
+                            "reference type `{}` does not support static method `{}`",
+                            ast::type_to_string(&internal_type),
+                            name
+                        ));
+                    }
                     Type::Custom(_) | Type::GenericInstance { .. } if name == "create" => {
                         for argument in arguments {
                             let (argument, _) = self.transform_expr(
@@ -1993,6 +2003,9 @@ impl Monomorphizer {
                                 Type::Const { inner } => {
                                     current_type = inner.deref().clone();
                                 }
+                                Type::Reference { target_type, .. } => {
+                                    current_type = target_type.deref().clone();
+                                }
                                 Type::Pointer { target_type } => {
                                     current_type = target_type.deref().clone();
                                 }
@@ -2055,6 +2068,7 @@ impl Monomorphizer {
                         }
                         Node::Dereference { metadata } => {
                             current_type = match current_type {
+                                Type::Reference { target_type, .. } => target_type.deref().clone(),
                                 Type::Pointer { target_type } => target_type.deref().clone(),
                                 other => {
                                     return Err(format!(
@@ -2311,9 +2325,26 @@ impl Monomorphizer {
                 let result_type = match operator {
                     UnaryOperator::Plus | UnaryOperator::Minus => operand_type.clone(),
                     UnaryOperator::Negate => Type::Boolean,
-                    UnaryOperator::AddressOf => Type::Pointer {
-                        target_type: Box::new(operand_type.clone()),
+                    UnaryOperator::AddressOf => match expected_type.map(ast::unwrap_binding_const) {
+                        Some(Type::Pointer { .. }) => Type::Pointer {
+                            target_type: Box::new(operand_type.clone()),
+                        },
+                        _ => Type::Reference {
+                            target_type: Box::new(operand_type.clone()),
+                            mutable: false,
+                        },
                     },
+                    UnaryOperator::AddressOfMut => {
+                        match expected_type.map(ast::unwrap_binding_const) {
+                            Some(Type::Pointer { .. }) => Type::Pointer {
+                                target_type: Box::new(operand_type.clone()),
+                            },
+                            _ => Type::Reference {
+                                target_type: Box::new(operand_type.clone()),
+                                mutable: true,
+                            },
+                        }
+                    }
                 };
                 Ok((
                     Node::UnaryOp {
@@ -2713,6 +2744,35 @@ impl Monomorphizer {
                     ));
                 };
                 self.unify_generic_type(elem_type, actual_elem_type, generic_params, substitutions)
+            }
+            Type::Reference {
+                target_type,
+                mutable,
+            } => {
+                let Type::Reference {
+                    target_type: actual_target_type,
+                    mutable: actual_mutable,
+                } = actual
+                else {
+                    return Err(format!(
+                        "expected `{}`, found `{}`",
+                        ast::type_to_string(pattern),
+                        ast::type_to_string(actual)
+                    ));
+                };
+                if mutable != actual_mutable {
+                    return Err(format!(
+                        "expected `{}`, found `{}`",
+                        ast::type_to_string(pattern),
+                        ast::type_to_string(actual)
+                    ));
+                }
+                self.unify_generic_type(
+                    target_type,
+                    actual_target_type,
+                    generic_params,
+                    substitutions,
+                )
             }
             Type::Pointer { target_type } => {
                 let Type::Pointer {
@@ -3235,6 +3295,13 @@ impl Monomorphizer {
             Type::BindingConst { inner } => Type::BindingConst {
                 inner: Box::new(self.apply_substitutions(inner, substitutions)),
             },
+            Type::Reference {
+                target_type,
+                mutable,
+            } => Type::Reference {
+                target_type: Box::new(self.apply_substitutions(target_type, substitutions)),
+                mutable: *mutable,
+            },
             Type::MutSelf => Type::MutSelf,
             Type::Custom(name) => substitutions
                 .get(name)
@@ -3292,6 +3359,13 @@ impl Monomorphizer {
             } => Ok(Type::Array {
                 elem_type: Box::new(self.concretize_type(elem_type)?),
                 dimensions: dimensions.clone(),
+            }),
+            Type::Reference {
+                target_type,
+                mutable,
+            } => Ok(Type::Reference {
+                target_type: Box::new(self.concretize_type(target_type)?),
+                mutable: *mutable,
             }),
             Type::Pointer { target_type } => Ok(Type::Pointer {
                 target_type: Box::new(self.concretize_type(target_type)?),
@@ -3548,6 +3622,16 @@ fn type_mangle(sk_type: &Type) -> String {
         Type::Char => "char".to_string(),
         Type::Const { inner } => format!("const_{}", type_mangle(inner)),
         Type::BindingConst { inner } => type_mangle(inner),
+        Type::Reference {
+            target_type,
+            mutable,
+        } => {
+            if *mutable {
+                format!("mut_ref_{}", type_mangle(target_type))
+            } else {
+                format!("ref_{}", type_mangle(target_type))
+            }
+        }
         Type::Allocator => "Allocator".to_string(),
         Type::Arena => "Arena".to_string(),
         Type::Custom(name) => sanitize_mangle(name),

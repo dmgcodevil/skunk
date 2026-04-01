@@ -115,7 +115,7 @@ function main(): void {
 
             <section id="types">
                 <h2>Types</h2>
-                <p>Skunk currently supports primitive types, fixed arrays, slices, pointers, function types, structs, enums, and generic instantiations.</p>
+                <p>Skunk currently supports primitive types, fixed arrays, slices, safe references, raw pointers, function types, structs, enums, and generic instantiations.</p>
                 <table class="reference-table">
                     <thead>
                         <tr>
@@ -145,8 +145,12 @@ function main(): void {
                             <td>Slice view over contiguous elements</td>
                         </tr>
                         <tr>
+                            <td><code>&amp;T</code>, <code>&amp;mut T</code></td>
+                            <td>Safe shared or mutable reference to one value</td>
+                        </tr>
+                        <tr>
                             <td><code>*T</code></td>
-                            <td>Pointer/reference to one value</td>
+                            <td>Raw pointer to one value for unsafe memory operations</td>
                         </tr>
                         <tr>
                             <td><code>*const T</code>, <code>[]const T</code></td>
@@ -268,7 +272,7 @@ function main(): void {
 
             <section id="pointers-allocators-and-arenas">
                 <h2>Pointers, Allocators, and Arenas</h2>
-                <p>Skunk uses explicit allocation. Plain values use value semantics; allocator-backed single objects use <code>*T</code>; allocator-backed buffers use <code>[]T</code>.</p>
+                <p>Skunk uses explicit allocation. Plain values use value semantics; safe borrows use <code>&amp;T</code> and <code>&amp;mut T</code>; allocator-backed single objects use <code>*T</code>; allocator-backed buffers use <code>[]T</code>.</p>
 <pre><code class="language-skunk">struct Point {
     x: int;
     y: int;
@@ -300,6 +304,7 @@ function main(): void {
                     <li><code>alloc.destroy(ptr)</code> releases a pointer allocation.</li>
                     <li><code>alloc.free(slice)</code> releases a slice allocation.</li>
                     <li><code>Arena::init(backing)</code>, <code>arena.allocator()</code>, <code>arena.reset()</code>, and <code>arena.deinit()</code> provide arena-style lifetime management.</li>
+                    <li><code>&amp;T</code> shares read-only access and <code>&amp;mut T</code> grants checked mutable access without entering <code>unsafe</code>.</li>
                     <li>Field access like <code>point.x</code> and method calls like <code>point.bump()</code> still auto-deref ordinary typed pointers.</li>
                 </ul>
             </section>
@@ -329,7 +334,8 @@ function main(): void {
 }</code></pre>
                 <ul>
                     <li><code>unsafe { ... }</code> enables low-level operations the compiler cannot verify as memory-safe.</li>
-                    <li><code>&amp;expr</code> takes the address of an addressable access expression.</li>
+                    <li><code>&amp;expr</code> and <code>&amp;mut expr</code> create safe references by default.</li>
+                    <li>When a raw pointer is explicitly expected, the same address-of syntax feeds unsafe pointer operations such as <code>*T::cast</code>, <code>*byte::offset</code>, and <code>Memory::copy</code>.</li>
                     <li><code>ptr.*</code> explicitly dereferences a pointer value.</li>
                     <li><code>T::size_of()</code> and <code>T::align_of()</code> are safe compile-time layout queries.</li>
                     <li><code>*T::cast(ptr)</code> reinterprets one pointer type as another pointer type.</li>

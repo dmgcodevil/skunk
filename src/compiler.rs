@@ -21,6 +21,10 @@ enum LlvmType {
     TraitObject(String),
     Struct(String),
     Enum(String),
+    Reference {
+        target_type: Box<LlvmType>,
+        mutable: bool,
+    },
     Pointer {
         target_type: Box<LlvmType>,
     },
@@ -55,6 +59,7 @@ impl LlvmType {
             LlvmType::TraitObject(name) => format!("%trait.{}", sanitize_name(name)),
             LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
             LlvmType::Enum(name) => format!("%enum.{}", sanitize_name(name)),
+            LlvmType::Reference { .. } => "ptr".to_string(),
             LlvmType::Pointer { .. } => "ptr".to_string(),
             LlvmType::Function { .. } => "{ ptr, ptr }".to_string(),
             LlvmType::Slice { .. } => "{ ptr, i32 }".to_string(),
@@ -62,6 +67,13 @@ impl LlvmType {
             LlvmType::Void => "void".to_string(),
         }
     }
+}
+
+fn is_pointer_like_llvm_type(llvm_type: &LlvmType) -> bool {
+    matches!(
+        llvm_type,
+        LlvmType::Pointer { .. } | LlvmType::Reference { .. }
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +210,13 @@ fn llvm_type(
         }
         Type::Slice { elem_type } => Ok(LlvmType::Slice {
             elem_type: Box::new(llvm_type(elem_type, structs, enums, traits)?),
+        }),
+        Type::Reference {
+            target_type,
+            mutable,
+        } => Ok(LlvmType::Reference {
+            target_type: Box::new(llvm_type(target_type, structs, enums, traits)?),
+            mutable: *mutable,
         }),
         Type::Pointer { target_type } => Ok(LlvmType::Pointer {
             target_type: Box::new(llvm_type(target_type, structs, enums, traits)?),
@@ -1052,6 +1071,7 @@ impl<'a> FunctionCompiler<'a> {
             LlvmType::Allocator
             | LlvmType::Arena
             | LlvmType::TraitObject(_)
+            | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => {
                 Err("cannot print a pointer-like value directly".to_string())
             }
@@ -1167,19 +1187,28 @@ impl<'a> FunctionCompiler<'a> {
             } => self.compile_lambda_expr(parameters, return_type, body, expected),
             Node::UnaryOp { operator, operand } => {
                 match operator {
-                    UnaryOperator::AddressOf => {
-                        if !self.unsafe_allowed() {
-                            return Err("address-of requires an unsafe block".to_string());
-                        }
+                    UnaryOperator::AddressOf | UnaryOperator::AddressOfMut => {
                         let Node::Access { nodes } = operand.as_ref() else {
                             return Err(
                                 "address-of requires an addressable access expression".to_string()
                             );
                         };
                         let (ptr, llvm_type) = self.resolve_access_ptr(nodes)?;
+                        if matches!(expected, Some(LlvmType::Pointer { .. })) {
+                            if !self.unsafe_allowed() {
+                                return Err("address-of requires an unsafe block".to_string());
+                            }
+                            return Ok(ExprValue {
+                                llvm_type: LlvmType::Pointer {
+                                    target_type: Box::new(llvm_type),
+                                },
+                                value: ptr,
+                            });
+                        }
                         Ok(ExprValue {
-                            llvm_type: LlvmType::Pointer {
+                            llvm_type: LlvmType::Reference {
                                 target_type: Box::new(llvm_type),
+                                mutable: matches!(operator, UnaryOperator::AddressOfMut),
                             },
                             value: ptr,
                         })
@@ -1324,10 +1353,16 @@ impl<'a> FunctionCompiler<'a> {
                         let count =
                             self.compile_expr_with_expected(&arguments[2], Some(&LlvmType::I32))?;
                         let count = self.coerce_expr(count, &LlvmType::I64, "Memory::copy")?;
-                        if !matches!(dst.llvm_type, LlvmType::Pointer { .. }) {
+                        if !matches!(
+                            dst.llvm_type,
+                            LlvmType::Pointer { .. } | LlvmType::Reference { .. }
+                        ) {
                             return Err("Memory::copy expects a pointer destination".to_string());
                         }
-                        if !matches!(src.llvm_type, LlvmType::Pointer { .. }) {
+                        if !matches!(
+                            src.llvm_type,
+                            LlvmType::Pointer { .. } | LlvmType::Reference { .. }
+                        ) {
                             return Err("Memory::copy expects a pointer source".to_string());
                         }
                         self.emit_line(format!(
@@ -1352,7 +1387,10 @@ impl<'a> FunctionCompiler<'a> {
                         let count =
                             self.compile_expr_with_expected(&arguments[2], Some(&LlvmType::I32))?;
                         let count = self.coerce_expr(count, &LlvmType::I64, "Memory::set")?;
-                        if !matches!(dst.llvm_type, LlvmType::Pointer { .. }) {
+                        if !matches!(
+                            dst.llvm_type,
+                            LlvmType::Pointer { .. } | LlvmType::Reference { .. }
+                        ) {
                             return Err("Memory::set expects a pointer destination".to_string());
                         }
                         self.emit_line(format!(
@@ -1382,7 +1420,7 @@ impl<'a> FunctionCompiler<'a> {
                 let value = self.compile_expr(&arguments[0])?;
                 let target_type = llvm_type(sk_type, self.structs, self.enums, self.traits)?;
                 match value.llvm_type {
-                    LlvmType::Pointer { .. } => Ok(ExprValue {
+                    LlvmType::Pointer { .. } | LlvmType::Reference { .. } => Ok(ExprValue {
                         llvm_type: target_type,
                         value: value.value,
                     }),
@@ -1407,7 +1445,7 @@ impl<'a> FunctionCompiler<'a> {
                     self.compile_expr_with_expected(&arguments[1], Some(&LlvmType::I32))?;
                 let offset = self.coerce_expr(offset, &LlvmType::I64, "pointer offset")?;
                 match base.llvm_type {
-                    LlvmType::Pointer { .. } => {
+                    LlvmType::Pointer { .. } | LlvmType::Reference { .. } => {
                         let temp = self.next_temp();
                         self.emit_line(format!(
                             "{} = getelementptr inbounds i8, ptr {}, i64 {}",
@@ -2229,6 +2267,16 @@ impl<'a> FunctionCompiler<'a> {
 
         let struct_name = match receiver_type {
             LlvmType::Struct(name) => name,
+            LlvmType::Reference { target_type, .. } => match *target_type {
+                LlvmType::Struct(name) => name,
+                other => {
+                    return Err(format!(
+                        "method `{}` requires a struct receiver, found `{}`",
+                        method_name,
+                        other.ir()
+                    ))
+                }
+            },
             LlvmType::Pointer { target_type } => match *target_type {
                 LlvmType::Struct(name) => name,
                 other => {
@@ -2256,10 +2304,13 @@ impl<'a> FunctionCompiler<'a> {
             .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, struct_name))?;
 
         let receiver_ptr = match self.resolve_access_ptr(receiver_nodes) {
-            Ok((ptr, llvm_type)) => match llvm_type {
-                LlvmType::Pointer { .. } => self.load_from_ptr(&ptr, &llvm_type)?.value,
-                _ => ptr,
-            },
+            Ok((ptr, llvm_type)) => {
+                if is_pointer_like_llvm_type(&llvm_type) {
+                    self.load_from_ptr(&ptr, &llvm_type)?.value
+                } else {
+                    ptr
+                }
+            }
             Err(_) => {
                 let temp_var =
                     self.emit_heap_alloc(LlvmType::Struct(struct_name.clone()), "receiver_tmp");
@@ -2362,6 +2413,11 @@ impl<'a> FunctionCompiler<'a> {
 
     fn apply_access_type_step(&self, current: LlvmType, node: &Node) -> Result<LlvmType, String> {
         let current = match (&current, node) {
+            (LlvmType::Reference { target_type, .. }, Node::MemberAccess { .. })
+            | (LlvmType::Reference { target_type, .. }, Node::ArrayAccess { .. })
+            | (LlvmType::Reference { target_type, .. }, Node::SliceAccess { .. }) => {
+                target_type.as_ref().clone()
+            }
             (LlvmType::Pointer { target_type }, Node::MemberAccess { .. })
             | (LlvmType::Pointer { target_type }, Node::ArrayAccess { .. })
             | (LlvmType::Pointer { target_type }, Node::SliceAccess { .. }) => {
@@ -2371,6 +2427,7 @@ impl<'a> FunctionCompiler<'a> {
         };
         match node {
             Node::Dereference { .. } => match current {
+                LlvmType::Reference { target_type, .. } => Ok(*target_type),
                 LlvmType::Pointer { target_type } => Ok(*target_type),
                 other => Err(format!(
                     "cannot dereference non-pointer type `{}` in LLVM backend",
@@ -2451,12 +2508,19 @@ impl<'a> FunctionCompiler<'a> {
         for node in &nodes[1..] {
             if matches!(
                 (&current_type, node),
-                (LlvmType::Pointer { .. }, Node::MemberAccess { .. })
+                (LlvmType::Reference { .. }, Node::MemberAccess { .. })
+                    | (LlvmType::Reference { .. }, Node::ArrayAccess { .. })
+                    | (LlvmType::Reference { .. }, Node::SliceAccess { .. })
+                    | (LlvmType::Pointer { .. }, Node::MemberAccess { .. })
                     | (LlvmType::Pointer { .. }, Node::ArrayAccess { .. })
                     | (LlvmType::Pointer { .. }, Node::SliceAccess { .. })
             ) {
                 let loaded = self.load_from_ptr(&ptr, &current_type)?;
                 match current_type.clone() {
+                    LlvmType::Reference { target_type, .. } => {
+                        ptr = loaded.value;
+                        current_type = *target_type;
+                    }
                     LlvmType::Pointer { target_type } => {
                         ptr = loaded.value;
                         current_type = *target_type;
@@ -2466,11 +2530,16 @@ impl<'a> FunctionCompiler<'a> {
             }
             match node {
                 Node::Dereference { .. } => {
-                    if !self.unsafe_allowed() {
-                        return Err("pointer dereference requires an unsafe block".to_string());
-                    }
                     match current_type.clone() {
+                        LlvmType::Reference { target_type, .. } => {
+                            let loaded = self.load_from_ptr(&ptr, &current_type)?;
+                            ptr = loaded.value;
+                            current_type = *target_type;
+                        }
                         LlvmType::Pointer { target_type } => {
+                            if !self.unsafe_allowed() {
+                                return Err("pointer dereference requires an unsafe block".to_string());
+                            }
                             let loaded = self.load_from_ptr(&ptr, &current_type)?;
                             ptr = loaded.value;
                             current_type = *target_type;
@@ -3197,6 +3266,10 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: llvm_type.clone(),
                 value: "zeroinitializer".to_string(),
             },
+            LlvmType::Reference { .. } => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "null".to_string(),
+            },
             LlvmType::Pointer { .. } => ExprValue {
                 llvm_type: llvm_type.clone(),
                 value: "null".to_string(),
@@ -3354,6 +3427,23 @@ impl<'a> FunctionCompiler<'a> {
                     value.llvm_type.ir()
                 ))
             }
+            (
+                LlvmType::Reference {
+                    target_type: actual_target,
+                    mutable: true,
+                },
+                LlvmType::Reference {
+                    target_type: expected_target,
+                    mutable: false,
+                },
+            ) if actual_target == expected_target => {
+                return Ok(ExprValue {
+                    llvm_type: expected.clone(),
+                    value: value.value,
+                });
+            }
+            (LlvmType::Reference { .. }, LlvmType::Reference { .. })
+            | 
             (LlvmType::Pointer { .. }, LlvmType::Pointer { .. })
             | (LlvmType::Allocator, LlvmType::Allocator)
             | (LlvmType::Arena, LlvmType::Arena) => {
@@ -3647,6 +3737,7 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::Allocator
             | LlvmType::Arena
             | LlvmType::TraitObject(_)
+            | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => 8,
             LlvmType::Function { .. } => 8,
             LlvmType::Struct(name) => self
@@ -3691,6 +3782,7 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::PtrI8
             | LlvmType::Allocator
             | LlvmType::Arena
+            | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => 8,
             LlvmType::TraitObject(_) => 16,
             LlvmType::Function { .. } => 16,
@@ -4077,6 +4169,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         LlvmType::Allocator
         | LlvmType::Arena
         | LlvmType::TraitObject(_)
+        | LlvmType::Reference { .. }
         | LlvmType::Pointer { .. } => {
             return Err("LLVM backend does not support `main` returning pointer-like values yet".to_string())
         }
@@ -5572,6 +5665,68 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "12\n13\n");
+    }
+
+    #[test]
+    fn runs_compiled_safe_reference_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Counter {
+                value: int;
+            }
+
+            attach Counter {
+                function get(self): int {
+                    return self.value;
+                }
+            }
+
+            function bump(counter: &mut Counter): void {
+                counter.value = counter.value + 1;
+            }
+
+            function read(counter: &Counter): int {
+                return counter.get();
+            }
+
+            function main(): void {
+                counter: Counter = Counter { value: 4 };
+                bump(&mut counter);
+
+                reader: &Counter = &counter;
+                print(read(reader));
+                print(reader.*.value);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "5\n5\n");
+    }
+
+    #[test]
+    fn rejects_mutating_through_immutable_reference() {
+        let result = compile_and_run(
+            r#"
+            struct Counter {
+                value: int;
+            }
+
+            function bump(counter: &Counter): void {
+                counter.value = counter.value + 1;
+            }
+
+            function main(): void {
+                counter: Counter = Counter { value: 4 };
+                bump(&counter);
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("cannot assign through const-qualified target"));
     }
 
     #[test]

@@ -482,7 +482,8 @@ fn coerce_value_to_type(value_ref: ValueRef, target: &Type) -> ValueRef {
         Type::GenericInstance { .. } => {
             panic!("interpreter does not support unresolved generic instance types")
         }
-        Type::Pointer { .. }
+        Type::Reference { .. }
+        | Type::Pointer { .. }
         | Type::Allocator
         | Type::Arena
         | Type::Void
@@ -2105,7 +2106,7 @@ pub fn evaluate_node(
                     Value::Boolean(val) => Value::Boolean(!val),
                     _ => panic!("Unary negate is only supported for booleans"),
                 }),
-                ast::UnaryOperator::AddressOf => {
+                ast::UnaryOperator::AddressOf | ast::UnaryOperator::AddressOfMut => {
                     panic!("address-of is not supported in the legacy interpreter")
                 }
             }

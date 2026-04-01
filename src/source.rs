@@ -1025,6 +1025,13 @@ impl ModuleNormalizer {
                     .map(|dim| self.rename_expr(dim, value_scopes, type_scopes))
                     .collect::<Result<Vec<_>, String>>()?,
             },
+            ast::Type::Reference {
+                target_type,
+                mutable,
+            } => ast::Type::Reference {
+                target_type: Box::new(self.rename_type(*target_type, value_scopes, type_scopes)?),
+                mutable,
+            },
             ast::Type::Pointer { target_type } => ast::Type::Pointer {
                 target_type: Box::new(self.rename_type(*target_type, value_scopes, type_scopes)?),
             },

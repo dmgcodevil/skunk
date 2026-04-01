@@ -32,6 +32,7 @@ operation = _{ add | subtract | multiply | divide | modulus | power | and | or |
     unary_plus      = { "+" }
     unary_minus     = { "-" }
     negate          = { "!" }
+    address_of_mut  = { "&" ~ mut_kw }
     address_of      = { "&" }
 
 
@@ -52,8 +53,9 @@ legacy_array_dim = { "[" ~ expression ~ "]" }
 legacy_array_type = { base_type ~ legacy_array_dim+ } // legacy syntax: int[3]
 legacy_slice_type = { base_type ~ ("[" ~ "]")+ } // legacy syntax: int[]
 pointer_prefix  = { "*" }
-type_prefix     = { pointer_prefix | "[" ~ expression? ~ "]" }
-prefixed_type   = { type_prefix+ ~ const_kw? ~ (base_type | function_type) } // preferred syntax: [3]int, []int, *const Foo
+reference_prefix = { "&" ~ mut_kw? }
+type_prefix     = { pointer_prefix | reference_prefix | "[" ~ expression? ~ "]" }
+prefixed_type   = { type_prefix+ ~ const_kw? ~ (base_type | function_type) } // preferred syntax: [3]int, []int, *const Foo, &T, &mut T
 function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
 _type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type }
 
@@ -148,7 +150,7 @@ io              = { print | input }
 sk_return        = { "return" ~ (lambda_expr | expression)? ~ ";" }
 
 
-unary_op        = { (unary_plus | unary_minus | negate | address_of) ~ primary }
+unary_op        = { (unary_plus | unary_minus | negate | address_of_mut | address_of) ~ primary }
 expression      = { primary ~ (operation ~ primary)* }
 primary         = { lambda_expr | unary_op | literal | static_func_call | func_call | struct_init | inline_array_init | access | "(" ~ expression ~ ")" | block | IDENTIFIER }
 

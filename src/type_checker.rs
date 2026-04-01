@@ -361,6 +361,26 @@ fn is_assignable(global_scope: &GlobalScope, expected: &Type, actual: &Type) -> 
             expected_dimensions == actual_dimensions
                 && is_assignable(global_scope, expected_elem, actual_elem)
         }
+        (
+            Type::Reference {
+                target_type: expected_target,
+                mutable: false,
+            },
+            Type::Reference {
+                target_type: actual_target,
+                ..
+            },
+        ) => is_assignable(global_scope, expected_target, actual_target),
+        (
+            Type::Reference {
+                target_type: expected_target,
+                mutable: true,
+            },
+            Type::Reference {
+                target_type: actual_target,
+                mutable: true,
+            },
+        ) => is_assignable(global_scope, expected_target, actual_target),
         (Type::Custom(expected_name), _) if global_scope.traits.contains_key(expected_name) => {
             type_implements_trait(global_scope, actual, expected_name, &mut Vec::new())
         }
@@ -789,6 +809,15 @@ fn resolve_access(
                 access_nodes,
             );
         }
+        if let Type::Reference { target_type, .. } = curr {
+            return resolve_access(
+                global_scope,
+                symbol_tables,
+                target_type.deref().clone(),
+                i,
+                access_nodes,
+            );
+        }
         if let Type::Pointer { target_type } = curr {
             return resolve_access(
                 global_scope,
@@ -870,15 +899,24 @@ fn resolve_access(
             resolve_access(global_scope, symbol_tables, next_type, i + 1, access_nodes)
         }
         Node::Dereference { .. } => {
-            require_unsafe(symbol_tables, "pointer dereference")?;
             match curr {
-                Type::Pointer { target_type } => resolve_access(
+                Type::Reference { target_type, .. } => resolve_access(
                     global_scope,
                     symbol_tables,
                     target_type.deref().clone(),
                     i + 1,
                     access_nodes,
                 ),
+                Type::Pointer { target_type } => {
+                    require_unsafe(symbol_tables, "pointer dereference")?;
+                    resolve_access(
+                        global_scope,
+                        symbol_tables,
+                        target_type.deref().clone(),
+                        i + 1,
+                        access_nodes,
+                    )
+                }
                 other => Err(format!(
                     "cannot dereference non-pointer type `{}`",
                     type_to_string(&other)
@@ -1137,6 +1175,7 @@ fn resolve_addressable_access_type(
             loop {
                 match current {
                     Type::Const { inner } => current = inner.deref().clone(),
+                    Type::Reference { target_type, .. } => current = target_type.deref().clone(),
                     Type::Pointer { target_type } => current = target_type.deref().clone(),
                     _ => break,
                 }
@@ -1145,9 +1184,12 @@ fn resolve_addressable_access_type(
 
         match step {
             Node::Dereference { .. } => {
-                require_unsafe(symbol_tables, "pointer dereference")?;
                 current = match current {
-                    Type::Pointer { target_type } => target_type.deref().clone(),
+                    Type::Reference { target_type, .. } => target_type.deref().clone(),
+                    Type::Pointer { target_type } => {
+                        require_unsafe(symbol_tables, "pointer dereference")?;
+                        target_type.deref().clone()
+                    }
                     other => {
                         return Err(format!(
                             "cannot dereference non-pointer type `{}`",
@@ -1259,7 +1301,7 @@ fn resolve_addressable_access_type(
 fn binding_allows_indirect_mutation(sk_type: &Type) -> bool {
     matches!(
         unwrap_binding_const(sk_type),
-        Type::Pointer { .. } | Type::Slice { .. }
+        Type::Pointer { .. } | Type::Slice { .. } | Type::Reference { mutable: true, .. }
     )
 }
 
@@ -1288,6 +1330,15 @@ fn assert_mutating_receiver_allowed(
                         writable = false;
                         current = inner.deref().clone();
                     }
+                    Type::Reference {
+                        target_type,
+                        mutable,
+                    } => {
+                        if !mutable {
+                            writable = false;
+                        }
+                        current = target_type.deref().clone();
+                    }
                     Type::Pointer { target_type } => {
                         current = target_type.deref().clone();
                     }
@@ -1298,9 +1349,12 @@ fn assert_mutating_receiver_allowed(
 
         match step {
             Node::Dereference { .. } => {
-                require_unsafe(symbol_tables, "pointer dereference")?;
                 current = match current {
-                    Type::Pointer { target_type } => target_type.deref().clone(),
+                    Type::Reference { target_type, .. } => target_type.deref().clone(),
+                    Type::Pointer { target_type } => {
+                        require_unsafe(symbol_tables, "pointer dereference")?;
+                        target_type.deref().clone()
+                    }
                     other => {
                         return Err(format!(
                             "cannot dereference non-pointer type `{}`",
@@ -1409,6 +1463,15 @@ fn assert_mutating_receiver_allowed(
                 writable = false;
                 current = inner.deref().clone();
             }
+            Type::Reference {
+                target_type,
+                mutable,
+            } => {
+                if !mutable {
+                    writable = false;
+                }
+                current = target_type.deref().clone();
+            }
             Type::Pointer { target_type } => {
                 current = target_type.deref().clone();
             }
@@ -1458,6 +1521,15 @@ fn assert_assignment_target_mutable(
                         writable = false;
                         current = inner.deref().clone();
                     }
+                    Type::Reference {
+                        target_type,
+                        mutable,
+                    } => {
+                        if !mutable {
+                            writable = false;
+                        }
+                        current = target_type.deref().clone();
+                    }
                     Type::Pointer { target_type } => {
                         current = target_type.deref().clone();
                     }
@@ -1468,9 +1540,12 @@ fn assert_assignment_target_mutable(
 
         match step {
             Node::Dereference { .. } => {
-                require_unsafe(symbol_tables, "pointer dereference")?;
                 current = match current {
-                    Type::Pointer { target_type } => target_type.deref().clone(),
+                    Type::Reference { target_type, .. } => target_type.deref().clone(),
+                    Type::Pointer { target_type } => {
+                        require_unsafe(symbol_tables, "pointer dereference")?;
+                        target_type.deref().clone()
+                    }
                     other => {
                         return Err(format!(
                             "cannot dereference non-pointer type `{}`",
@@ -2240,7 +2315,10 @@ fn resolve_type(
                     }
                     let arg_type =
                         resolve_type(global_scope, symbol_tables, &arguments[0], None)?.sk_type;
-                    if !matches!(unwrap_binding_const(&arg_type), Type::Pointer { .. }) {
+                    if !matches!(
+                        unwrap_binding_const(&arg_type),
+                        Type::Pointer { .. } | Type::Reference { .. }
+                    ) {
                         return Err(format!(
                             "error {}:{}: pointer cast expects a pointer argument",
                             metadata.span.line, metadata.span.start
@@ -2269,7 +2347,10 @@ fn resolve_type(
                     }
                     let ptr_type =
                         resolve_type(global_scope, symbol_tables, &arguments[0], None)?.sk_type;
-                    if !matches!(unwrap_binding_const(&ptr_type), Type::Pointer { .. }) {
+                    if !matches!(
+                        unwrap_binding_const(&ptr_type),
+                        Type::Pointer { .. } | Type::Reference { .. }
+                    ) {
                         return Err(format!(
                             "error {}:{}: pointer offset expects a pointer argument",
                             metadata.span.line, metadata.span.start
@@ -2290,6 +2371,7 @@ fn resolve_type(
                     return Ok(ResolveResult::new(_type.clone()));
                 }
                 Type::Pointer { .. } => {}
+                Type::Reference { .. } => {}
                 Type::Custom(custom_name) if custom_name == "Memory" => {
                     require_unsafe(symbol_tables, &format!("Memory::{}", name))?;
                     match name.as_str() {
@@ -2304,7 +2386,10 @@ fn resolve_type(
                                 let arg_type =
                                     resolve_type(global_scope, symbol_tables, argument, None)?
                                         .sk_type;
-                                if !matches!(unwrap_binding_const(&arg_type), Type::Pointer { .. }) {
+                                if !matches!(
+                                    unwrap_binding_const(&arg_type),
+                                    Type::Pointer { .. } | Type::Reference { .. }
+                                ) {
                                     return Err(format!(
                                         "error {}:{}: Memory::copy expects pointer arguments",
                                         metadata.span.line, metadata.span.start
@@ -2335,7 +2420,10 @@ fn resolve_type(
                             let dst_type =
                                 resolve_type(global_scope, symbol_tables, &arguments[0], None)?
                                     .sk_type;
-                            if !matches!(unwrap_binding_const(&dst_type), Type::Pointer { .. }) {
+                            if !matches!(
+                                unwrap_binding_const(&dst_type),
+                                Type::Pointer { .. } | Type::Reference { .. }
+                            ) {
                                 return Err(format!(
                                     "error {}:{}: Memory::set expects a pointer destination",
                                     metadata.span.line, metadata.span.start
@@ -2770,16 +2858,38 @@ fn resolve_type(
                         ))
                     }
                 }
-                UnaryOperator::AddressOf => {
-                    require_unsafe(symbol_tables, "address-of")?;
+                UnaryOperator::AddressOf | UnaryOperator::AddressOfMut => {
                     let Node::Access { nodes } = operand.deref() else {
                         return Err("address-of requires an addressable access expression".to_string());
                     };
                     let target_type =
                         resolve_addressable_access_type(global_scope, symbol_tables, nodes)?;
-                    Ok(ResolveResult::new(Type::Pointer {
-                        target_type: Box::new(target_type),
-                    }))
+                    let expected = expected_type_opt.map(unwrap_binding_const);
+                    if matches!(expected, Some(Type::Pointer { .. })) {
+                        if matches!(operator, UnaryOperator::AddressOfMut) {
+                            assert_assignment_target_mutable(
+                                global_scope,
+                                symbol_tables,
+                                operand.deref(),
+                            )?;
+                        }
+                        require_unsafe(symbol_tables, "address-of")?;
+                        Ok(ResolveResult::new(Type::Pointer {
+                            target_type: Box::new(target_type),
+                        }))
+                    } else {
+                        if matches!(operator, UnaryOperator::AddressOfMut) {
+                            assert_assignment_target_mutable(
+                                global_scope,
+                                symbol_tables,
+                                operand.deref(),
+                            )?;
+                        }
+                        Ok(ResolveResult::new(Type::Reference {
+                            target_type: Box::new(target_type),
+                            mutable: matches!(operator, UnaryOperator::AddressOfMut),
+                        }))
+                    }
                 }
             }
         }
