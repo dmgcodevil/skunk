@@ -1291,6 +1291,16 @@ impl Monomorphizer {
                 };
                 Ok((Node::Return(value), Some(expected_return_type.clone())))
             }
+            Node::Defer(expression) => {
+                let (expression, _) = self.transform_expr(
+                    expression,
+                    env,
+                    None,
+                    substitutions,
+                    self_type,
+                )?;
+                Ok((Node::Defer(Box::new(expression)), Some(Type::Void)))
+            }
             Node::Print(expr) => {
                 let (expr, expr_type) =
                     self.transform_expr(expr, env, None, substitutions, self_type)?;
@@ -2554,6 +2564,7 @@ impl Monomorphizer {
             | Node::If { .. }
             | Node::Match { .. }
             | Node::For { .. }
+            | Node::Defer(_)
             | Node::Return(_)
             | Node::Print(_)
             | Node::Input

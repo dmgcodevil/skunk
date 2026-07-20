@@ -1108,6 +1108,7 @@ pub struct CallFrame {
     name: String,
     env: Rc<RefCell<Environment>>,
     closure_cache: Vec<(String, Option<ValueRef>)>,
+    deferred: Vec<Node>,
 }
 
 impl CallFrame {
@@ -1116,6 +1117,7 @@ impl CallFrame {
             name: name.to_string(),
             env: Rc::new(RefCell::new(Environment::new())),
             closure_cache: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -1261,6 +1263,50 @@ pub fn evaluate(node: &Node) -> ValueRef {
     let ge = Rc::new(RefCell::new(GlobalEnvironment::new()));
     stack.borrow_mut().create_frame_push("main".to_string());
     evaluate_node(node, &stack, &ge)
+}
+
+fn evaluate_statements(
+    statements: &[Node],
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+) -> ValueRef {
+    let mut result = ValueRef::stack(Value::Undefined);
+    for statement in statements {
+        result = evaluate_node(statement, stack, global_environment);
+        if result.returned() {
+            break;
+        }
+    }
+    result
+}
+
+fn run_current_frame_defers(
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+) {
+    let deferred = stack
+        .borrow()
+        .current_frame()
+        .deferred
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    for expression in deferred {
+        let _ = evaluate_node(&expression, stack, global_environment);
+    }
+}
+
+fn evaluate_scoped_statements(
+    statements: &[Node],
+    stack: &Rc<RefCell<CallStack>>,
+    global_environment: &Rc<RefCell<GlobalEnvironment>>,
+) -> ValueRef {
+    stack.borrow_mut().create_frame_push("".to_string());
+    let result = evaluate_statements(statements, stack, global_environment);
+    run_current_frame_defers(stack, global_environment);
+    stack.borrow_mut().pop();
+    result
 }
 
 fn assert_value_is_struct(v: &Value) {
@@ -1560,6 +1606,7 @@ fn evaluate_function(
             break;
         }
     }
+    run_current_frame_defers(stack, global_environment);
     result
 }
 
@@ -1919,17 +1966,7 @@ pub fn evaluate_node(
         ),
         Node::FunctionCall { .. } => evaluate_function_call(node, stack, global_environment, None),
         Node::Block { statements } => {
-            stack.borrow_mut().create_frame_push("".to_string());
-            let mut res = ValueRef::stack(Value::Undefined);
-            for statement in statements {
-                res = evaluate_node(statement, stack, global_environment);
-                if res.returned() {
-                    break;
-                }
-            }
-
-            stack.borrow_mut().frames.pop();
-            res
+            evaluate_scoped_statements(statements, stack, global_environment)
         }
         Node::StaticFunctionCall {
             _type,
@@ -2012,11 +2049,9 @@ pub fn evaluate_node(
                 })
                 .unwrap();
             if ok {
-                for n in body {
-                    let val = evaluate_node(n, stack, global_environment);
-                    if val.returned() {
-                        return val;
-                    }
+                let result = evaluate_scoped_statements(body, stack, global_environment);
+                if result.returned() {
+                    return result;
                 }
                 return ValueRef::stack(Value::Executed);
             }
@@ -2035,17 +2070,11 @@ pub fn evaluate_node(
             }
 
             if let Some(nodes) = else_block {
-                for n in nodes {
-                    let val = evaluate_node(n, stack, global_environment);
-                    if val.returned() {
-                        return val;
-                    }
-                    if val.is_match(|v| match v {
-                        Value::Executed => true,
-                        _ => false,
-                    }) {
-                        return val;
-                    }
+                let result = evaluate_scoped_statements(nodes, stack, global_environment);
+                if result.returned()
+                    || result.is_match(|value| matches!(value, Value::Executed))
+                {
+                    return result;
                 }
             }
 
@@ -2072,11 +2101,9 @@ pub fn evaluate_node(
                 })
                 .unwrap_or(true)
             {
-                for n in body {
-                    let val = evaluate_node(n, stack, global_environment);
-                    if val.returned() {
-                        return val;
-                    }
+                let result = evaluate_scoped_statements(body, stack, global_environment);
+                if result.returned() {
+                    return result;
                 }
                 if let Some(n) = update {
                     evaluate_node(n, stack, global_environment);
@@ -2181,11 +2208,19 @@ pub fn evaluate_node(
         }
         Node::Identifier(name) => stack.borrow().get_variable(name).unwrap().clone(),
         Node::EOI => ValueRef::stack(Value::Void),
+        Node::Defer(expression) => {
+            stack
+                .borrow_mut()
+                .current_frame_mut()
+                .deferred
+                .push(expression.as_ref().clone());
+            ValueRef::stack(Value::Void)
+        }
         Node::Return(body_opt) => {
             if let Some(body) = body_opt {
                 evaluate_node(body, stack, global_environment).to_returned()
             } else {
-                ValueRef::stack(Value::Void)
+                ValueRef::stack(Value::Void).to_returned()
             }
         }
         _ => panic!("Unexpected node type: {:?}", node),
@@ -2195,6 +2230,38 @@ pub fn evaluate_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_defer_runs_in_lifo_order_across_returned_scopes() {
+        let program = ast::parse(
+            r#"
+            struct Recorder {
+                value: int;
+            }
+
+            attach Recorder {
+                function push(mut self, digit: int): void {
+                    self.value = self.value * 10 + digit;
+                }
+            }
+
+            function finish(recorder: Recorder): void {
+                defer recorder.push(1);
+                {
+                    defer recorder.push(2);
+                    return;
+                }
+            }
+
+            recorder: Recorder = Recorder { value: 0 };
+            finish(recorder);
+            recorder.value;
+            "#,
+        );
+
+        let result = evaluate(&program);
+        assert_eq!(Value::Integer(21), result.get_value());
+    }
 
     #[test]
     fn test_array_modify() {

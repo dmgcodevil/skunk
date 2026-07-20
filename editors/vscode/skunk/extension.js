@@ -15,6 +15,7 @@ const KEYWORDS = [
     "for",
     "function",
     "return",
+    "defer",
     "if",
     "else",
     "match",

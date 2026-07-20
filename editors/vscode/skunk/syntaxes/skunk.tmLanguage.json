@@ -118,7 +118,7 @@
       "patterns": [
         {
           "name": "keyword.control.skunk",
-          "match": "\\b(?:if|else|for|in|match|case|return|unsafe)\\b"
+          "match": "\\b(?:if|else|for|in|match|case|return|defer|unsafe)\\b"
         },
         {
           "name": "keyword.declaration.skunk",

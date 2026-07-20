@@ -3070,6 +3070,10 @@ fn resolve_type(
             resolve_type(global_scope, symbol_tables, n.deref(), expected_type_opt)?; // verify string
             Ok(ResolveResult::new(Type::Void))
         }
+        Node::Defer(expression) => {
+            resolve_type(global_scope, symbol_tables, expression, None)?;
+            Ok(ResolveResult::new(Type::Void))
+        }
         Node::Return(body_opt) => {
             let mut res = ResolveResult::returned(Type::Void);
             if let Some(body) = body_opt {

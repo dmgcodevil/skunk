@@ -70,7 +70,7 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | import | export_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl | attach_decl | conform_decl | control_flow | io | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
+statement         = { module | import | export_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl | attach_decl | conform_decl | control_flow | io | defer_stmt | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
 assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
@@ -148,6 +148,7 @@ input           = { "input" ~ "(" ~ ")" ~ ";" }
 io              = { print | input }
 
 sk_return        = { "return" ~ (lambda_expr | expression)? ~ ";" }
+defer_stmt       = { "defer" ~ expression ~ ";" }
 
 
 unary_op        = { (unary_plus | unary_minus | negate | address_of_mut | address_of) ~ primary }

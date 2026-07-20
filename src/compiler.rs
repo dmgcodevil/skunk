@@ -122,6 +122,13 @@ struct TraitMethodLayout {
     parameters: Vec<LlvmType>,
 }
 
+#[derive(Clone)]
+struct DeferredExpression {
+    expression: Node,
+    locals: HashMap<String, LocalVar>,
+    unsafe_depth: usize,
+}
+
 #[derive(Clone, Debug)]
 struct TraitLayout {
     name: String,
@@ -534,6 +541,7 @@ struct FunctionCompiler<'a> {
     lambda_counter: &'a mut usize,
     closure_env: Option<ClosureEnv>,
     scopes: Vec<HashMap<String, LocalVar>>,
+    deferred_scopes: Vec<Vec<DeferredExpression>>,
     lines: Vec<String>,
     temp_counter: usize,
     label_counter: usize,
@@ -570,6 +578,7 @@ impl<'a> FunctionCompiler<'a> {
             lambda_counter,
             closure_env,
             scopes: vec![HashMap::new()],
+            deferred_scopes: vec![Vec::new()],
             lines: Vec::new(),
             temp_counter: 0,
             label_counter: 0,
@@ -628,7 +637,10 @@ impl<'a> FunctionCompiler<'a> {
 
         if !self.terminated {
             match self.return_type {
-                LlvmType::Void => self.emit_line("ret void".to_string()),
+                LlvmType::Void => {
+                    self.compile_current_scope_defers()?;
+                    self.emit_line("ret void".to_string());
+                }
                 _ => {
                     return Err(format!(
                         "function `{}` can reach the end without returning a value in LLVM backend",
@@ -697,13 +709,21 @@ impl<'a> FunctionCompiler<'a> {
             Node::Block { statements } => {
                 self.push_scope();
                 self.compile_statements(statements)?;
+                if !self.terminated {
+                    self.compile_current_scope_defers()?;
+                }
                 self.pop_scope();
                 Ok(())
             }
             Node::UnsafeBlock { statements } => {
                 self.push_scope();
                 self.enter_unsafe();
-                let result = self.compile_statements(statements);
+                let result = self.compile_statements(statements).and_then(|_| {
+                    if !self.terminated {
+                        self.compile_current_scope_defers()?;
+                    }
+                    Ok(())
+                });
                 self.exit_unsafe();
                 self.pop_scope();
                 result
@@ -726,6 +746,21 @@ impl<'a> FunctionCompiler<'a> {
                 update.as_deref(),
                 body,
             ),
+            Node::Defer(expression) => {
+                let mut locals = HashMap::new();
+                for scope in &self.scopes {
+                    locals.extend(scope.clone());
+                }
+                self.deferred_scopes
+                    .last_mut()
+                    .expect("defer scope stack should never be empty")
+                    .push(DeferredExpression {
+                        expression: expression.as_ref().clone(),
+                        locals,
+                        unsafe_depth: self.unsafe_depth,
+                    });
+                Ok(())
+            }
             Node::Return(value) => {
                 match value {
                     Some(value) => {
@@ -733,6 +768,7 @@ impl<'a> FunctionCompiler<'a> {
                         let expr = self.compile_expr_with_expected(value, Some(&return_type))?;
                         let return_type = self.return_type.clone();
                         let expr = self.coerce_expr(expr, &return_type, "return")?;
+                        self.compile_all_scope_defers()?;
                         self.emit_line(format!("ret {} {}", expr.llvm_type.ir(), expr.value));
                     }
                     None => {
@@ -743,6 +779,7 @@ impl<'a> FunctionCompiler<'a> {
                                 self.return_type.ir()
                             ));
                         }
+                        self.compile_all_scope_defers()?;
                         self.emit_line("ret void".to_string());
                     }
                 }
@@ -792,6 +829,9 @@ impl<'a> FunctionCompiler<'a> {
         self.emit_label(&then_label);
         self.push_scope();
         self.compile_statements(body)?;
+        if !self.terminated {
+            self.compile_current_scope_defers()?;
+        }
         self.pop_scope();
         if !self.terminated {
             self.emit_line(format!("br label %{}", after_label));
@@ -806,6 +846,9 @@ impl<'a> FunctionCompiler<'a> {
         if let Some(else_block) = else_block {
             self.push_scope();
             self.compile_statements(else_block)?;
+            if !self.terminated {
+                self.compile_current_scope_defers()?;
+            }
             self.pop_scope();
         }
         let else_terminated = self.terminated;
@@ -902,6 +945,9 @@ impl<'a> FunctionCompiler<'a> {
                         self.declare_local(binding.clone(), payload_ptr, payload_type.clone());
                     }
                     self.compile_statements(&case.body)?;
+                    if !self.terminated {
+                        self.compile_current_scope_defers()?;
+                    }
                     self.pop_scope();
                     if !self.terminated {
                         all_terminated = false;
@@ -937,6 +983,9 @@ impl<'a> FunctionCompiler<'a> {
                 self.push_scope();
                 self.bind_struct_pattern_fields(struct_name, &matched, fields)?;
                 self.compile_statements(&case.body)?;
+                if !self.terminated {
+                    self.compile_current_scope_defers()?;
+                }
                 self.pop_scope();
                 Ok(())
             }
@@ -977,7 +1026,12 @@ impl<'a> FunctionCompiler<'a> {
         }
 
         self.emit_label(&body_label);
+        self.push_scope();
         self.compile_statements(body)?;
+        if !self.terminated {
+            self.compile_current_scope_defers()?;
+        }
+        self.pop_scope();
         let body_terminated = self.terminated;
         self.terminated = false;
         if !body_terminated {
@@ -992,6 +1046,7 @@ impl<'a> FunctionCompiler<'a> {
         self.emit_line(format!("br label %{}", cond_label));
 
         self.emit_label(&end_label);
+        self.compile_current_scope_defers()?;
         self.pop_scope();
         Ok(())
     }
@@ -3995,10 +4050,56 @@ impl<'a> FunctionCompiler<'a> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.deferred_scopes.push(Vec::new());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.deferred_scopes.pop();
+    }
+
+    fn compile_current_scope_defers(&mut self) -> Result<(), String> {
+        let deferred = self
+            .deferred_scopes
+            .last()
+            .expect("defer scope stack should never be empty")
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.compile_deferred_expressions(deferred)
+    }
+
+    fn compile_all_scope_defers(&mut self) -> Result<(), String> {
+        let deferred = self
+            .deferred_scopes
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.iter().rev())
+            .cloned()
+            .collect::<Vec<_>>();
+        self.compile_deferred_expressions(deferred)
+    }
+
+    fn compile_deferred_expressions(
+        &mut self,
+        deferred: Vec<DeferredExpression>,
+    ) -> Result<(), String> {
+        for deferred_expression in deferred {
+            let active_scopes = std::mem::replace(
+                &mut self.scopes,
+                vec![deferred_expression.locals],
+            );
+            let active_unsafe_depth = std::mem::replace(
+                &mut self.unsafe_depth,
+                deferred_expression.unsafe_depth,
+            );
+            let result = self.compile_expr(&deferred_expression.expression);
+            self.scopes = active_scopes;
+            self.unsafe_depth = active_unsafe_depth;
+            let _ = result?;
+        }
+        Ok(())
     }
 
     fn enter_unsafe(&mut self) {
@@ -4933,6 +5034,88 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "3\n4\n3\n4\n");
+    }
+
+    #[test]
+    fn runs_compiled_defer_on_scope_exit_return_and_loop_iterations() {
+        let stdout = compile_and_run(
+            r#"
+            function log(value: int): void {
+                print(value);
+            }
+
+            function finish(early: boolean): int {
+                defer log(1);
+                if (early) {
+                    defer log(2);
+                    defer log(3);
+                    return 7;
+                }
+                defer log(4);
+                return 8;
+            }
+
+            function shadowed_return(): void {
+                value: int = 1;
+                defer log(value);
+                {
+                    value: int = 2;
+                    return;
+                }
+            }
+
+            function main(): void {
+                print(finish(true));
+                print(finish(false));
+                shadowed_return();
+
+                {
+                    defer log(5);
+                    defer log(6);
+                    log(0);
+                }
+
+                for (i: int = 0; i < 2; i = i + 1) {
+                    defer log(i);
+                    log(i + 10);
+                }
+
+                marker: int = 9;
+                defer log(marker);
+                marker = 10;
+
+                bytes: [1]byte;
+                unsafe {
+                    defer Memory::set(&bytes[0], 12, 1);
+                }
+                print(bytes[0]);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            stdout,
+            "3\n2\n1\n7\n4\n1\n8\n1\n0\n6\n5\n10\n0\n11\n1\n12\n10\n"
+        );
+    }
+
+    #[test]
+    fn rejects_safe_defer_unwound_from_an_unsafe_return() {
+        let result = compile_and_run(
+            r#"
+            function main(): void {
+                value: int = 0;
+                defer Memory::set(&value, 7, int::size_of());
+                unsafe {
+                    return;
+                }
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unsafe block"));
     }
 
     #[test]

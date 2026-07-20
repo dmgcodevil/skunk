@@ -130,6 +130,7 @@ pub enum Node {
         update: Option<Box<Node>>,    // Update is a statement node
         body: Vec<Node>,              // The body is a list of nodes
     },
+    Defer(Box<Node>),          // The expression runs when its lexical scope exits
     Return(Option<Box<Node>>), // The return value is an expression node
     Print(Box<Node>),          // The print expression is an expression node
     Input,                     // Read data from keyboard
@@ -429,6 +430,9 @@ impl PestImpl {
             Rule::static_func_call => self.create_static_func_call(pair),
             Rule::struct_init => self.create_struct_init(pair),
             Rule::inline_array_init => self.create_inline_array_init(pair),
+            Rule::defer_stmt => {
+                Node::Defer(Box::new(self.create_ast(pair.into_inner().next().unwrap())))
+            }
             Rule::sk_return => {
                 let mut pairs = pair.into_inner();
                 if pairs.len() != 0 {
@@ -2716,6 +2720,24 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test]
+    fn test_defer_statement() {
+        assert_eq!(
+            Node::Program {
+                statements: vec![
+                    Node::Defer(Box::new(Node::FunctionCall {
+                        name: "cleanup".to_string(),
+                        type_arguments: vec![],
+                        arguments: vec![vec![]],
+                        metadata: Metadata::EMPTY,
+                    })),
+                    Node::EOI,
+                ],
+            },
+            parse("defer cleanup();")
+        );
     }
 
     #[test]

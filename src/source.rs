@@ -737,6 +737,11 @@ impl ModuleNormalizer {
                     body,
                 }
             }
+            Node::Defer(expression) => Node::Defer(Box::new(self.rename_expr(
+                *expression,
+                value_scopes,
+                type_scopes,
+            )?)),
             Node::Return(value) => Node::Return(
                 value
                     .map(|value| {
@@ -936,6 +941,7 @@ impl ModuleNormalizer {
             | Node::If { .. }
             | Node::Match { .. }
             | Node::For { .. }
+            | Node::Defer(_)
             | Node::Return(_)
             | Node::Print(_)
             | Node::StructDestructure { .. }

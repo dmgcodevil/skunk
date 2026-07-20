@@ -202,12 +202,15 @@ function copy_into(const dst: []int, src: []const int): void {
 
             <section id="functions-and-control-flow">
                 <h2>Functions and Control Flow</h2>
-                <p>Skunk supports named functions, lambdas, closures, <code>if</code>, <code>for</code>, <code>return</code>, and block scoping.</p>
+                <p>Skunk supports named functions, lambdas, closures, <code>if</code>, <code>for</code>, <code>return</code>, <code>defer</code>, and block scoping.</p>
 <pre><code class="language-skunk">function add(a: int, b: int): int {
     return a + b;
 }
 
 function main(): void {
+    arena: Arena = Arena::init(System::allocator());
+    defer arena.deinit();
+
     total: int = add(5, 7);
 
     if (total &gt; 10) {
@@ -222,6 +225,7 @@ function main(): void {
     print(counter());
 }</code></pre>
                 <p>Closures can capture and mutate surrounding locals. Function values can be stored, returned, and passed as arguments.</p>
+                <p><code>defer expression;</code> schedules an expression for the end of the current lexical scope. Deferred expressions run in last-in, first-out order on both normal scope exit and <code>return</code>; their values and arguments are evaluated when the scope exits.</p>
             </section>
 
             <section id="arrays-and-slices">
