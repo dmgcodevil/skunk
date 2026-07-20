@@ -254,7 +254,7 @@ print(mid[0]);</code></pre>
 
 attach Counter {
     function new(seed: int, value: int): Counter {
-        return Counter { seed: seed, value: value };
+        return Counter { seed, value };
     }
 
     function bump(mut self): void {
@@ -272,10 +272,17 @@ function main(): void {
     print(counter.seed);
     print(counter.get());
 }</code></pre>
+                <p>Struct literals support field shorthand when a field name matches an in-scope binding. <code>Counter { seed, value }</code> is equivalent to <code>Counter { seed: seed, value: value }</code>. Shorthand and explicit fields may be mixed:</p>
+<pre><code class="language-skunk">seed: int = 3;
+value: int = 4;
+
+counter: Counter = Counter { seed, value };
+next: Counter = Counter { seed, value: value + 1 };</code></pre>
                 <p>Receiver mutability is explicit:</p>
                 <ul>
                     <li><code>attach Type { ... }</code> adds inherent methods to a type without declaring trait conformance.</li>
                     <li>Attached functions without <code>self</code> are called with <code>Type::name(...)</code> and work well for constructors and factories.</li>
+                    <li>A shorthand field such as <code>x</code> uses the same value as <code>x: x</code>; use the explicit form for a different binding or a computed expression.</li>
                     <li>Struct fields may be declared <code>const</code>; they may be initialized but not reassigned later.</li>
                     <li><code>self</code> means the method may read but may not mutate receiver state.</li>
                     <li><code>mut self</code> means the method may mutate receiver state.</li>

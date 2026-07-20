@@ -735,10 +735,8 @@ impl PestImpl {
     }
 
     /// Parses a struct literal and stores each field as an explicit
-    /// `(field_name, expression)` pair.
-    ///
-    /// If you add syntactic sugar for struct literals, this is usually the best
-    /// place to desugar it so the type checker and compiler can stay simple.
+    /// `(field_name, expression)` pair. A shorthand field such as `x` is
+    /// desugared to the same access expression produced by `x: x`.
     fn create_struct_init(&self, pair: Pair<Rule>) -> Node {
         let mut inner_pairs = pair.into_inner();
         let struct_type = self.create_type(inner_pairs.next().unwrap());
@@ -749,7 +747,12 @@ impl PestImpl {
                     Rule::init_field => {
                         let mut init_field_pairs = p.into_inner();
                         let field_name = init_field_pairs.next().unwrap().as_str().to_string();
-                        let body = self.create_ast(init_field_pairs.next().unwrap());
+                        let body = init_field_pairs
+                            .next()
+                            .map(|expression| self.create_ast(expression))
+                            .unwrap_or_else(|| Node::Access {
+                                nodes: vec![Node::Identifier(field_name.clone())],
+                            });
                         fields.push((field_name, body));
                     }
                     _ => panic!("unsupported rule {}", p),
@@ -3463,6 +3466,29 @@ mod tests {
             },
             parse(source_code)
         )
+    }
+
+    #[test]
+    fn test_struct_init_shorthand_desugars_to_explicit_fields() {
+        assert_eq!(
+            parse("p: Point = Point { x, y };"),
+            parse("p: Point = Point { x: x, y: y };")
+        );
+    }
+
+    #[test]
+    fn test_struct_init_mixes_shorthand_and_explicit_fields() {
+        assert_eq!(
+            parse("p: Point = Point { x, y: 2 };"),
+            parse("p: Point = Point { x: x, y: 2 };")
+        );
+    }
+
+    #[test]
+    fn test_struct_init_rejects_explicit_field_without_expression() {
+        assert!(PestImpl::new()
+            .parse("p: Point = Point { x: };")
+            .is_err());
     }
 
     #[test]

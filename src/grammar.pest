@@ -107,7 +107,7 @@ lambda_expr       = { "function" ~ static_func_params ~ optional_return_type ~ "
 // Struct Initialization
 struct_init        = { nominal_type ~ "{" ~ init_field_list? ~ "}" }
 init_field_list    = { init_field ~ ("," ~ init_field)* }
-init_field         = { IDENTIFIER ~ ":" ~ expression }
+init_field         = { IDENTIFIER ~ (":" ~ expression)? }
 
 // Array Access and Initialization
 slice_start = { expression? }

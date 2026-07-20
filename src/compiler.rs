@@ -4910,6 +4910,32 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_struct_field_shorthand_program() {
+        let stdout = compile_and_run(
+            r#"
+            struct Point {
+                x: int;
+                y: int;
+            }
+
+            function main(): void {
+                x: int = 3;
+                y: int = 4;
+                shorthand: Point = Point { x, y };
+                explicit: Point = Point { x: x, y: y };
+                print(shorthand.x);
+                print(shorthand.y);
+                print(explicit.x);
+                print(explicit.y);
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "3\n4\n3\n4\n");
+    }
+
+    #[test]
     fn runs_compiled_nested_struct_program() {
         let stdout = compile_and_run(
             r#"
