@@ -3157,7 +3157,7 @@ fn resolve_type(
 /// Type-checks a fully loaded and monomorphized program.
 ///
 /// Successful completion means the program is semantically valid enough for the
-/// interpreter and LLVM backend to consume.
+/// LLVM backend to consume.
 pub fn check(node: &Node) -> Result<(), String> {
     let mut var_tables = SymbolTables::new();
     var_tables.add(SymbolTable::new());

@@ -18,9 +18,7 @@ At a high level, the compiler answers one question:
 
 "How do we turn a `.skunk` program into something the machine can run?"
 
-In this repository, there are currently two ways to answer that question.
-
-The older path is the interpreter. It reads the program and executes it directly inside Rust. The newer and more important path is the compiler. It reads the program, checks it, lowers it into LLVM IR, and asks `clang` to produce a native executable.
+Skunk reads the program, checks it, lowers it into LLVM IR, and asks `clang` to produce a native executable. The same native pipeline powers both `skunk run` and `skunk compile`.
 
 That means Skunk is not just a parser and not just a code generator. It is a whole pipeline made of loading, parsing, normalization, monomorphization, type checking, lowering, and runtime linkage.
 
@@ -56,7 +54,7 @@ The important thing to notice is the order:
 2. Load the program
 3. Prepare the program
 4. Type-check the program
-5. Interpret it or compile it
+5. Compile it, then either run it or keep the executable
 
 That order tells you what the rest of the repository expects. For example, the compiler backend assumes it receives a program that has already been loaded, normalized, and checked.
 
@@ -104,7 +102,6 @@ Many parts of the compiler talk in terms of `Node` and `Type`, including:
 - the source loader
 - the monomorphizer
 - the type checker
-- the interpreter
 - the LLVM backend
 
 This is powerful because it keeps the project easy to extend. A new language feature can often be added by introducing new AST cases and teaching a few later stages how to handle them.
@@ -351,23 +348,16 @@ This means the final binary is a collaboration between:
 - [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 - [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
 
-## Chapter 14: The Interpreter Still Has Educational Value
+## Chapter 14: One Native Execution Model
 
-Skunk still contains an interpreter in [`src/interpreter.rs`](../src/interpreter.rs).
+Skunk has one authoritative execution path. Runtime behavior tests lower programs to LLVM IR, link them with the runtime support files, and execute the resulting native binaries.
 
-Even though native compilation is the main path, the interpreter remains useful as:
-
-- a semantic reference
-- a fallback execution model for some features
-- a source of tests and examples
-- a reminder of the language's intended behavior independent of LLVM details
-
-In young language projects, it is normal for interpreter and compiler paths to coexist for a while.
+Keeping one path means language semantics, command-line execution, and compiler tests all exercise the same implementation.
 
 ### Read next
 
-- [`src/interpreter.rs`](../src/interpreter.rs): `evaluate`
-- [`src/interpreter.rs`](../src/interpreter.rs): `evaluate_node`
+- [`src/compiler.rs`](../src/compiler.rs): native runtime tests
+- [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 
 ## Chapter 15: How To Read The Codebase Without Drowning
 
@@ -414,9 +404,8 @@ Second pass:
 
 1. [`src/grammar.pest`](../src/grammar.pest)
 2. [`src/monomorphize.rs`](../src/monomorphize.rs)
-3. [`src/interpreter.rs`](../src/interpreter.rs)
-4. [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
-5. [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
+3. [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
+4. [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
 
 That order works well because it gives you the story first and the details second.
 

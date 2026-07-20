@@ -7,7 +7,7 @@ Do not use Skunk to build critical, safety-sensitive, security-sensitive, or hig
 ## Status
 
 - Native compilation through LLVM/Clang is the primary execution path.
-- The repository still contains legacy interpreter code while the compiler/runtime continues to absorb older coverage.
+- Native compilation is the only execution path, keeping runtime behavior aligned with generated binaries.
 - The language reference lives in [Skunk](https://dmgcodevil.github.io/skunk/)
 - Syntax and implemented behavior are defined by [`src/grammar.pest`](src/grammar.pest) and the test suite.
 
@@ -35,10 +35,12 @@ cargo run -- compile examples/pong.skunk ./pong
 ./pong
 ```
 
-The legacy interpreter path still exists:
+Compile and run a program natively using a temporary executable:
 
 ```bash
 cargo run -- path/to/main.skunk
+# Equivalent explicit form:
+cargo run -- run path/to/main.skunk
 ```
 
 ## VS Code

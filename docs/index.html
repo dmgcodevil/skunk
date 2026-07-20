@@ -72,7 +72,7 @@
 
             <section id="status">
                 <h2>Status</h2>
-                <p>The primary execution path is native compilation through LLVM and <code>clang</code>. The repository still contains legacy interpreter code, but the compiler/runtime path is the main focus.</p>
+                <p>Skunk uses one execution path: native compilation through LLVM and <code>clang</code>.</p>
                 <ul>
                     <li>Source-level syntax is defined in <code>src/grammar.pest</code>.</li>
                     <li>Implemented behavior is backed by parser, type-checker, source-loader, and compiler tests.</li>
@@ -97,8 +97,9 @@
 <pre><code class="language-bash">cargo build
 cargo run -- compile path/to/main.skunk ./out
 ./out</code></pre>
-                <p>The legacy interpreter path still exists while the codebase transitions further toward compiler-only execution.</p>
+                <p>Compile and run through a temporary native executable with either command:</p>
 <pre><code class="language-bash">cargo run -- path/to/main.skunk</code></pre>
+<pre><code class="language-bash">cargo run -- run path/to/main.skunk</code></pre>
             </section>
 
             <section id="programs-and-modules">

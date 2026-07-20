@@ -2303,6 +2303,7 @@ fn parse_char_literal(literal: &str) -> Result<char, String> {
     Ok(ch)
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::Node::Access;

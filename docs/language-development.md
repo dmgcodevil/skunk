@@ -7,7 +7,7 @@ This document captures the current working agreement for Skunk development.
 Skunk language behavior should be derived from these sources:
 
 1. [`src/grammar.pest`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/grammar.pest) for syntax
-2. Parser, interpreter, and type-checker tests in [`src/ast.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/ast.rs), [`src/interpreter.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/interpreter.rs), and [`src/type_checker.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/type_checker.rs) for executable behavior
+2. Parser, type-checker, and native compiler tests in [`src/ast.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/ast.rs), [`src/type_checker.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/type_checker.rs), and [`src/compiler.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/compiler.rs) for executable behavior
 3. [`README.md`](/Users/dmgcodevil/dev/skunk-llvm/skunk/README.md) for language-facing examples and intent
 4. Focused design notes in [`docs/`](/Users/dmgcodevil/dev/skunk-llvm/skunk/docs) for agreed future language directions such as pointers and allocators
 
@@ -35,7 +35,7 @@ We are keeping this repository and evolving it in place rather than restarting f
 
 Why:
 
-- The repo already has a parser, AST, type checker, interpreter, and initial LLVM compiler path
+- The repo already has a parser, AST, type checker, and LLVM compiler/runtime path
 - The language is still evolving, so preserving iteration speed is more valuable than a clean-slate rewrite
 - Existing tests provide a growing language contract
 
@@ -48,10 +48,10 @@ Skunk should move toward a clearer compiler pipeline over time:
 1. Parse source into syntax-level AST
 2. Perform semantic analysis and type checking
 3. Lower into a simpler typed IR
-4. Execute either through an interpreter/runtime path or LLVM code generation
+4. Lower to LLVM IR and link a native executable with the runtime
 5. Keep tests covering syntax, typing, and runtime behavior at each layer
 
-The current interpreter remains valuable as a reference implementation while the compiler backend grows.
+The native compiler and runtime are the authoritative execution model.
 
 ## Near-Term Engineering Priorities
 
