@@ -4168,7 +4168,13 @@ pub fn compile_to_executable(
     let runtime_c_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_runtime.c");
     let runtime_window_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_window_runtime.m");
-    let mut command = Command::new("clang");
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("xcrun");
+        command.args(["--sdk", "macosx", "clang"]);
+        command
+    } else {
+        Command::new("clang")
+    };
     command.arg(&llvm_ir_path).arg(&runtime_c_path);
     if cfg!(target_os = "macos") {
         command
