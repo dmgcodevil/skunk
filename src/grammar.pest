@@ -57,7 +57,11 @@ reference_prefix = { "&" ~ mut_kw? }
 type_prefix     = { pointer_prefix | reference_prefix | "[" ~ expression? ~ "]" }
 prefixed_type   = { type_prefix+ ~ const_kw? ~ (base_type | function_type) } // preferred syntax: [3]int, []int, *const Foo, &T, &mut T
 function_type   = { "(" ~ param_type_list? ~ ")" ~ "->" ~ _type }
-_type           = { prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type }
+type_atom       = _{ prefixed_type | legacy_array_type | legacy_slice_type | base_type | function_type | "(" ~ _type ~ ")" }
+intersection_type = { type_atom ~ ("&" ~ type_atom)+ }
+union_member    = _{ intersection_type | type_atom }
+union_type      = { union_member ~ ("|" ~ union_member)+ }
+_type           = { union_type | intersection_type | type_atom }
 
 _self               = { (const_kw | mut_kw)? ~ "self" }
 member_func_params  = { "(" ~ _self ~ ("," ~ param_list )? ~ ")" }
@@ -70,13 +74,14 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | import | export_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl | attach_decl | conform_decl | control_flow | io | defer_stmt | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
+statement         = { module | import | export_decl | type_alias_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl | attach_decl | conform_decl | control_flow | io | defer_stmt | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
 assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
 module            = { "module" ~ qualified_name ~ ";"}
 import            = { "import" ~ qualified_name ~ ";"}
-export_decl       = { "export" ~ (var_decl_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl) }
+export_decl       = { "export" ~ (type_alias_decl | var_decl_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl) }
+type_alias_decl   = { "type" ~ IDENTIFIER ~ generic_params? ~ "=" ~ _type ~ ";" }
 param_decl        = { const_kw? ~ IDENTIFIER ~ ":" ~ _type }
 var_decl          = { const_kw? ~ IDENTIFIER ~ ":" ~ _type ~ ( "=" ~ ( lambda_expr | expression | func_call ) )? }
 var_decl_stmt     = { var_decl ~ ";"? }

@@ -326,6 +326,22 @@ fn is_assignable(global_scope: &GlobalScope, expected: &Type, actual: &Type) -> 
     }
 
     match (expected, actual) {
+        (Type::Union(members), _) => members
+            .iter()
+            .any(|member| is_assignable(global_scope, member, actual)),
+        (_, Type::Union(members)) => members
+            .iter()
+            .all(|member| is_assignable(global_scope, expected, member)),
+        (Type::Intersection(members), _) => members
+            .iter()
+            .all(|member| is_assignable(global_scope, member, actual)),
+        (Type::Custom(expected_name), Type::Intersection(members))
+            if global_scope.traits.contains_key(expected_name) =>
+        {
+            members
+                .iter()
+                .any(|member| member == &Type::Custom(expected_name.clone()))
+        }
         (
             Type::Const {
                 inner: expected_inner,
@@ -463,6 +479,36 @@ fn collect_trait_methods(
     }
     visiting.pop();
     Ok(methods)
+}
+
+fn intersection_method_symbol(
+    global_scope: &GlobalScope,
+    members: &[Type],
+    method_name: &str,
+) -> Result<Symbol, String> {
+    let mut matches = Vec::new();
+    for member in members {
+        let Type::Custom(trait_name) = member else {
+            continue;
+        };
+        let methods = collect_trait_methods(global_scope, trait_name, &mut Vec::new())?;
+        if let Some(method) = methods.get(method_name) {
+            matches.push((trait_name.clone(), method.clone()));
+        }
+    }
+    match matches.len() {
+        0 => Err(format!(
+            "no method named `{}` found for intersection `{}`",
+            method_name,
+            type_to_string(&Type::Intersection(members.to_vec()))
+        )),
+        1 => Ok(matches.pop().unwrap().1),
+        _ => Err(format!(
+            "ambiguous method `{}` on intersection `{}`",
+            method_name,
+            type_to_string(&Type::Intersection(members.to_vec()))
+        )),
+    }
 }
 
 fn is_zero_initializable_type(sk_type: &Type) -> bool {
@@ -1002,6 +1048,42 @@ fn resolve_access(
                     metadata.span.line, metadata.span.start, name
                 )),
                 _ => Err("arena member access expects a function call".to_string()),
+            },
+            Type::Intersection(members) => match member.deref() {
+                Node::Identifier(field_name) => Err(format!(
+                    "error {}:{}: no field `{}` on intersection `{}`",
+                    metadata.span.line,
+                    metadata.span.start,
+                    field_name,
+                    type_to_string(&Type::Intersection(members))
+                )),
+                Node::FunctionCall { name, .. } => {
+                    let method_symbol =
+                        intersection_method_symbol(global_scope, &members, name)?;
+                    if let Type::Function { parameters, .. } = &method_symbol.sk_type {
+                        if parameters.first().is_some_and(is_mut_self_type) {
+                            assert_mutating_receiver_allowed(
+                                global_scope,
+                                symbol_tables,
+                                &access_nodes[..i],
+                            )?;
+                        }
+                    }
+                    let return_type = resolve_function_call(
+                        global_scope,
+                        symbol_tables,
+                        &method_symbol,
+                        member.deref(),
+                    )?;
+                    resolve_access(
+                        global_scope,
+                        symbol_tables,
+                        return_type,
+                        i + 1,
+                        access_nodes,
+                    )
+                }
+                _ => Err("intersection member access expects a method call".to_string()),
             },
             Type::Custom(type_name) => {
                 if type_name == "Window" {
@@ -2846,6 +2928,7 @@ fn resolve_type(
                     }));
                 }
                 Type::Function { .. } => {}
+                Type::Union(_) | Type::Intersection(_) => {}
                 Type::SkSelf | Type::MutSelf => {}
                 Type::BindingConst { .. } | Type::Const { .. } => unreachable!(),
             }

@@ -26,6 +26,13 @@
     ],
     "description": "Create a data-only struct"
   },
+  "Type Alias": {
+    "prefix": "type",
+    "body": [
+      "type ${1:Name} = ${2:int};"
+    ],
+    "description": "Create a transparent type alias"
+  },
   "Trait": {
     "prefix": "trait",
     "body": [

@@ -20,6 +20,12 @@ pub enum Node {
     Export {
         declaration: Box<Node>,
     },
+    TypeAliasDeclaration {
+        name: String,
+        generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
+        target_type: Type,
+    },
     Block {
         statements: Vec<Node>,
         // metadata: Metadata,
@@ -300,6 +306,8 @@ pub enum Type {
         base: String,
         type_arguments: Vec<Type>,
     },
+    Union(Vec<Type>),
+    Intersection(Vec<Type>),
     Custom(String), // Custom types like structs
     Function {
         parameters: Vec<Type>,
@@ -398,6 +406,7 @@ impl PestImpl {
             Rule::module => self.create_module(pair),
             Rule::import => self.create_import(pair),
             Rule::export_decl => self.create_export(pair),
+            Rule::type_alias_decl => self.create_type_alias_decl(pair),
             Rule::statement => {
                 let mut pairs = pair.into_inner();
                 let inner = pairs.next().unwrap();
@@ -1007,6 +1016,16 @@ impl PestImpl {
                     dimensions,
                 }
             }
+            Rule::union_type => Type::Union(
+                pair.into_inner()
+                    .map(|member| self.create_type(member))
+                    .collect(),
+            ),
+            Rule::intersection_type => Type::Intersection(
+                pair.into_inner()
+                    .map(|member| self.create_type(member))
+                    .collect(),
+            ),
             Rule::_type => self.create_type(pair.into_inner().next().unwrap()),
             _ => panic!("unexpected pair {:?}", pair),
         }
@@ -1272,6 +1291,27 @@ impl PestImpl {
                 generic_bounds,
                 variants,
             }
+        }
+    }
+
+    fn create_type_alias_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::type_alias_decl);
+        let mut inner_pairs = pair.into_inner().peekable();
+        let name = inner_pairs.next().unwrap().as_str().to_string();
+        let (generic_params, generic_bounds) = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
+        {
+            self.create_generic_params(inner_pairs.next().unwrap())
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+        let target_type = self.create_type(inner_pairs.next().unwrap());
+        Node::TypeAliasDeclaration {
+            name,
+            generic_params,
+            generic_bounds,
+            target_type,
         }
     }
 
@@ -2057,6 +2097,19 @@ pub fn type_to_string(t: &Type) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Type::Union(members) => members
+            .iter()
+            .map(type_to_string)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Type::Intersection(members) => members
+            .iter()
+            .map(|member| match member {
+                Type::Union(_) => format!("({})", type_to_string(member)),
+                _ => type_to_string(member),
+            })
+            .collect::<Vec<_>>()
+            .join(" & "),
         Type::Function {
             parameters,
             return_type,
@@ -5350,5 +5403,60 @@ mod tests {
             },
             parse(source_code)
         );
+    }
+
+    #[test]
+    fn parses_type_aliases_and_type_composition() {
+        let program = parse(
+            r#"
+            type Value = string | int;
+            type Service = Readable & Writable;
+            type Result[T: Readable & Writable] = T | string;
+            "#,
+        );
+        let Node::Program { statements } = program else {
+            panic!("expected program");
+        };
+        assert!(matches!(
+            &statements[0],
+            Node::TypeAliasDeclaration {
+                name,
+                generic_params,
+                target_type: Type::Union(members),
+                ..
+            } if name == "Value"
+                && generic_params.is_empty()
+                && members == &vec![Type::String, Type::Int]
+        ));
+        assert!(matches!(
+            &statements[1],
+            Node::TypeAliasDeclaration {
+                name,
+                target_type: Type::Intersection(members),
+                ..
+            } if name == "Service"
+                && members == &vec![
+                    Type::Custom("Readable".to_string()),
+                    Type::Custom("Writable".to_string())
+                ]
+        ));
+        assert!(matches!(
+            &statements[2],
+            Node::TypeAliasDeclaration {
+                name,
+                generic_params,
+                generic_bounds,
+                target_type: Type::Union(members),
+            } if name == "Result"
+                && generic_params == &vec!["T".to_string()]
+                && generic_bounds.get("T") == Some(&vec![
+                    "Readable".to_string(),
+                    "Writable".to_string()
+                ])
+                && members == &vec![
+                    Type::Custom("T".to_string()),
+                    Type::String
+                ]
+        ));
     }
 }

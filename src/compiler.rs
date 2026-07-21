@@ -20,6 +20,8 @@ enum LlvmType {
     Arena,
     Window,
     TraitObject(String),
+    TraitIntersection(Vec<String>),
+    Union(Vec<LlvmType>),
     Struct(String),
     Enum(String),
     Reference {
@@ -59,6 +61,14 @@ impl LlvmType {
             LlvmType::Arena => "ptr".to_string(),
             LlvmType::Window => "ptr".to_string(),
             LlvmType::TraitObject(name) => format!("%trait.{}", sanitize_name(name)),
+            LlvmType::TraitIntersection(traits) => format!(
+                "{{ {} }}",
+                std::iter::repeat("ptr")
+                    .take(traits.len() + 1)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            LlvmType::Union(_) => "{ i32, ptr }".to_string(),
             LlvmType::Struct(name) => format!("%struct.{}", sanitize_name(name)),
             LlvmType::Enum(name) => format!("%enum.{}", sanitize_name(name)),
             LlvmType::Reference { .. } => "ptr".to_string(),
@@ -240,6 +250,25 @@ fn llvm_type(
                 .collect::<Result<Vec<_>, _>>()?,
             return_type: Box::new(llvm_type(return_type, structs, enums, traits)?),
         }),
+        Type::Union(members) => Ok(LlvmType::Union(
+            members
+                .iter()
+                .map(|member| llvm_type(member, structs, enums, traits))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Type::Intersection(members) => {
+            let names = members
+                .iter()
+                .map(|member| match member {
+                    Type::Custom(name) if traits.contains_key(name) => Ok(name.clone()),
+                    other => Err(format!(
+                        "LLVM backend requires trait intersection members, found `{}`",
+                        ast::type_to_string(other)
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LlvmType::TraitIntersection(names))
+        }
         Type::Custom(name) => {
             if name == "Color" {
                 Ok(LlvmType::I32)
@@ -1133,12 +1162,14 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::Arena
             | LlvmType::Window
             | LlvmType::TraitObject(_)
+            | LlvmType::TraitIntersection(_)
             | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => {
                 Err("cannot print a pointer-like value directly".to_string())
             }
             LlvmType::Struct(_) => Err("cannot print a struct value directly".to_string()),
             LlvmType::Enum(_) => Err("cannot print an enum value directly".to_string()),
+            LlvmType::Union(_) => Err("cannot print a union value directly".to_string()),
             LlvmType::Function { .. } => Err("cannot print a function value directly".to_string()),
             LlvmType::Slice { .. } => Err("cannot print a slice value directly".to_string()),
             LlvmType::Array { .. } => Err("cannot print an array value directly".to_string()),
@@ -1235,7 +1266,7 @@ impl<'a> FunctionCompiler<'a> {
                     }
                 };
                 match expected {
-                    Some(LlvmType::TraitObject(_)) => {
+                    Some(LlvmType::TraitObject(_) | LlvmType::TraitIntersection(_)) => {
                         let inferred = LlvmType::Struct(struct_name.to_string());
                         self.compile_struct_literal(struct_name, fields, &inferred)
                     }
@@ -2359,6 +2390,114 @@ impl<'a> FunctionCompiler<'a> {
                 current = self.compile_closure_call(current, arg_group, "trait method call")?;
             }
 
+            return Ok(Some(current));
+        }
+
+        if let LlvmType::TraitIntersection(trait_names) = receiver_type {
+            let mut found = Vec::new();
+            for (trait_index, trait_name) in trait_names.iter().enumerate() {
+                let trait_layout = self
+                    .traits
+                    .get(trait_name)
+                    .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
+                if let Some((method_index, method)) = trait_layout
+                    .methods
+                    .iter()
+                    .enumerate()
+                    .find(|(_, method)| method.name == method_name)
+                {
+                    found.push((
+                        trait_index,
+                        trait_name.clone(),
+                        method_index,
+                        method.clone(),
+                    ));
+                }
+            }
+            if found.is_empty() {
+                return Err(format!(
+                    "unknown method `{}` on trait intersection",
+                    method_name
+                ));
+            }
+            if found.len() > 1 {
+                return Err(format!(
+                    "ambiguous method `{}` on trait intersection",
+                    method_name
+                ));
+            }
+            let (trait_index, trait_name, method_index, method) = found.pop().unwrap();
+            let first_args = arguments
+                .first()
+                .ok_or_else(|| "method call is missing its first argument group".to_string())?;
+            if first_args.len() != method.parameters.len() {
+                return Err(format!(
+                    "method `{}` expects {} arguments, got {}",
+                    method_name,
+                    method.parameters.len(),
+                    first_args.len()
+                ));
+            }
+
+            let receiver_value = self.compile_expr(&Node::Access {
+                nodes: receiver_nodes.to_vec(),
+            })?;
+            let data_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = extractvalue {} {}, 0",
+                data_ptr,
+                receiver_value.llvm_type.ir(),
+                receiver_value.value
+            ));
+            let vtable_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = extractvalue {} {}, {}",
+                vtable_ptr,
+                receiver_value.llvm_type.ir(),
+                receiver_value.value,
+                trait_index + 1
+            ));
+            let slot_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = getelementptr inbounds %vtable.{}, ptr {}, i32 0, i32 {}",
+                slot_ptr,
+                sanitize_name(&trait_name),
+                vtable_ptr,
+                method_index
+            ));
+            let fn_ptr = self.next_temp();
+            self.emit_line(format!("{} = load ptr, ptr {}, align 8", fn_ptr, slot_ptr));
+
+            let mut arg_parts = vec![format!("ptr {}", data_ptr)];
+            for (arg_node, expected_type) in first_args.iter().zip(method.parameters.iter()) {
+                let arg = self.compile_expr_with_expected(arg_node, Some(expected_type))?;
+                let arg = self.coerce_expr(arg, expected_type, "trait method argument")?;
+                arg_parts.push(format!("{} {}", arg.llvm_type.ir(), arg.value));
+            }
+            let mut current = if method.return_type == LlvmType::Void {
+                self.emit_line(format!("call void {}({})", fn_ptr, arg_parts.join(", ")));
+                ExprValue {
+                    llvm_type: LlvmType::Void,
+                    value: "void".to_string(),
+                }
+            } else {
+                let temp = self.next_temp();
+                self.emit_line(format!(
+                    "{} = call {} {}({})",
+                    temp,
+                    method.return_type.ir(),
+                    fn_ptr,
+                    arg_parts.join(", ")
+                ));
+                ExprValue {
+                    llvm_type: method.return_type,
+                    value: temp,
+                }
+            };
+            for arg_group in arguments.iter().skip(1) {
+                current =
+                    self.compile_closure_call(current, arg_group, "trait method call")?;
+            }
             return Ok(Some(current));
         }
 
@@ -3621,6 +3760,10 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: llvm_type.clone(),
                 value: "zeroinitializer".to_string(),
             },
+            LlvmType::TraitIntersection(_) | LlvmType::Union(_) => ExprValue {
+                llvm_type: llvm_type.clone(),
+                value: "zeroinitializer".to_string(),
+            },
             LlvmType::Reference { .. } => ExprValue {
                 llvm_type: llvm_type.clone(),
                 value: "null".to_string(),
@@ -3747,6 +3890,9 @@ impl<'a> FunctionCompiler<'a> {
                 LlvmType::Struct(concrete_name) => {
                     self.box_trait_object(trait_name, &concrete_name, value, context)
                 }
+                LlvmType::TraitIntersection(traits) => {
+                    self.trait_object_from_intersection(trait_name, &traits, value, context)
+                }
                 other => Err(format!(
                     "type mismatch in {}: expected `{}`, got `{}`",
                     context,
@@ -3754,6 +3900,50 @@ impl<'a> FunctionCompiler<'a> {
                     other.ir()
                 )),
             };
+        }
+
+        if let LlvmType::TraitIntersection(traits) = expected {
+            return match value.llvm_type.clone() {
+                LlvmType::Struct(concrete_name) => {
+                    self.box_trait_intersection(traits, &concrete_name, value, context)
+                }
+                LlvmType::TraitIntersection(actual_traits) => self.project_trait_intersection(
+                    traits,
+                    &actual_traits,
+                    value,
+                    context,
+                ),
+                other => Err(format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    other.ir()
+                )),
+            };
+        }
+
+        if let LlvmType::Union(members) = expected {
+            let mut last_error = None;
+            let exact_index = members.iter().position(|member| member == &value.llvm_type);
+            let candidates = exact_index
+                .into_iter()
+                .chain((0..members.len()).filter(|index| Some(*index) != exact_index));
+            for index in candidates {
+                match self.coerce_expr(value.clone(), &members[index], context) {
+                    Ok(member_value) => {
+                        return self.box_union_value(members, index, member_value);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            return Err(last_error.unwrap_or_else(|| {
+                format!(
+                    "type mismatch in {}: expected `{}`, got `{}`",
+                    context,
+                    expected.ir(),
+                    value.llvm_type.ir()
+                )
+            }));
         }
 
         let temp = self.next_temp();
@@ -3913,6 +4103,207 @@ impl<'a> FunctionCompiler<'a> {
         self.emit_store(&boxed_ptr, &value);
 
         self.trait_object_from_data_ptr(trait_name, boxed_ptr, &vtable_symbol)
+    }
+
+    fn box_trait_intersection(
+        &mut self,
+        trait_names: &[String],
+        concrete_name: &str,
+        value: ExprValue,
+        context: &str,
+    ) -> Result<ExprValue, String> {
+        let vtables = trait_names
+            .iter()
+            .map(|trait_name| self.trait_vtable_symbol(trait_name, concrete_name, context))
+            .collect::<Result<Vec<_>, _>>()?;
+        let allocator = self.next_temp();
+        self.emit_line(format!("{} = call ptr @skunk_system_allocator()", allocator));
+        let boxed_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = call ptr @skunk_alloc_create(ptr {}, i64 {})",
+            boxed_ptr,
+            allocator,
+            self.size_of(&value.llvm_type)
+        ));
+        self.emit_store(&boxed_ptr, &value);
+
+        let intersection_type = LlvmType::TraitIntersection(trait_names.to_vec());
+        let mut aggregate = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, ptr {}, 0",
+            aggregate,
+            intersection_type.ir(),
+            boxed_ptr
+        ));
+        for (index, vtable) in vtables.iter().enumerate() {
+            let next = self.next_temp();
+            self.emit_line(format!(
+                "{} = insertvalue {} {}, ptr @{}, {}",
+                next,
+                intersection_type.ir(),
+                aggregate,
+                vtable,
+                index + 1
+            ));
+            aggregate = next;
+        }
+        Ok(ExprValue {
+            llvm_type: intersection_type,
+            value: aggregate,
+        })
+    }
+
+    fn trait_object_from_intersection(
+        &mut self,
+        trait_name: &str,
+        trait_names: &[String],
+        value: ExprValue,
+        context: &str,
+    ) -> Result<ExprValue, String> {
+        let index = trait_names
+            .iter()
+            .position(|candidate| candidate == trait_name)
+            .ok_or_else(|| {
+                format!(
+                    "type mismatch in {}: intersection does not contain trait `{}`",
+                    context, trait_name
+                )
+            })?;
+        let data_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, 0",
+            data_ptr,
+            value.llvm_type.ir(),
+            value.value
+        ));
+        let vtable_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, {}",
+            vtable_ptr,
+            value.llvm_type.ir(),
+            value.value,
+            index + 1
+        ));
+        let trait_type = LlvmType::TraitObject(trait_name.to_string());
+        let with_data = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, ptr {}, 0",
+            with_data,
+            trait_type.ir(),
+            data_ptr
+        ));
+        let result = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} {}, ptr {}, 1",
+            result,
+            trait_type.ir(),
+            with_data,
+            vtable_ptr
+        ));
+        Ok(ExprValue {
+            llvm_type: trait_type,
+            value: result,
+        })
+    }
+
+    fn project_trait_intersection(
+        &mut self,
+        expected_traits: &[String],
+        actual_traits: &[String],
+        value: ExprValue,
+        context: &str,
+    ) -> Result<ExprValue, String> {
+        let indices = expected_traits
+            .iter()
+            .map(|trait_name| {
+                actual_traits
+                    .iter()
+                    .position(|candidate| candidate == trait_name)
+                    .ok_or_else(|| {
+                        format!(
+                            "type mismatch in {}: intersection does not contain trait `{}`",
+                            context, trait_name
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let data_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = extractvalue {} {}, 0",
+            data_ptr,
+            value.llvm_type.ir(),
+            value.value
+        ));
+        let projected_type = LlvmType::TraitIntersection(expected_traits.to_vec());
+        let mut aggregate = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, ptr {}, 0",
+            aggregate,
+            projected_type.ir(),
+            data_ptr
+        ));
+        for (output_index, input_index) in indices.into_iter().enumerate() {
+            let vtable_ptr = self.next_temp();
+            self.emit_line(format!(
+                "{} = extractvalue {} {}, {}",
+                vtable_ptr,
+                value.llvm_type.ir(),
+                value.value,
+                input_index + 1
+            ));
+            let next = self.next_temp();
+            self.emit_line(format!(
+                "{} = insertvalue {} {}, ptr {}, {}",
+                next,
+                projected_type.ir(),
+                aggregate,
+                vtable_ptr,
+                output_index + 1
+            ));
+            aggregate = next;
+        }
+        Ok(ExprValue {
+            llvm_type: projected_type,
+            value: aggregate,
+        })
+    }
+
+    fn box_union_value(
+        &mut self,
+        members: &[LlvmType],
+        member_index: usize,
+        value: ExprValue,
+    ) -> Result<ExprValue, String> {
+        let allocator = self.next_temp();
+        self.emit_line(format!("{} = call ptr @skunk_system_allocator()", allocator));
+        let boxed_ptr = self.next_temp();
+        self.emit_line(format!(
+            "{} = call ptr @skunk_alloc_create(ptr {}, i64 {})",
+            boxed_ptr,
+            allocator,
+            self.size_of(&value.llvm_type)
+        ));
+        self.emit_store(&boxed_ptr, &value);
+        let union_type = LlvmType::Union(members.to_vec());
+        let with_tag = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} zeroinitializer, i32 {}, 0",
+            with_tag,
+            union_type.ir(),
+            member_index
+        ));
+        let result = self.next_temp();
+        self.emit_line(format!(
+            "{} = insertvalue {} {}, ptr {}, 1",
+            result,
+            union_type.ir(),
+            with_tag,
+            boxed_ptr
+        ));
+        Ok(ExprValue {
+            llvm_type: union_type,
+            value: result,
+        })
     }
 
     fn trait_vtable_symbol(
@@ -4139,6 +4530,8 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::Arena
             | LlvmType::Window
             | LlvmType::TraitObject(_)
+            | LlvmType::TraitIntersection(_)
+            | LlvmType::Union(_)
             | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => 8,
             LlvmType::Function { .. } => 8,
@@ -4188,6 +4581,8 @@ impl<'a> FunctionCompiler<'a> {
             | LlvmType::Reference { .. }
             | LlvmType::Pointer { .. } => 8,
             LlvmType::TraitObject(_) => 16,
+            LlvmType::TraitIntersection(traits) => 8 * (traits.len() + 1),
+            LlvmType::Union(_) => 16,
             LlvmType::Function { .. } => 16,
             LlvmType::Slice { .. } => 16,
             LlvmType::Array { elem_type, len } => self.size_of(elem_type) * len,
@@ -4587,6 +4982,8 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         | LlvmType::Arena
         | LlvmType::Window
         | LlvmType::TraitObject(_)
+        | LlvmType::TraitIntersection(_)
+        | LlvmType::Union(_)
         | LlvmType::Reference { .. }
         | LlvmType::Pointer { .. } => {
             return Err("LLVM backend does not support `main` returning pointer-like values yet".to_string())
@@ -6872,5 +7269,107 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "7\n");
+    }
+
+    #[test]
+    fn runs_compiled_exported_type_alias_program() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "types.skunk",
+                    r#"
+                    module types;
+                    export type Value = string | int;
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import types;
+
+                    function consume(value: Value): void {
+                        print(7);
+                    }
+
+                    function main(): void {
+                        consume("exported");
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+        assert_eq!(stdout, "7\n");
+    }
+
+    #[test]
+    fn runs_compiled_union_and_generic_alias_program() {
+        let stdout = compile_and_run(
+            r#"
+            type Value = string | int;
+            type Either[T] = T | string;
+
+            function forward(value: Value): Either[int] {
+                return value;
+            }
+
+            function main(): void {
+                first: Value = 7;
+                second: Value = "skunk";
+                a: Either[int] = forward(first);
+                b: Either[int] = forward(second);
+                print(42);
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(stdout, "42\n");
+    }
+
+    #[test]
+    fn runs_compiled_trait_intersection_alias_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            trait Resettable {
+                function reset(mut self): void;
+            }
+
+            type Service = Writer & Resettable;
+
+            struct Counter {
+                value: int;
+            }
+
+            conform Writer for Counter {
+                function write(mut self, value: int): int {
+                    self.value = self.value + value;
+                    return self.value;
+                }
+            }
+
+            conform Resettable for Counter {
+                function reset(mut self): void {
+                    self.value = 0;
+                }
+            }
+
+            function use_service(service: Service): int {
+                service.reset();
+                return service.write(41);
+            }
+
+            function main(): void {
+                service: Service = Counter { value: 9 };
+                print(use_service(service));
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(stdout, "41\n");
     }
 }

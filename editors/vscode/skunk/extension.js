@@ -6,6 +6,7 @@ const KEYWORDS = [
     "module",
     "import",
     "export",
+    "type",
     "struct",
     "enum",
     "trait",
@@ -145,6 +146,11 @@ function createSnippetItems() {
             "function main(): void {\n\t$0\n}"
         ),
         createSnippetItem(
+            "type",
+            "Create a type alias",
+            "type ${1:Name} = ${2:int};"
+        ),
+        createSnippetItem(
             "struct",
             "Create a data-only struct",
             "struct ${1:Name} {\n\t${2:field}: ${3:int};\n}"
@@ -187,6 +193,11 @@ function createSnippetItem(label, detail, snippet) {
 
 function collectDocumentSymbolItems(text) {
     const specs = [
+        {
+            regex: /\btype\s+([A-Za-z_][A-Za-z0-9_]*)/g,
+            kind: vscode.CompletionItemKind.TypeParameter,
+            detail: "Skunk type alias",
+        },
         {
             regex: /\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)/g,
             kind: vscode.CompletionItemKind.Struct,

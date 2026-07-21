@@ -122,7 +122,7 @@
         },
         {
           "name": "keyword.declaration.skunk",
-          "match": "\\b(?:module|import|export|struct|enum|trait|shape|attach|conform|function)\\b"
+          "match": "\\b(?:module|import|export|type|struct|enum|trait|shape|attach|conform|function)\\b"
         },
         {
           "name": "storage.modifier.skunk",
@@ -141,6 +141,18 @@
             },
             "2": {
               "name": "entity.name.function.skunk"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.type-alias.skunk",
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.skunk"
+            },
+            "2": {
+              "name": "entity.name.type.alias.skunk"
             }
           }
         },

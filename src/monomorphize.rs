@@ -56,6 +56,14 @@ struct FunctionSignature {
     return_type: Type,
 }
 
+#[derive(Clone)]
+struct TypeAliasTemplate {
+    name: String,
+    generic_params: Vec<String>,
+    generic_bounds: HashMap<String, Vec<String>>,
+    target_type: Type,
+}
+
 #[derive(Clone, Copy)]
 enum ConstraintKind {
     Trait,
@@ -118,6 +126,7 @@ struct Monomorphizer {
     concrete_enums: HashMap<String, EnumTemplate>,
     traits: HashMap<String, TraitTemplate>,
     shapes: HashMap<String, ShapeTemplate>,
+    type_aliases: HashMap<String, TypeAliasTemplate>,
     impls: Vec<ImplTemplate>,
     implemented_traits: HashMap<String, HashSet<String>>,
     root_traits: Vec<Node>,
@@ -146,6 +155,7 @@ impl Monomorphizer {
         let mut concrete_enums = HashMap::new();
         let mut traits = HashMap::new();
         let mut shapes = HashMap::new();
+        let mut type_aliases = HashMap::new();
         let mut impls = Vec::new();
         let mut root_traits = Vec::new();
         let mut root_concrete_impls = Vec::new();
@@ -285,6 +295,25 @@ impl Monomorphizer {
                         },
                     );
                 }
+                Node::TypeAliasDeclaration {
+                    name,
+                    generic_params,
+                    generic_bounds,
+                    target_type,
+                } => {
+                    if type_aliases.contains_key(name) {
+                        return Err(format!("duplicate type alias `{}`", name));
+                    }
+                    type_aliases.insert(
+                        name.clone(),
+                        TypeAliasTemplate {
+                            name: name.clone(),
+                            generic_params: generic_params.clone(),
+                            generic_bounds: generic_bounds.clone(),
+                            target_type: target_type.clone(),
+                        },
+                    );
+                }
                 Node::ImplDeclaration {
                     generic_params,
                     generic_bounds,
@@ -307,6 +336,19 @@ impl Monomorphizer {
             }
         }
 
+        for name in type_aliases.keys() {
+            if concrete_structs.contains_key(name)
+                || generic_structs.contains_key(name)
+                || concrete_enums.contains_key(name)
+                || generic_enums.contains_key(name)
+                || traits.contains_key(name)
+                || shapes.contains_key(name)
+            {
+                return Err(format!("duplicate type declaration `{}`", name));
+            }
+        }
+        validate_type_alias_cycles(&type_aliases)?;
+
         Ok(Self {
             generic_functions,
             concrete_functions,
@@ -316,6 +358,7 @@ impl Monomorphizer {
             concrete_enums,
             traits,
             shapes,
+            type_aliases,
             impls,
             implemented_traits: HashMap::new(),
             root_traits,
@@ -422,6 +465,174 @@ impl Monomorphizer {
         }
         output.push(Node::EOI);
         Ok(Node::Program { statements: output })
+    }
+
+    fn expand_type(&mut self, sk_type: &Type) -> Result<Type, String> {
+        self.expand_type_inner(sk_type, &mut Vec::new())
+    }
+
+    fn expand_type_inner(
+        &mut self,
+        sk_type: &Type,
+        stack: &mut Vec<String>,
+    ) -> Result<Type, String> {
+        match sk_type {
+            Type::Custom(name) if self.type_aliases.contains_key(name) => {
+                let template = self.type_aliases.get(name).cloned().unwrap();
+                if !template.generic_params.is_empty() {
+                    return Err(format!(
+                        "generic type alias `{}` expects {} type arguments",
+                        name,
+                        template.generic_params.len()
+                    ));
+                }
+                if stack.iter().any(|entry| entry == name) {
+                    stack.push(name.clone());
+                    return Err(format!(
+                        "cyclic type alias detected: {}",
+                        stack.join(" -> ")
+                    ));
+                }
+                stack.push(name.clone());
+                let result = self.expand_type_inner(&template.target_type, stack);
+                stack.pop();
+                result
+            }
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } if self.type_aliases.contains_key(base) => {
+                let template = self.type_aliases.get(base).cloned().unwrap();
+                if template.generic_params.len() != type_arguments.len() {
+                    return Err(format!(
+                        "generic type alias `{}` expects {} type arguments, got {}",
+                        base,
+                        template.generic_params.len(),
+                        type_arguments.len()
+                    ));
+                }
+                let expanded_arguments = type_arguments
+                    .iter()
+                    .map(|argument| self.expand_type_inner(argument, stack))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let substitutions = template
+                    .generic_params
+                    .iter()
+                    .cloned()
+                    .zip(expanded_arguments)
+                    .collect::<HashMap<_, _>>();
+                self.check_trait_bounds(
+                    &template.generic_bounds,
+                    &substitutions,
+                    &format!("type alias `{}`", template.name),
+                )?;
+                if stack.iter().any(|entry| entry == base) {
+                    stack.push(base.clone());
+                    return Err(format!(
+                        "cyclic type alias detected: {}",
+                        stack.join(" -> ")
+                    ));
+                }
+                let target = self.apply_substitutions(&template.target_type, &substitutions);
+                stack.push(base.clone());
+                let result = self.expand_type_inner(&target, stack);
+                stack.pop();
+                result
+            }
+            Type::Const { inner } => Ok(Type::Const {
+                inner: Box::new(self.expand_type_inner(inner, stack)?),
+            }),
+            Type::BindingConst { inner } => Ok(Type::BindingConst {
+                inner: Box::new(self.expand_type_inner(inner, stack)?),
+            }),
+            Type::Reference {
+                target_type,
+                mutable,
+            } => Ok(Type::Reference {
+                target_type: Box::new(self.expand_type_inner(target_type, stack)?),
+                mutable: *mutable,
+            }),
+            Type::Pointer { target_type } => Ok(Type::Pointer {
+                target_type: Box::new(self.expand_type_inner(target_type, stack)?),
+            }),
+            Type::Array {
+                elem_type,
+                dimensions,
+            } => Ok(Type::Array {
+                elem_type: Box::new(self.expand_type_inner(elem_type, stack)?),
+                dimensions: dimensions.clone(),
+            }),
+            Type::Slice { elem_type } => Ok(Type::Slice {
+                elem_type: Box::new(self.expand_type_inner(elem_type, stack)?),
+            }),
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => Ok(Type::GenericInstance {
+                base: base.clone(),
+                type_arguments: type_arguments
+                    .iter()
+                    .map(|argument| self.expand_type_inner(argument, stack))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Type::Function {
+                parameters,
+                return_type,
+            } => Ok(Type::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| self.expand_type_inner(parameter, stack))
+                    .collect::<Result<Vec<_>, _>>()?,
+                return_type: Box::new(self.expand_type_inner(return_type, stack)?),
+            }),
+            Type::Union(members) => {
+                let mut flattened = Vec::new();
+                for member in members {
+                    match self.expand_type_inner(member, stack)? {
+                        Type::Union(nested) => flattened.extend(nested),
+                        Type::Void => {
+                            return Err("union types cannot contain `void`".to_string())
+                        }
+                        member => flattened.push(member),
+                    }
+                }
+                flattened.sort_by_key(ast::type_to_string);
+                flattened.dedup();
+                if flattened.len() < 2 {
+                    return Err("a union type requires at least two distinct members".to_string());
+                }
+                Ok(Type::Union(flattened))
+            }
+            Type::Intersection(members) => {
+                let mut flattened = Vec::new();
+                for member in members {
+                    match self.expand_type_inner(member, stack)? {
+                        Type::Intersection(nested) => flattened.extend(nested),
+                        member => flattened.push(member),
+                    }
+                }
+                flattened.sort_by_key(ast::type_to_string);
+                flattened.dedup();
+                if flattened.len() < 2 {
+                    return Err(
+                        "an intersection type requires at least two distinct traits".to_string()
+                    );
+                }
+                for member in &flattened {
+                    let Type::Custom(name) = member else {
+                        return Err(format!(
+                            "intersection member `{}` is not a trait",
+                            ast::type_to_string(member)
+                        ));
+                    };
+                    if !self.traits.contains_key(name) {
+                        return Err(format!("intersection member `{}` is not a trait", name));
+                    }
+                }
+                Ok(Type::Intersection(flattened))
+            }
+            other => Ok(other.clone()),
+        }
     }
 
     fn validate_traits(&self) -> Result<(), String> {
@@ -632,6 +843,9 @@ impl Monomorphizer {
                     self.validate_impl_target_type(type_argument, generic_params)?;
                 }
                 Ok(())
+            }
+            Type::Union(_) | Type::Intersection(_) => {
+                Err("impl targets cannot be union or intersection types".to_string())
             }
             Type::SkSelf | Type::MutSelf => Err("`self` is not a valid impl target".to_string()),
         }
@@ -1046,7 +1260,8 @@ impl Monomorphizer {
                     }
                 }
             } else {
-                self.apply_substitutions(param_type, substitutions)
+                let substituted = self.apply_substitutions(param_type, substitutions);
+                self.expand_type(&substituted)?
             };
             env.insert(param_name.clone(), internal_type.clone());
             output_parameters.push((
@@ -1059,7 +1274,8 @@ impl Monomorphizer {
             ));
         }
 
-        let internal_return_type = self.apply_substitutions(return_type, substitutions);
+        let substituted_return_type = self.apply_substitutions(return_type, substitutions);
+        let internal_return_type = self.expand_type(&substituted_return_type)?;
         let mut output_body = Vec::new();
         for statement in body {
             let (statement, _) = self.transform_statement(
@@ -1182,7 +1398,8 @@ impl Monomorphizer {
                 value,
                 metadata,
             } => {
-                let internal_type = self.apply_substitutions(var_type, substitutions);
+                let substituted = self.apply_substitutions(var_type, substitutions);
+                let internal_type = self.expand_type(&substituted)?;
                 let output_type = self.concretize_type(&internal_type)?;
                 let is_recursive_lambda = matches!(
                     value.as_deref(),
@@ -1222,7 +1439,8 @@ impl Monomorphizer {
                 value,
                 metadata,
             } => {
-                let internal_type = self.apply_substitutions(struct_type, substitutions);
+                let substituted = self.apply_substitutions(struct_type, substitutions);
+                let internal_type = self.expand_type(&substituted)?;
                 let output_type = self.concretize_type(&internal_type)?;
                 let (value, _) = self.transform_expr(
                     value,
@@ -1607,7 +1825,8 @@ impl Monomorphizer {
                     }
                 }
             } else {
-                self.apply_substitutions(param_type, substitutions)
+                let substituted = self.apply_substitutions(param_type, substitutions);
+                self.expand_type(&substituted)?
             };
             env.insert(param_name.clone(), internal_type.clone());
             function_parameters.push(ast::strip_binding_const(&internal_type));
@@ -1620,7 +1839,8 @@ impl Monomorphizer {
                 },
             ));
         }
-        let internal_return_type = self.apply_substitutions(return_type, substitutions);
+        let substituted_return_type = self.apply_substitutions(return_type, substitutions);
+        let internal_return_type = self.expand_type(&substituted_return_type)?;
         let mut output_body = Vec::new();
         for statement in body {
             let (statement, _) = self.transform_statement(
@@ -1669,17 +1889,18 @@ impl Monomorphizer {
                         ast::strip_binding_const(&sk_type),
                     ));
                 }
-                if let Some(function) = self.concrete_functions.get(name) {
+                if let Some(function) = self.concrete_functions.get(name).cloned() {
+                    let signature = Type::Function {
+                        parameters: function
+                            .parameters
+                            .iter()
+                            .map(|(_, sk_type)| sk_type.clone())
+                            .collect(),
+                        return_type: Box::new(function.return_type.clone()),
+                    };
                     return Ok((
                         Node::Identifier(name.clone()),
-                        Type::Function {
-                            parameters: function
-                                .parameters
-                                .iter()
-                                .map(|(_, sk_type)| sk_type.clone())
-                                .collect(),
-                            return_type: Box::new(function.return_type.clone()),
-                        },
+                        self.expand_type(&signature)?,
                     ));
                 }
                 if self.generic_functions.contains_key(name) {
@@ -1729,7 +1950,8 @@ impl Monomorphizer {
                 Ok((Node::ArrayInit { elements: output }, internal_type))
             }
             Node::StructInitialization { _type, fields } => {
-                let internal_type = self.apply_substitutions(_type, substitutions);
+                let substituted = self.apply_substitutions(_type, substitutions);
+                let internal_type = self.expand_type(&substituted)?;
                 let struct_name = self.ensure_struct_for_type(&internal_type)?;
                 let mut output_fields = Vec::new();
                 for (field_name, value) in fields {
@@ -1765,7 +1987,8 @@ impl Monomorphizer {
                 arguments,
                 metadata,
             } => {
-                let internal_type = self.apply_substitutions(_type, substitutions);
+                let substituted = self.apply_substitutions(_type, substitutions);
+                let internal_type = self.expand_type(&substituted)?;
                 let output_type = self.concretize_type(&internal_type)?;
                 let mut output_args = Vec::new();
                 if name == "size_of" || name == "align_of" {
@@ -2578,6 +2801,7 @@ impl Monomorphizer {
             | Node::AttachDeclaration { .. }
             | Node::ConformDeclaration { .. }
             | Node::ImplDeclaration { .. }
+            | Node::TypeAliasDeclaration { .. }
             | Node::VariableDeclaration { .. }
             | Node::StructDestructure { .. }
             | Node::StructDeclaration { .. }
@@ -2772,7 +2996,9 @@ impl Monomorphizer {
                 &format!("generic function `{}`", template.name),
             )?;
             let specialized_name = self.ensure_specialized_function(&template, &substitutions)?;
-            let base_return_type = self.apply_substitutions(&template.return_type, &substitutions);
+            let substituted_return_type =
+                self.apply_substitutions(&template.return_type, &substitutions);
+            let base_return_type = self.expand_type(&substituted_return_type)?;
             let result_type = apply_call_groups_to_function_signature(
                 &base_return_type,
                 &argument_types[1..],
@@ -2798,15 +3024,16 @@ impl Monomorphizer {
 
         let signature = if let Some(local_type) = env.get(name) {
             ast::strip_binding_const(&local_type)
-        } else if let Some(function) = self.concrete_functions.get(name) {
-            Type::Function {
+        } else if let Some(function) = self.concrete_functions.get(name).cloned() {
+            let signature = Type::Function {
                 parameters: function
                     .parameters
                     .iter()
                     .map(|(_, sk_type)| sk_type.clone())
                     .collect(),
                 return_type: Box::new(function.return_type.clone()),
-            }
+            };
+            self.expand_type(&signature)?
         } else {
             return Err(format!("unknown function `{}`", name));
         };
@@ -3236,11 +3463,14 @@ impl Monomorphizer {
         match sk_type {
             Type::Custom(name) => {
                 if let Some(template) = self.concrete_structs.get(name) {
-                    Ok(template
+                    let field_type = template
                         .fields
                         .iter()
                         .find(|(candidate, _)| candidate == field_name)
-                        .map(|(_, field_type)| field_type.clone()))
+                        .map(|(_, field_type)| field_type.clone());
+                    field_type
+                        .map(|field_type| self.expand_type(&field_type))
+                        .transpose()
                 } else {
                     Ok(None)
                 }
@@ -3259,11 +3489,14 @@ impl Monomorphizer {
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
-                Ok(template
+                let field_type = template
                     .fields
                     .iter()
                     .find(|(candidate, _)| candidate == field_name)
-                    .map(|(_, field_type)| self.apply_substitutions(field_type, &substitutions)))
+                    .map(|(_, field_type)| self.apply_substitutions(field_type, &substitutions));
+                field_type
+                    .map(|field_type| self.expand_type(&field_type))
+                    .transpose()
             }
             _ => Ok(None),
         }
@@ -3274,7 +3507,7 @@ impl Monomorphizer {
         receiver_type: &Type,
         method_name: &str,
     ) -> Result<(Type, Vec<Type>, Type), String> {
-        match receiver_type {
+        let result = match receiver_type {
             Type::Custom(name) => {
                 if let Some(template) = self.concrete_structs.get(name) {
                     let function = template
@@ -3304,7 +3537,7 @@ impl Monomorphizer {
                             .into_iter()
                             .filter(|(_, sk_type)| !ast::is_self_type(sk_type))
                             .map(|(_, sk_type)| sk_type)
-                            .collect(),
+                            .collect::<Vec<_>>(),
                         function.1,
                     ))
                 } else if let Some(trait_template) = self.traits.get(name) {
@@ -3379,11 +3612,63 @@ impl Monomorphizer {
                     self.apply_substitutions(&function.1, &substitutions),
                 ))
             }
+            Type::Intersection(members) => {
+                let mut found = Vec::new();
+                for member in members {
+                    let Type::Custom(trait_name) = member else {
+                        continue;
+                    };
+                    let methods = self.collect_trait_methods(trait_name, &mut Vec::new())?;
+                    if let Some(method) = methods.into_iter().find(|method| method.name == method_name)
+                    {
+                        found.push((trait_name.clone(), method));
+                    }
+                }
+                if found.is_empty() {
+                    return Err(format!(
+                        "unknown method `{}` on intersection `{}`",
+                        method_name,
+                        ast::type_to_string(receiver_type)
+                    ));
+                }
+                if found.len() > 1 {
+                    return Err(format!(
+                        "ambiguous method `{}` on intersection `{}`",
+                        method_name,
+                        ast::type_to_string(receiver_type)
+                    ));
+                }
+                let (_, method) = found.pop().unwrap();
+                let receiver = method
+                    .parameters
+                    .first()
+                    .map(|(_, sk_type)| sk_type.clone())
+                    .ok_or_else(|| format!("method `{}` is missing self", method_name))?;
+                Ok((
+                    receiver,
+                    method
+                        .parameters
+                        .iter()
+                        .skip(1)
+                        .map(|(_, sk_type)| sk_type.clone())
+                        .collect(),
+                    method.return_type,
+                ))
+            }
             other => Err(format!(
                 "method lookup requires a struct receiver, found `{}`",
                 ast::type_to_string(other)
             )),
-        }
+        };
+        let (receiver, parameters, return_type) = result?;
+        Ok((
+            self.expand_type(&receiver)?,
+            parameters
+                .iter()
+                .map(|parameter| self.expand_type(parameter))
+                .collect::<Result<Vec<_>, _>>()?,
+            self.expand_type(&return_type)?,
+        ))
     }
 
     fn lookup_static_function_signature(
@@ -3391,7 +3676,7 @@ impl Monomorphizer {
         target_type: &Type,
         function_name: &str,
     ) -> Result<(Vec<Type>, Type), String> {
-        match target_type {
+        let result = match target_type {
             Type::Custom(name) => {
                 let template = self
                     .concrete_structs
@@ -3423,7 +3708,7 @@ impl Monomorphizer {
                         .0
                         .into_iter()
                         .map(|(_, sk_type)| sk_type)
-                        .collect(),
+                        .collect::<Vec<_>>(),
                     function.1,
                 ))
             }
@@ -3475,7 +3760,15 @@ impl Monomorphizer {
                 "static function lookup requires a struct type, found `{}`",
                 ast::type_to_string(other)
             )),
-        }
+        };
+        let (parameters, return_type) = result?;
+        Ok((
+            parameters
+                .iter()
+                .map(|parameter| self.expand_type(parameter))
+                .collect::<Result<Vec<_>, _>>()?,
+            self.expand_type(&return_type)?,
+        ))
     }
 
     fn apply_substitutions(&self, sk_type: &Type, substitutions: &HashMap<String, Type>) -> Type {
@@ -3521,6 +3814,18 @@ impl Monomorphizer {
                     .map(|sk_type| self.apply_substitutions(sk_type, substitutions))
                     .collect(),
             },
+            Type::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|member| self.apply_substitutions(member, substitutions))
+                    .collect(),
+            ),
+            Type::Intersection(members) => Type::Intersection(
+                members
+                    .iter()
+                    .map(|member| self.apply_substitutions(member, substitutions))
+                    .collect(),
+            ),
             Type::Function {
                 parameters,
                 return_type,
@@ -3536,43 +3841,60 @@ impl Monomorphizer {
     }
 
     fn concretize_type(&mut self, sk_type: &Type) -> Result<Type, String> {
+        let expanded = self.expand_type(sk_type)?;
+        self.concretize_expanded_type(&expanded)
+    }
+
+    fn concretize_expanded_type(&mut self, sk_type: &Type) -> Result<Type, String> {
         match sk_type {
             Type::Const { inner } => Ok(Type::Const {
-                inner: Box::new(self.concretize_type(inner)?),
+                inner: Box::new(self.concretize_expanded_type(inner)?),
             }),
             Type::BindingConst { inner } => Ok(Type::BindingConst {
-                inner: Box::new(self.concretize_type(inner)?),
+                inner: Box::new(self.concretize_expanded_type(inner)?),
             }),
             Type::MutSelf => Ok(Type::MutSelf),
             Type::Array {
                 elem_type,
                 dimensions,
             } => Ok(Type::Array {
-                elem_type: Box::new(self.concretize_type(elem_type)?),
+                elem_type: Box::new(self.concretize_expanded_type(elem_type)?),
                 dimensions: dimensions.clone(),
             }),
             Type::Reference {
                 target_type,
                 mutable,
             } => Ok(Type::Reference {
-                target_type: Box::new(self.concretize_type(target_type)?),
+                target_type: Box::new(self.concretize_expanded_type(target_type)?),
                 mutable: *mutable,
             }),
             Type::Pointer { target_type } => Ok(Type::Pointer {
-                target_type: Box::new(self.concretize_type(target_type)?),
+                target_type: Box::new(self.concretize_expanded_type(target_type)?),
             }),
             Type::Slice { elem_type } => Ok(Type::Slice {
-                elem_type: Box::new(self.concretize_type(elem_type)?),
+                elem_type: Box::new(self.concretize_expanded_type(elem_type)?),
             }),
+            Type::Union(members) => Ok(Type::Union(
+                members
+                    .iter()
+                    .map(|member| self.concretize_expanded_type(member))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            Type::Intersection(members) => Ok(Type::Intersection(
+                members
+                    .iter()
+                    .map(|member| self.concretize_expanded_type(member))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
             Type::Function {
                 parameters,
                 return_type,
             } => Ok(Type::Function {
                 parameters: parameters
                     .iter()
-                    .map(|parameter| self.concretize_type(parameter))
+                    .map(|parameter| self.concretize_expanded_type(parameter))
                     .collect::<Result<Vec<_>, _>>()?,
-                return_type: Box::new(self.concretize_type(return_type)?),
+                return_type: Box::new(self.concretize_expanded_type(return_type)?),
             }),
             Type::GenericInstance { .. } => Ok(Type::Custom(self.ensure_nominal_type(sk_type)?)),
             other => Ok(other.clone()),
@@ -3799,6 +4121,109 @@ fn apply_single_call_to_type(signature_type: &Type, arg_len: usize) -> Result<Ty
     }
 }
 
+fn validate_type_alias_cycles(
+    aliases: &HashMap<String, TypeAliasTemplate>,
+) -> Result<(), String> {
+    fn visit(
+        name: &str,
+        aliases: &HashMap<String, TypeAliasTemplate>,
+        visited: &mut HashSet<String>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if let Some(index) = stack.iter().position(|entry| entry == name) {
+            let mut cycle = stack[index..].to_vec();
+            cycle.push(name.to_string());
+            return Err(format!(
+                "cyclic type alias detected: {}",
+                cycle.join(" -> ")
+            ));
+        }
+        if visited.contains(name) {
+            return Ok(());
+        }
+        stack.push(name.to_string());
+        let alias = aliases.get(name).expect("alias dependency exists");
+        let mut dependencies = HashSet::new();
+        let generic_params = alias
+            .generic_params
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        collect_alias_dependencies(
+            &alias.target_type,
+            aliases,
+            &generic_params,
+            &mut dependencies,
+        );
+        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        dependencies.sort();
+        for dependency in dependencies {
+            visit(&dependency, aliases, visited, stack)?;
+        }
+        stack.pop();
+        visited.insert(name.to_string());
+        Ok(())
+    }
+
+    let mut visited = HashSet::new();
+    let mut names = aliases.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        visit(&name, aliases, &mut visited, &mut Vec::new())?;
+    }
+    Ok(())
+}
+
+fn collect_alias_dependencies(
+    sk_type: &Type,
+    aliases: &HashMap<String, TypeAliasTemplate>,
+    generic_params: &HashSet<&str>,
+    output: &mut HashSet<String>,
+) {
+    match sk_type {
+        Type::Custom(name) => {
+            if !generic_params.contains(name.as_str()) && aliases.contains_key(name) {
+                output.insert(name.clone());
+            }
+        }
+        Type::GenericInstance {
+            base,
+            type_arguments,
+        } => {
+            if !generic_params.contains(base.as_str()) && aliases.contains_key(base) {
+                output.insert(base.clone());
+            }
+            for argument in type_arguments {
+                collect_alias_dependencies(argument, aliases, generic_params, output);
+            }
+        }
+        Type::Const { inner } | Type::BindingConst { inner } => {
+            collect_alias_dependencies(inner, aliases, generic_params, output)
+        }
+        Type::Reference { target_type, .. } | Type::Pointer { target_type } => {
+            collect_alias_dependencies(target_type, aliases, generic_params, output)
+        }
+        Type::Array { elem_type, .. } | Type::Slice { elem_type } => {
+            collect_alias_dependencies(elem_type, aliases, generic_params, output)
+        }
+        Type::Function {
+            parameters,
+            return_type,
+        } => {
+            for parameter in parameters {
+                collect_alias_dependencies(parameter, aliases, generic_params, output);
+            }
+            collect_alias_dependencies(return_type, aliases, generic_params, output);
+        }
+        Type::Union(members) | Type::Intersection(members) => {
+            for member in members {
+                collect_alias_dependencies(member, aliases, generic_params, output);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn type_mangle(sk_type: &Type) -> String {
     match sk_type {
         Type::Void => "void".to_string(),
@@ -3825,6 +4250,14 @@ fn type_mangle(sk_type: &Type) -> String {
         }
         Type::Allocator => "Allocator".to_string(),
         Type::Arena => "Arena".to_string(),
+        Type::Union(members) => format!(
+            "union_{}",
+            members.iter().map(type_mangle).collect::<Vec<_>>().join("_or_")
+        ),
+        Type::Intersection(members) => format!(
+            "intersection_{}",
+            members.iter().map(type_mangle).collect::<Vec<_>>().join("_and_")
+        ),
         Type::Custom(name) => sanitize_mangle(name),
         Type::GenericInstance {
             base,
@@ -4010,5 +4443,92 @@ mod tests {
             statement,
             Node::FunctionDeclaration { name, .. } if name == "wrap__int"
         )));
+    }
+
+    #[test]
+    fn expands_concrete_and_generic_type_aliases() {
+        let statements = prepared_statements(
+            r#"
+            type Value = string | int;
+            type Either[T] = T | string;
+
+            function use_value(value: Value): Either[int] {
+                return value;
+            }
+
+            function main(): void {
+                value: Value = 7;
+                result: Either[int] = use_value(value);
+            }
+            "#,
+        );
+        let use_value = statements
+            .iter()
+            .find(|statement| matches!(
+                statement,
+                Node::FunctionDeclaration { name, .. } if name == "use_value"
+            ))
+            .expect("prepared function");
+        let Node::FunctionDeclaration {
+            parameters,
+            return_type,
+            ..
+        } = use_value
+        else {
+            unreachable!();
+        };
+        let expected = Type::Union(vec![Type::Int, Type::String]);
+        assert_eq!(parameters[0].1, expected);
+        assert_eq!(return_type, &expected);
+        assert!(!statements
+            .iter()
+            .any(|statement| matches!(statement, Node::TypeAliasDeclaration { .. })));
+    }
+
+    #[test]
+    fn rejects_recursive_type_aliases() {
+        let program = ast::parse(
+            r#"
+            type A = B;
+            type B = A;
+            function main(): void {}
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains("cyclic type alias detected: A -> B -> A"));
+    }
+
+    #[test]
+    fn rejects_type_alias_bound_violations() {
+        let program = ast::parse(
+            r#"
+            trait Writer {
+                function write(mut self, value: int): int;
+            }
+
+            type WriterValue[T: Writer] = T | string;
+
+            function main(): void {
+                value: WriterValue[int] = 1;
+            }
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains("type alias `WriterValue` requires `T` to implement trait `Writer`"));
+    }
+
+    #[test]
+    fn rejects_non_trait_intersection_members() {
+        let program = ast::parse(
+            r#"
+            type Invalid = int & string;
+
+            function main(): void {
+                value: Invalid;
+            }
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains("intersection member `int` is not a trait"));
     }
 }

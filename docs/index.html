@@ -129,7 +129,7 @@ function main(): void {
 
             <section id="types">
                 <h2>Types</h2>
-                <p>Skunk currently supports primitive types, fixed arrays, slices, safe references, raw pointers, function types, structs, enums, and generic instantiations.</p>
+                <p>Skunk currently supports primitive types, fixed arrays, slices, safe references, raw pointers, function types, structs, enums, generic instantiations, transparent type aliases, union types, and trait intersection types.</p>
                 <table class="reference-table">
                     <thead>
                         <tr>
@@ -178,8 +178,33 @@ function main(): void {
                             <td><code>Box[int]</code></td>
                             <td>Generic type instantiation</td>
                         </tr>
+                        <tr>
+                            <td><code>A | B</code></td>
+                            <td>Union type accepting a value of either member type</td>
+                        </tr>
+                        <tr>
+                            <td><code>Readable &amp; Writable</code></td>
+                            <td>Runtime trait intersection requiring every listed trait</td>
+                        </tr>
+                        <tr>
+                            <td><code>type Name = T;</code></td>
+                            <td>Transparent type alias; aliases do not create a distinct nominal type</td>
+                        </tr>
                     </tbody>
                 </table>
+<pre><code class="language-skunk">type UserId = int;
+type TextOrNumber = string | int;
+type ReadWrite = Readable &amp; Writable;
+type Either[T] = T | string;
+type ComparableValue[T: Serializable &amp; Comparable] = T;
+
+export type PublicId = UserId;</code></pre>
+                <ul>
+                    <li>Aliases may be concrete or generic, may declare trait or shape bounds, and may be exported from modules.</li>
+                    <li>Alias expansion is transparent and recursive alias cycles are rejected.</li>
+                    <li>Intersections are currently restricted to traits. A concrete value must conform to every member trait.</li>
+                    <li><code>&amp;</code> binds more tightly than <code>|</code>; parentheses may be used to make composed types explicit.</li>
+                </ul>
                 <p><code>Allocator</code> and <code>Arena</code> are built-in runtime types used for explicit memory management.</p>
             </section>
 
@@ -553,6 +578,7 @@ function main(): void {
                     <li>No user-defined allocators yet. The current allocator and arena model is still runtime-provided.</li>
                     <li>The unsafe memory layer is intentionally small today: there are no raw pointer trait bounds, no arbitrary pointer arithmetic beyond <code>*byte::offset</code>, and no general <code>unsafe</code> standard library yet.</li>
                     <li>Struct <code>match</code> is intentionally narrow in this first pass.</li>
+                    <li>Type-level <code>match</code> expressions are not part of the current alias V1. Union values can be stored, passed, and returned, but runtime union narrowing and union pattern matching are not implemented yet.</li>
                     <li>Runtime trait values still use a simple V1 representation. Lvalues reuse their existing storage, while temporaries and other rvalues are boxed when converted to trait values.</li>
                 </ul>
             </section>

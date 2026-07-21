@@ -203,6 +203,35 @@ impl ModuleNormalizer {
             Node::Export { .. } => {
                 return Err("`export` is only allowed at module scope".to_string());
             }
+            Node::TypeAliasDeclaration {
+                name,
+                generic_params,
+                generic_bounds,
+                target_type,
+            } => {
+                if !top_level {
+                    return Err("type aliases are only allowed at module scope".to_string());
+                }
+                let renamed_name = if !exported {
+                    self.type_renames
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(name.clone())
+                } else {
+                    name.clone()
+                };
+                let type_scope = generic_params.iter().cloned().collect::<HashSet<_>>();
+                type_scopes.push(type_scope);
+                let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let target_type = self.rename_type(target_type, value_scopes, type_scopes)?;
+                type_scopes.pop();
+                Node::TypeAliasDeclaration {
+                    name: renamed_name,
+                    generic_params,
+                    generic_bounds,
+                    target_type,
+                }
+            }
             Node::Block { statements } => {
                 value_scopes.push(HashSet::new());
                 let statements =
@@ -948,6 +977,7 @@ impl ModuleNormalizer {
             | Node::VariableDeclaration { .. }
             | Node::FunctionDeclaration { .. }
             | Node::GenericFunctionDeclaration { .. }
+            | Node::TypeAliasDeclaration { .. }
             | Node::TraitDeclaration { .. }
             | Node::ShapeDeclaration { .. }
             | Node::AttachDeclaration { .. }
@@ -1061,6 +1091,18 @@ impl ModuleNormalizer {
                     .map(|arg| self.rename_type(arg, value_scopes, type_scopes))
                     .collect::<Result<Vec<_>, String>>()?,
             },
+            ast::Type::Union(members) => ast::Type::Union(
+                members
+                    .into_iter()
+                    .map(|member| self.rename_type(member, value_scopes, type_scopes))
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+            ast::Type::Intersection(members) => ast::Type::Intersection(
+                members
+                    .into_iter()
+                    .map(|member| self.rename_type(member, value_scopes, type_scopes))
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
             ast::Type::Custom(name) => ast::Type::Custom(self.rename_type_name(&name, type_scopes)),
             ast::Type::Function {
                 parameters,
@@ -1119,6 +1161,7 @@ fn top_level_decl_name(node: &Node) -> Option<(TopLevelDeclKind, String)> {
             ..
         } => Some((TopLevelDeclKind::Value, name.clone())),
         Node::StructDeclaration { name, .. }
+        | Node::TypeAliasDeclaration { name, .. }
         | Node::GenericStructDeclaration { name, .. }
         | Node::EnumDeclaration { name, .. }
         | Node::GenericEnumDeclaration { name, .. }
@@ -1133,6 +1176,7 @@ fn validate_export_target(node: &Node) -> Result<(), String> {
         Node::VariableDeclaration { .. }
         | Node::FunctionDeclaration { lambda: false, .. }
         | Node::GenericFunctionDeclaration { lambda: false, .. }
+        | Node::TypeAliasDeclaration { .. }
         | Node::StructDeclaration { .. }
         | Node::GenericStructDeclaration { .. }
         | Node::EnumDeclaration { .. }
@@ -1140,7 +1184,7 @@ fn validate_export_target(node: &Node) -> Result<(), String> {
         | Node::TraitDeclaration { .. }
         | Node::ShapeDeclaration { .. } => Ok(()),
         _ => Err(
-            "`export` supports only top-level variables, functions, structs, enums, traits, and shapes"
+            "`export` supports only top-level variables, functions, type aliases, structs, enums, traits, and shapes"
                 .to_string(),
         ),
     }

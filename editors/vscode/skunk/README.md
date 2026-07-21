@@ -8,7 +8,7 @@ This extension adds lightweight editor support for Skunk:
 
 ## What It Supports Today
 
-- `struct`, `trait`, `shape`, `attach`, and `conform` highlighting
+- `type`, `struct`, `trait`, `shape`, `attach`, and `conform` highlighting
 - Builtin types such as `int`, `float`, `Allocator`, and `Arena`
 - Snippets for common Skunk declarations
 - Format Document support with a simple line-based formatter
