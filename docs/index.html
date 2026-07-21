@@ -592,6 +592,7 @@ where B &gt;: A, B &lt;: Animal {
                 <ul>
                     <li>Nested instantiations such as <code>Box[Box[int]]</code> are supported.</li>
                     <li>Function type argument inference works from call arguments in common cases.</li>
+                    <li>Generic enum constructors infer type arguments from their payloads and expected return, variable, assignment, field, array-element, or concrete parameter type. For example, a function returning <code>Option[int]</code> may write <code>Option::Some(7)</code>.</li>
                     <li>Explicit function call type arguments are supported with forms like <code>id[int](42)</code>.</li>
                     <li><code>T &lt;: Upper</code> requires the chosen type for <code>T</code> to be a subtype of <code>Upper</code>. Trait conformance and inherited traits participate in this check.</li>
                     <li><code>T &gt;: Lower</code> requires the chosen type for <code>T</code> to be a supertype of <code>Lower</code>. When both bounds are present, write the lower bound first: <code>T &gt;: Lower &lt;: Upper</code>.</li>
@@ -619,9 +620,14 @@ function unwrap(value: Option[int]): int {
             return v;
         }
     }
+}
+
+function some_value(): Option[int] {
+    return Option::Some(7);
 }</code></pre>
                 <ul>
-                    <li>Construct variants with forms like <code>Option[int]::None()</code> and <code>Option[int]::Some(7)</code>.</li>
+                    <li>When context determines the complete generic type, construct variants concisely with forms like <code>Option::None()</code> and <code>Option::Some(7)</code>.</li>
+                    <li>Explicit forms such as <code>Option[int]::Some(7)</code> remain available when inference is ambiguous.</li>
                     <li>Variants may carry multiple payload values, such as <code>Pair(A, B)</code>.</li>
                     <li><code>match</code> is exhaustiveness-checked for enums.</li>
                 </ul>

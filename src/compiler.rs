@@ -6576,6 +6576,69 @@ mod tests {
     }
 
     #[test]
+    fn runs_inferred_generic_enum_constructors() {
+        let stdout = compile_and_run(
+            r#"
+            enum Outcome[T, E] {
+                Ok(T);
+                Err(E);
+            }
+
+            enum AppError {
+                Failed(string);
+            }
+
+            function make_value(ok: bool): Outcome[int, AppError] {
+                if (ok) {
+                    return Outcome::Ok(41);
+                }
+                return Outcome::Err(AppError::Failed("failed"));
+            }
+
+            function consume(value: Outcome[int, AppError]): int {
+                match (value) {
+                    case Ok(number): {
+                        return number;
+                    }
+                    case Err(error): {
+                        return -1;
+                    }
+                }
+            }
+
+            function make_wide_value(): Outcome[long, AppError] {
+                value: int = 44;
+                return Outcome::Ok(value);
+            }
+
+            function consume_wide(value: Outcome[long, AppError]): long {
+                match (value) {
+                    case Ok(number): {
+                        return number;
+                    }
+                    case Err(error): {
+                        return -1L;
+                    }
+                }
+            }
+
+            function main(): void {
+                print(consume(make_value(true)));
+                print(consume(Outcome::Ok(42)));
+                failure: Outcome[int, AppError] = Outcome::Err(
+                    AppError::Failed("no value")
+                );
+                print(consume(failure));
+                print(consume_wide(make_wide_value()));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "41\n42\n-1\n44\n");
+    }
+
+    #[test]
     fn runs_compiled_multi_payload_enum_match_program() {
         let stdout = compile_and_run(
             r#"

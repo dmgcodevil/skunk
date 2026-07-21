@@ -2172,6 +2172,18 @@ impl Monomorphizer {
                 metadata,
             } => {
                 let substituted = self.apply_substitutions(_type, substitutions);
+                if let Some(constructor) = self.transform_inferred_generic_enum_constructor(
+                    &substituted,
+                    name,
+                    arguments,
+                    metadata,
+                    env,
+                    expected_type,
+                    substitutions,
+                    self_type.clone(),
+                )? {
+                    return Ok(constructor);
+                }
                 let internal_type = self.expand_type(&substituted)?;
                 let output_type = self.concretize_type(&internal_type)?;
                 let mut output_args = Vec::new();
@@ -3086,6 +3098,179 @@ impl Monomorphizer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn transform_inferred_generic_enum_constructor(
+        &mut self,
+        written_type: &Type,
+        variant_name: &str,
+        arguments: &[Node],
+        metadata: &Metadata,
+        env: &mut Env,
+        expected_type: Option<&Type>,
+        outer_substitutions: &HashMap<String, Type>,
+        self_type: Option<Type>,
+    ) -> Result<Option<(Node, Type)>, String> {
+        let Type::Custom(base) = written_type else {
+            return Ok(None);
+        };
+        let Some(template) = self.generic_enums.get(base).cloned() else {
+            return Ok(None);
+        };
+        let Some(variant) = template
+            .variants
+            .iter()
+            .find(|variant| variant.name == variant_name)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        if arguments.len() != variant.payload_types.len() {
+            return Err(format!(
+                "enum variant constructor `{}::{}` expects {} argument(s), got {}",
+                base,
+                variant_name,
+                variant.payload_types.len(),
+                arguments.len()
+            ));
+        }
+
+        let mut inferred = HashMap::<String, Type>::new();
+        if let Some(expected_type) = expected_type {
+            let expanded_expected = self.expand_type(expected_type)?;
+            let expanded_expected =
+                ast::unwrap_const_view(ast::unwrap_binding_const(&expanded_expected));
+            if let Type::GenericInstance {
+                base: expected_base,
+                type_arguments,
+            } = expanded_expected
+            {
+                if expected_base == base && type_arguments.len() == template.generic_params.len() {
+                    inferred.extend(
+                        template
+                            .generic_params
+                            .iter()
+                            .cloned()
+                            .zip(type_arguments.iter().cloned()),
+                    );
+                }
+            }
+        }
+
+        let mut output_arguments = Vec::new();
+        for (argument, payload_type) in arguments.iter().zip(variant.payload_types.iter()) {
+            let partially_substituted = self.apply_substitutions(payload_type, &inferred);
+            let argument_expected = if contains_unresolved_generic(
+                &partially_substituted,
+                &template.generic_params,
+                &inferred,
+            ) {
+                None
+            } else {
+                Some(self.expand_type(&partially_substituted)?)
+            };
+            let (argument, argument_type) = self.transform_expr(
+                argument,
+                env,
+                argument_expected.as_ref(),
+                outer_substitutions,
+                self_type.clone(),
+            )?;
+            let inference_argument_type = if let Some(argument_expected) = &argument_expected {
+                if ast::is_numeric_assignable(argument_expected, &argument_type)
+                    || self.is_subtype(&argument_type, argument_expected)?
+                {
+                    argument_expected
+                } else {
+                    &argument_type
+                }
+            } else {
+                &argument_type
+            };
+            self.unify_generic_type(
+                payload_type,
+                inference_argument_type,
+                &template.generic_params,
+                &mut inferred,
+            )?;
+            output_arguments.push(argument);
+        }
+
+        for _ in 0..=template.generic_params.len() {
+            let mut changed = false;
+            for param in &template.generic_params {
+                let Some(bounds) = template.subtype_bounds.get(param) else {
+                    continue;
+                };
+                let Some(lower) = &bounds.lower else {
+                    continue;
+                };
+                let lower = self.apply_substitutions(lower, &inferred);
+                if contains_unresolved_generic(&lower, &template.generic_params, &inferred) {
+                    continue;
+                }
+                let previous = inferred.get(param).cloned();
+                self.merge_inferred_lower(param, &lower, &mut inferred)?;
+                changed |= inferred.get(param) != previous.as_ref();
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let missing = template
+            .generic_params
+            .iter()
+            .filter(|param| !inferred.contains_key(*param))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let arguments = missing
+                .iter()
+                .map(|param| format!("`{}`", param))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "could not infer type argument{} {} for generic enum constructor `{}::{}`; add an expected `{}` type or write explicit type arguments",
+                if missing.len() == 1 { "" } else { "s" },
+                arguments,
+                base,
+                variant_name,
+                base
+            ));
+        }
+
+        self.check_generic_bounds(
+            &template.generic_bounds,
+            &template.subtype_bounds,
+            &inferred,
+            &format!("generic enum `{}`", base),
+        )?;
+        let internal_type = Type::GenericInstance {
+            base: base.clone(),
+            type_arguments: template
+                .generic_params
+                .iter()
+                .map(|param| {
+                    inferred
+                        .get(param)
+                        .expect("all generic enum arguments were inferred")
+                        .clone()
+                })
+                .collect(),
+        };
+        let output_type = self.concretize_type(&internal_type)?;
+        Ok(Some((
+            Node::StaticFunctionCall {
+                _type: output_type,
+                name: variant_name.to_string(),
+                arguments: output_arguments,
+                metadata: metadata.clone(),
+            },
+            internal_type,
+        )))
+    }
+
     fn lookup_enum_variant_payload_types(
         &mut self,
         enum_type: &Type,
@@ -3136,23 +3321,24 @@ impl Monomorphizer {
         substitutions: &HashMap<String, Type>,
         self_type: Option<Type>,
     ) -> Result<(Node, Type), String> {
-        let mut output_args = Vec::new();
-        let mut argument_types = Vec::new();
-        for args in arguments {
-            let transformed = args
-                .iter()
-                .map(|arg| self.transform_expr(arg, env, None, substitutions, self_type.clone()))
-                .collect::<Result<Vec<_>, String>>()?;
-            output_args.push(transformed.iter().map(|(node, _)| node.clone()).collect());
-            argument_types.push(
-                transformed
-                    .into_iter()
-                    .map(|(_, sk_type)| sk_type)
-                    .collect::<Vec<_>>(),
-            );
-        }
-
         if let Some(template) = self.generic_functions.get(name).cloned() {
+            let mut output_args = Vec::new();
+            let mut argument_types = Vec::new();
+            for args in arguments {
+                let transformed = args
+                    .iter()
+                    .map(|arg| {
+                        self.transform_expr(arg, env, None, substitutions, self_type.clone())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                output_args.push(transformed.iter().map(|(node, _)| node.clone()).collect());
+                argument_types.push(
+                    transformed
+                        .into_iter()
+                        .map(|(_, sk_type)| sk_type)
+                        .collect::<Vec<_>>(),
+                );
+            }
             let substitutions = if explicit_type_arguments.is_empty() {
                 self.infer_generic_function_arguments(&template, &argument_types, expected_type)?
             } else {
@@ -3224,6 +3410,40 @@ impl Monomorphizer {
         } else {
             return Err(format!("unknown function `{}`", name));
         };
+
+        let mut output_args = Vec::new();
+        let mut argument_types = Vec::new();
+        let mut current_signature = signature.clone();
+        for args in arguments {
+            let (expected_parameters, next_signature) = match &current_signature {
+                Type::Function {
+                    parameters,
+                    return_type,
+                } => (parameters.clone(), return_type.deref().clone()),
+                _ => (Vec::new(), current_signature.clone()),
+            };
+            let transformed = args
+                .iter()
+                .enumerate()
+                .map(|(index, arg)| {
+                    self.transform_expr(
+                        arg,
+                        env,
+                        expected_parameters.get(index),
+                        substitutions,
+                        self_type.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            output_args.push(transformed.iter().map(|(node, _)| node.clone()).collect());
+            argument_types.push(
+                transformed
+                    .into_iter()
+                    .map(|(_, sk_type)| sk_type)
+                    .collect::<Vec<_>>(),
+            );
+            current_signature = next_signature;
+        }
 
         let result_type =
             apply_call_groups_to_function_signature(&signature, &argument_types, metadata)?;
@@ -4758,6 +4978,151 @@ mod tests {
             statement,
             Node::FunctionDeclaration { name, .. } if name == "wrap__int"
         )));
+    }
+
+    #[test]
+    fn infers_generic_enum_constructor_arguments_from_context() {
+        let statements = prepared_statements(
+            r#"
+            enum Outcome[T, E] {
+                Ok(T);
+                Err(E);
+            }
+
+            enum AppError {
+                Failed;
+            }
+
+            enum Optional[T] {
+                Some(T);
+                None;
+            }
+
+            struct Holder {
+                value: Outcome[int, AppError];
+            }
+
+            type AppResult = Outcome[int, AppError];
+
+            function success(): AppResult {
+                return Outcome::Ok(40);
+            }
+
+            function failure(): Outcome[int, AppError] {
+                return Outcome::Err(AppError::Failed());
+            }
+
+            function no_value(): Optional[int] {
+                return Optional::None();
+            }
+
+            function widened_value(): Outcome[long, AppError] {
+                value: int = 7;
+                return Outcome::Ok(value);
+            }
+
+            function consume(value: Outcome[int, AppError]): int {
+                match (value) {
+                    case Ok(number): { return number; }
+                    case Err(error): { return 0; }
+                }
+            }
+
+            function generic_success[T, E](value: T): Outcome[T, E] {
+                return Outcome::Ok(value);
+            }
+
+            function main(): void {
+                assigned: Outcome[int, AppError];
+                assigned = Outcome::Ok(41);
+                direct: Outcome[int, AppError] = Outcome::Err(AppError::Failed());
+                inferred: Outcome[int, AppError] = generic_success(42);
+                holder: Holder = Holder { value: Outcome::Ok(43) };
+                values: [1]Outcome[int, AppError] = [Outcome::Ok(44)];
+                print(consume(Outcome::Ok(43)));
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::EnumDeclaration { name, .. } if name == "Outcome__int__AppError"
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::EnumDeclaration { name, .. } if name == "Optional__int"
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::FunctionDeclaration { name, .. } if name == "generic_success__int__AppError"
+        )));
+    }
+
+    #[test]
+    fn infers_generic_enum_constructor_arguments_from_payloads() {
+        let statements = prepared_statements(
+            r#"
+            enum Pair[A, B] {
+                Pair(A, B);
+            }
+
+            function main(): void {
+                Pair::Pair(7, "seven");
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::EnumDeclaration { name, .. } if name == "Pair__int__string"
+        )));
+    }
+
+    #[test]
+    fn reports_missing_generic_enum_constructor_arguments() {
+        let program = ast::parse(
+            r#"
+            enum Outcome[T, E] {
+                Ok(T);
+                Err(E);
+            }
+
+            function main(): void {
+                Outcome::Ok(7);
+            }
+            "#,
+        );
+
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains(
+            "could not infer type argument `E` for generic enum constructor `Outcome::Ok`"
+        ));
+        assert!(error.contains("write explicit type arguments"));
+    }
+
+    #[test]
+    fn rejects_conflicting_contextual_generic_enum_constructor_arguments() {
+        let program = ast::parse(
+            r#"
+            enum Outcome[T, E] {
+                Ok(T);
+                Err(E);
+            }
+
+            enum AppError {
+                Failed;
+            }
+
+            function invalid(): Outcome[int, AppError] {
+                return Outcome::Ok("not an int");
+            }
+
+            function main(): void {}
+            "#,
+        );
+
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains("conflicting inferred types for `T`: `int` and `string`"));
     }
 
     #[test]
