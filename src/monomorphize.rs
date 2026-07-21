@@ -30,6 +30,7 @@ struct EnumTemplate {
     generic_bounds: HashMap<String, Vec<String>>,
     subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     variants: Vec<ast::EnumVariant>,
+    functions: Vec<Node>,
 }
 
 #[derive(Clone)]
@@ -67,6 +68,29 @@ struct TypeAliasTemplate {
     generic_bounds: HashMap<String, Vec<String>>,
     subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     target_type: Type,
+}
+
+fn attached_function_signature(
+    functions: &[Node],
+    function_name: &str,
+    requires_receiver: bool,
+) -> Option<(Vec<(String, Type)>, Type)> {
+    functions.iter().find_map(|function| match function {
+        Node::FunctionDeclaration {
+            name,
+            parameters,
+            return_type,
+            ..
+        } if name == function_name
+            && parameters
+                .first()
+                .is_some_and(|(_, sk_type)| ast::is_self_type(sk_type))
+                == requires_receiver =>
+        {
+            Some((parameters.clone(), return_type.clone()))
+        }
+        _ => None,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +284,7 @@ impl Monomorphizer {
                     generic_bounds,
                     subtype_bounds,
                     variants,
+                    functions,
                 } => {
                     generic_enums.insert(
                         name.clone(),
@@ -269,10 +294,15 @@ impl Monomorphizer {
                             generic_bounds: generic_bounds.clone(),
                             subtype_bounds: subtype_bounds.clone(),
                             variants: variants.clone(),
+                            functions: functions.clone(),
                         },
                     );
                 }
-                Node::EnumDeclaration { name, variants } => {
+                Node::EnumDeclaration {
+                    name,
+                    variants,
+                    functions,
+                } => {
                     concrete_enums.insert(
                         name.clone(),
                         EnumTemplate {
@@ -281,6 +311,7 @@ impl Monomorphizer {
                             generic_bounds: HashMap::new(),
                             subtype_bounds: HashMap::new(),
                             variants: variants.clone(),
+                            functions: functions.clone(),
                         },
                     );
                     root_statements.push(statement.clone());
@@ -469,12 +500,28 @@ impl Monomorphizer {
                         None,
                     )?);
                 }
-                Node::EnumDeclaration { name, variants } => {
+                Node::EnumDeclaration {
+                    name,
+                    variants,
+                    functions: _,
+                } => {
                     self.ensure_runtime_impls_for_type(
                         &Type::Custom(name.clone()),
                         &Type::Custom(name.clone()),
                     )?;
-                    output.push(self.transform_enum_decl(&name, &variants, &HashMap::new())?);
+                    let functions = self
+                        .concrete_enums
+                        .get(&name)
+                        .ok_or_else(|| format!("unknown concrete enum `{}`", name))?
+                        .functions
+                        .clone();
+                    output.push(self.transform_enum_decl(
+                        &name,
+                        &variants,
+                        &functions,
+                        &HashMap::new(),
+                        None,
+                    )?);
                 }
                 Node::EOI => {}
                 extern_decl @ Node::ExternFunctionDeclaration { .. } => {
@@ -1542,8 +1589,11 @@ impl Monomorphizer {
         &mut self,
         name: &str,
         variants: &[ast::EnumVariant],
+        functions: &[Node],
         substitutions: &HashMap<String, Type>,
+        self_type: Option<Type>,
     ) -> Result<Node, String> {
+        let concrete_self_type = self_type.unwrap_or_else(|| Type::Custom(name.to_string()));
         let output_variants = variants
             .iter()
             .map(|variant| {
@@ -1561,9 +1611,41 @@ impl Monomorphizer {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
+        let mut output_functions = Vec::new();
+        for function in functions {
+            match function {
+                Node::FunctionDeclaration {
+                    name: method_name,
+                    parameters,
+                    return_type,
+                    body,
+                    lambda: false,
+                } => {
+                    output_functions.push(self.transform_named_function(
+                        method_name,
+                        parameters,
+                        return_type,
+                        body,
+                        substitutions,
+                        Some(concrete_self_type.clone()),
+                    )?);
+                }
+                Node::GenericFunctionDeclaration { name, .. } => {
+                    return Err(format!("generic methods are not supported yet: `{}`", name));
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported enum member during monomorphization: `{:?}`",
+                        other
+                    ))
+                }
+            }
+        }
+
         Ok(Node::EnumDeclaration {
             name: name.to_string(),
             variants: output_variants,
+            functions: output_functions,
         })
     }
 
@@ -3920,8 +4002,13 @@ impl Monomorphizer {
                     &substitutions,
                     &format!("generic enum `{}`", base),
                 )?;
-                let node =
-                    self.transform_enum_decl(&symbol_name, &template.variants, &substitutions)?;
+                let node = self.transform_enum_decl(
+                    &symbol_name,
+                    &template.variants,
+                    &template.functions,
+                    &substitutions,
+                    Some(sk_type.clone()),
+                )?;
                 self.generated_enums.insert(symbol_name.clone(), node);
                 self.generated_enum_order.push(symbol_name.clone());
                 self.ensure_runtime_impls_for_type(sk_type, &Type::Custom(symbol_name.clone()))?;
@@ -4009,19 +4096,36 @@ impl Monomorphizer {
         let result = match receiver_type {
             Type::Custom(name) => {
                 if let Some(template) = self.concrete_structs.get(name) {
-                    let function = template
-                        .functions
-                        .iter()
-                        .find_map(|function| match function {
-                            Node::FunctionDeclaration {
-                                name,
-                                parameters,
-                                return_type,
-                                ..
-                            } if name == method_name => Some((parameters.clone(), return_type.clone())),
-                            _ => None,
-                        })
+                    let function = attached_function_signature(
+                        &template.functions,
+                        method_name,
+                        true,
+                    )
                         .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, name))?;
+                    let receiver = function
+                        .0
+                        .first()
+                        .map(|(_, sk_type)| sk_type.clone())
+                        .ok_or_else(|| {
+                            format!("method `{}` on `{}` is missing self", method_name, name)
+                        })?;
+                    Ok((
+                        receiver,
+                        function
+                            .0
+                            .into_iter()
+                            .filter(|(_, sk_type)| !ast::is_self_type(sk_type))
+                            .map(|(_, sk_type)| sk_type)
+                            .collect::<Vec<_>>(),
+                        function.1,
+                    ))
+                } else if let Some(template) = self.concrete_enums.get(name) {
+                    let function = attached_function_signature(
+                        &template.functions,
+                        method_name,
+                        true,
+                    )
+                    .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, name))?;
                     let receiver = function
                         .0
                         .first()
@@ -4063,35 +4167,28 @@ impl Monomorphizer {
                         method.return_type.clone(),
                     ))
                 } else {
-                    Err(format!("unknown struct or trait `{}`", name))
+                    Err(format!("unknown nominal type or trait `{}`", name))
                 }
             }
             Type::GenericInstance {
                 base,
                 type_arguments,
             } => {
-                let template = self
-                    .generic_structs
-                    .get(base)
-                    .ok_or_else(|| format!("unknown generic struct `{}`", base))?;
-                let substitutions = template
-                    .generic_params
+                let (generic_params, functions) = if let Some(template) =
+                    self.generic_structs.get(base)
+                {
+                    (&template.generic_params, &template.functions)
+                } else if let Some(template) = self.generic_enums.get(base) {
+                    (&template.generic_params, &template.functions)
+                } else {
+                    return Err(format!("unknown generic nominal type `{}`", base));
+                };
+                let substitutions = generic_params
                     .iter()
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
-                let function = template
-                    .functions
-                    .iter()
-                    .find_map(|function| match function {
-                        Node::FunctionDeclaration {
-                            name,
-                            parameters,
-                            return_type,
-                            ..
-                        } if name == method_name => Some((parameters.clone(), return_type.clone())),
-                        _ => None,
-                    })
+                let function = attached_function_signature(functions, method_name, true)
                     .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, base))?;
                 let receiver = function
                     .0
@@ -4155,7 +4252,7 @@ impl Monomorphizer {
                 ))
             }
             other => Err(format!(
-                "method lookup requires a struct receiver, found `{}`",
+                "method lookup requires a nominal receiver, found `{}`",
                 ast::type_to_string(other)
             )),
         };
@@ -4177,28 +4274,14 @@ impl Monomorphizer {
     ) -> Result<(Vec<Type>, Type), String> {
         let result = match target_type {
             Type::Custom(name) => {
-                let template = self
-                    .concrete_structs
-                    .get(name)
-                    .ok_or_else(|| format!("unknown struct `{}`", name))?;
-                let function = template
-                    .functions
-                    .iter()
-                    .find_map(|function| match function {
-                        Node::FunctionDeclaration {
-                            name,
-                            parameters,
-                            return_type,
-                            ..
-                        } if name == function_name
-                            && !parameters
-                                .first()
-                                .is_some_and(|(_, sk_type)| ast::is_self_type(sk_type)) =>
-                        {
-                            Some((parameters.clone(), return_type.clone()))
-                        }
-                        _ => None,
-                    })
+                let functions = if let Some(template) = self.concrete_structs.get(name) {
+                    &template.functions
+                } else if let Some(template) = self.concrete_enums.get(name) {
+                    &template.functions
+                } else {
+                    return Err(format!("unknown nominal type `{}`", name));
+                };
+                let function = attached_function_signature(functions, function_name, false)
                     .ok_or_else(|| {
                         format!("unknown static function `{}` on `{}`", function_name, name)
                     })?;
@@ -4215,34 +4298,21 @@ impl Monomorphizer {
                 base,
                 type_arguments,
             } => {
-                let template = self
-                    .generic_structs
-                    .get(base)
-                    .ok_or_else(|| format!("unknown generic struct `{}`", base))?;
-                let substitutions = template
-                    .generic_params
+                let (generic_params, functions) = if let Some(template) =
+                    self.generic_structs.get(base)
+                {
+                    (&template.generic_params, &template.functions)
+                } else if let Some(template) = self.generic_enums.get(base) {
+                    (&template.generic_params, &template.functions)
+                } else {
+                    return Err(format!("unknown generic nominal type `{}`", base));
+                };
+                let substitutions = generic_params
                     .iter()
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
-                let function = template
-                    .functions
-                    .iter()
-                    .find_map(|function| match function {
-                        Node::FunctionDeclaration {
-                            name,
-                            parameters,
-                            return_type,
-                            ..
-                        } if name == function_name
-                            && !parameters
-                                .first()
-                                .is_some_and(|(_, sk_type)| ast::is_self_type(sk_type)) =>
-                        {
-                            Some((parameters.clone(), return_type.clone()))
-                        }
-                        _ => None,
-                    })
+                let function = attached_function_signature(functions, function_name, false)
                     .ok_or_else(|| {
                         format!("unknown static function `{}` on `{}`", function_name, base)
                     })?;
@@ -4256,7 +4326,7 @@ impl Monomorphizer {
                 ))
             }
             other => Err(format!(
-                "static function lookup requires a struct type, found `{}`",
+                "static function lookup requires a nominal type, found `{}`",
                 ast::type_to_string(other)
             )),
         };
@@ -4968,7 +5038,7 @@ mod tests {
 
         assert!(statements.iter().any(|statement| matches!(
             statement,
-            Node::EnumDeclaration { name, variants }
+            Node::EnumDeclaration { name, variants, .. }
                 if name == "Option__int"
                     && variants
                         .iter()

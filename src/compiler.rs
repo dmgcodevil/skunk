@@ -356,7 +356,7 @@ fn collect_enum_layouts(
     let enum_placeholders = collect_enum_placeholders(statements);
 
     for statement in statements {
-        let Node::EnumDeclaration { name, variants } = statement else {
+        let Node::EnumDeclaration { name, variants, .. } = statement else {
             continue;
         };
 
@@ -1786,7 +1786,36 @@ impl<'a> FunctionCompiler<'a> {
                 self.compile_array_fill(&llvm_type, &arguments[0])
             }
             Type::Custom(enum_name) if self.enums.contains_key(enum_name) => {
-                self.compile_enum_constructor(enum_name, name, arguments)
+                let is_variant = self
+                    .enums
+                    .get(enum_name)
+                    .is_some_and(|layout| {
+                        layout
+                            .variants
+                            .iter()
+                            .any(|variant| variant.name == name)
+                    });
+                if is_variant {
+                    self.compile_enum_constructor(enum_name, name, arguments)
+                } else {
+                    let signature_key = format!("{}::{}", enum_name, name);
+                    let signature = self
+                        .signatures
+                        .get(&signature_key)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown static function `{}` on `{}` in LLVM backend",
+                                name, enum_name
+                            )
+                        })?;
+                    self.compile_direct_call(
+                        &signature_key,
+                        &signature,
+                        arguments,
+                        "static function",
+                    )
+                }
             }
             Type::Custom(struct_name) if name != "create" && self.structs.contains_key(struct_name) => {
                 let signature_key = format!("{}::{}", struct_name, name);
@@ -2760,23 +2789,26 @@ impl<'a> FunctionCompiler<'a> {
             };
         }
 
-        let struct_name = match receiver_type {
-            LlvmType::Struct(name) => name,
+        let (nominal_name, nominal_type) = match receiver_type {
+            LlvmType::Struct(name) => (name.clone(), LlvmType::Struct(name)),
+            LlvmType::Enum(name) => (name.clone(), LlvmType::Enum(name)),
             LlvmType::Reference { target_type, .. } => match *target_type {
-                LlvmType::Struct(name) => name,
+                LlvmType::Struct(name) => (name.clone(), LlvmType::Struct(name)),
+                LlvmType::Enum(name) => (name.clone(), LlvmType::Enum(name)),
                 other => {
                     return Err(format!(
-                        "method `{}` requires a struct receiver, found `{}`",
+                        "method `{}` requires a nominal receiver, found `{}`",
                         method_name,
                         other.ir()
                     ))
                 }
             },
             LlvmType::Pointer { target_type } => match *target_type {
-                LlvmType::Struct(name) => name,
+                LlvmType::Struct(name) => (name.clone(), LlvmType::Struct(name)),
+                LlvmType::Enum(name) => (name.clone(), LlvmType::Enum(name)),
                 other => {
                     return Err(format!(
-                        "method `{}` requires a struct receiver, found `{}`",
+                        "method `{}` requires a nominal receiver, found `{}`",
                         method_name,
                         other.ir()
                     ))
@@ -2784,19 +2816,19 @@ impl<'a> FunctionCompiler<'a> {
             },
             other => {
                 return Err(format!(
-                    "method `{}` requires a struct receiver, found `{}`",
+                    "method `{}` requires a nominal receiver, found `{}`",
                     method_name,
                     other.ir()
                 ))
             }
         };
 
-        let signature_key = format!("{}::{}", struct_name, method_name);
+        let signature_key = format!("{}::{}", nominal_name, method_name);
         let signature = self
             .signatures
             .get(&signature_key)
             .cloned()
-            .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, struct_name))?;
+            .ok_or_else(|| format!("unknown method `{}` on `{}`", method_name, nominal_name))?;
 
         let receiver_ptr = match self.resolve_access_ptr(receiver_nodes) {
             Ok((ptr, llvm_type)) => {
@@ -2807,8 +2839,7 @@ impl<'a> FunctionCompiler<'a> {
                 }
             }
             Err(_) => {
-                let temp_var =
-                    self.emit_heap_alloc(LlvmType::Struct(struct_name.clone()), "receiver_tmp");
+                let temp_var = self.emit_heap_alloc(nominal_type, "receiver_tmp");
                 let receiver_expr = self.compile_expr(&Node::Access {
                     nodes: receiver_nodes.to_vec(),
                 })?;
@@ -4976,16 +5007,20 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 );
             }
             Node::EOI => {}
-            Node::EnumDeclaration { .. } => {}
             Node::TraitDeclaration { .. }
             | Node::ShapeDeclaration { .. }
             | Node::ImplDeclaration { .. } => {}
             Node::StructDeclaration {
                 name,
-                functions: struct_functions,
+                functions: nominal_functions,
+                ..
+            }
+            | Node::EnumDeclaration {
+                name,
+                functions: nominal_functions,
                 ..
             } => {
-                for function in struct_functions {
+                for function in nominal_functions {
                     if let Node::FunctionDeclaration {
                         name: method_name,
                         parameters,
@@ -6264,6 +6299,131 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "42\nok\n");
+    }
+
+    #[test]
+    fn runs_compiled_concrete_enum_attached_functions() {
+        let stdout = compile_and_run(
+            r#"
+            enum Direction {
+                North;
+                South;
+            }
+
+            attach Direction {
+                function is_north(self): bool {
+                    match (self) {
+                        case North: {
+                            return true;
+                        }
+                        case South: {
+                            return false;
+                        }
+                    }
+                }
+
+                function default_direction(): Direction {
+                    return Direction::North();
+                }
+            }
+
+            function main(): void {
+                north: Direction = Direction::default_direction();
+                south: Direction = Direction::South();
+                print(north.is_north());
+                print(south.is_north());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "true\nfalse\n");
+    }
+
+    #[test]
+    fn runs_compiled_generic_enum_attached_functions() {
+        let stdout = compile_and_run(
+            r#"
+            enum Option[T] {
+                Some(T);
+                None;
+            }
+
+            attach[T] Option[T] {
+                function is_some(self): bool {
+                    match (self) {
+                        case Some(value): {
+                            return true;
+                        }
+                        case None: {
+                            return false;
+                        }
+                    }
+                }
+
+                function unwrap_or(self, fallback: T): T {
+                    match (self) {
+                        case Some(value): {
+                            return value;
+                        }
+                        case None: {
+                            return fallback;
+                        }
+                    }
+                }
+
+                function empty(): Option[T] {
+                    return Option::None();
+                }
+
+                function replace(mut self, value: T): void {
+                    self = Option::Some(value);
+                }
+            }
+
+            function main(): void {
+                some: Option[int] = Option::Some(7);
+                none: Option[int] = Option[int]::empty();
+                text: Option[string] = Option::Some("skunk");
+                print(some.is_some());
+                print(none.is_some());
+                print(some.unwrap_or(99));
+                print(none.unwrap_or(99));
+                print(text.unwrap_or("fallback"));
+                none.replace(11);
+                print(none.unwrap_or(99));
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "true\nfalse\n7\n99\nskunk\n11\n");
+    }
+
+    #[test]
+    fn rejects_mutating_enum_method_on_const_binding() {
+        let error = compile_and_run(
+            r#"
+            enum Option[T] {
+                Some(T);
+                None;
+            }
+
+            attach[T] Option[T] {
+                function replace(mut self, value: T): void {
+                    self = Option::Some(value);
+                }
+            }
+
+            function main(): void {
+                const value: Option[int] = Option::None();
+                value.replace(7);
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot call mutating method through const or immutable receiver"));
     }
 
     #[test]
@@ -7950,6 +8110,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stdout, "5.000000\n");
+    }
+
+    #[test]
+    fn project_module_preserves_private_generic_enum_attach() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "main.skunk",
+                    r#"
+                    import maybe.ops;
+
+                    function main(): void {
+                        print(present_or(99));
+                        print(missing_or(99));
+                    }
+                    "#,
+                ),
+                (
+                    "maybe/ops.skunk",
+                    r#"
+                    module maybe.ops;
+
+                    enum Maybe[T] {
+                        Present(T);
+                        Missing;
+                    }
+
+                    attach[T] Maybe[T] {
+                        function unwrap_or(self, fallback: T): T {
+                            match (self) {
+                                case Present(value): {
+                                    return value;
+                                }
+                                case Missing: {
+                                    return fallback;
+                                }
+                            }
+                        }
+                    }
+
+                    export function present_or(fallback: int): int {
+                        value: Maybe[int] = Maybe::Present(7);
+                        return value.unwrap_or(fallback);
+                    }
+
+                    export function missing_or(fallback: int): int {
+                        value: Maybe[int] = Maybe::Missing();
+                        return value.unwrap_or(fallback);
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n99\n");
     }
 
     #[test]

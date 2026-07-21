@@ -642,7 +642,11 @@ impl ModuleNormalizer {
                     functions,
                 }
             }
-            Node::EnumDeclaration { name, variants } => {
+            Node::EnumDeclaration {
+                name,
+                variants,
+                functions,
+            } => {
                 let renamed_name = if top_level && !exported {
                     self.type_renames
                         .get(&name)
@@ -666,9 +670,16 @@ impl ModuleNormalizer {
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
+                let functions = functions
+                    .into_iter()
+                    .map(|function| {
+                        self.rename_statement(function, value_scopes, type_scopes, false, true)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 Node::EnumDeclaration {
                     name: renamed_name,
                     variants,
+                    functions,
                 }
             }
             Node::GenericEnumDeclaration {
@@ -677,6 +688,7 @@ impl ModuleNormalizer {
                 generic_bounds,
                 subtype_bounds,
                 variants,
+                functions,
             } => {
                 let renamed_name = if top_level && !exported {
                     self.type_renames
@@ -712,6 +724,12 @@ impl ModuleNormalizer {
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
+                let functions = functions
+                    .into_iter()
+                    .map(|function| {
+                        self.rename_statement(function, value_scopes, type_scopes, false, true)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 type_scopes.pop();
                 Node::GenericEnumDeclaration {
                     name: renamed_name,
@@ -719,6 +737,7 @@ impl ModuleNormalizer {
                     generic_bounds,
                     subtype_bounds,
                     variants,
+                    functions,
                 }
             }
             Node::If {

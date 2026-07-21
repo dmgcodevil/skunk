@@ -32,6 +32,7 @@ struct EnumVariantSymbol {
 struct EnumSymbol {
     name: String,
     variants: HashMap<String, EnumVariantSymbol>,
+    functions: HashMap<String, Symbol>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -290,7 +291,11 @@ impl GlobalScope {
                     },
                 );
             }
-            Node::EnumDeclaration { name, variants } => {
+            Node::EnumDeclaration {
+                name,
+                variants,
+                functions,
+            } => {
                 self.enums.insert(
                     name.clone(),
                     EnumSymbol {
@@ -305,6 +310,13 @@ impl GlobalScope {
                                         payload_types: variant.payload_types.clone(),
                                     },
                                 )
+                            })
+                            .collect(),
+                        functions: functions
+                            .iter()
+                            .map(|node| {
+                                let function = func_decl_node_to_symbol(node);
+                                (function.name.clone(), function)
                             })
                             .collect(),
                     },
@@ -1325,81 +1337,73 @@ fn resolve_access(
                         _ => panic!("expected member access node"),
                     }
                 } else {
-                    if !global_scope.structs.contains_key(&type_name) {
-                        return Err("error: struct doesn't exist".to_string());
-                    }
-                    let struct_symbol = global_scope.structs.get(&type_name).unwrap();
-                match member.deref() {
-                    Node::Identifier(field_name) => {
-                        if !struct_symbol.fields.contains_key(field_name) {
-                            return Err(format!(
-                                "error {}:{}: no field `{}` on type `{}`",
-                                metadata.span.line, metadata.span.start, field_name, type_name
-                            ));
+                    let (fields, functions, kind) =
+                        if let Some(struct_symbol) = global_scope.structs.get(&type_name) {
+                            (Some(&struct_symbol.fields), &struct_symbol.functions, "struct")
+                        } else if let Some(enum_symbol) = global_scope.enums.get(&type_name) {
+                            (None, &enum_symbol.functions, "enum")
+                        } else {
+                            return Err(format!("error: nominal type `{}` doesn't exist", type_name));
+                        };
+                    match member.deref() {
+                        Node::Identifier(field_name) => {
+                            let field_symbol = fields
+                                .and_then(|fields| fields.get(field_name))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "error {}:{}: no field `{}` on type `{}`",
+                                        metadata.span.line,
+                                        metadata.span.start,
+                                        field_name,
+                                        type_name
+                                    )
+                                })?;
+                            resolve_access(
+                                global_scope,
+                                symbol_tables,
+                                field_symbol.sk_type.clone(),
+                                i + 1,
+                                access_nodes,
+                            )
                         }
-                        resolve_access(
-                            global_scope,
-                            symbol_tables,
-                            struct_symbol
-                                .fields
-                                .get(field_name)
-                                .unwrap()
-                                .sk_type
-                                .clone(),
-                            i + 1,
-                            access_nodes,
-                        )
-                    }
-                    Node::FunctionCall {
-                        name,
-                        type_arguments: _,
-                        arguments,
-                        metadata,
-                    } => {
-                        if !struct_symbol.functions.contains_key(name) {
-                            return Err(format!(
-                                "error {}:{}:no method named `{}` found for struct `{}` in the current scope",
-                                metadata.span.line,
-                                metadata.span.start,
-                                name,
-                                type_name,
-                            ));
-                        }
-                        let method_symbol = struct_symbol.functions.get(name).unwrap();
-                        if let Type::Function { parameters, .. } = &method_symbol.sk_type {
-                            if parameters.first().is_some_and(is_mut_self_type) {
-                                assert_mutating_receiver_allowed(
-                                    global_scope,
-                                    symbol_tables,
-                                    &access_nodes[..i],
-                                )?;
+                        Node::FunctionCall {
+                            name, metadata, ..
+                        } => {
+                            let method_symbol = functions.get(name).ok_or_else(|| {
+                                format!(
+                                    "error {}:{}: no method named `{}` found for {} `{}` in the current scope",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    name,
+                                    kind,
+                                    type_name,
+                                )
+                            })?;
+                            if let Type::Function { parameters, .. } = &method_symbol.sk_type {
+                                if parameters.first().is_some_and(is_mut_self_type) {
+                                    assert_mutating_receiver_allowed(
+                                        global_scope,
+                                        symbol_tables,
+                                        &access_nodes[..i],
+                                    )?;
+                                }
                             }
+                            let return_type = resolve_function_call(
+                                global_scope,
+                                symbol_tables,
+                                method_symbol,
+                                member.deref(),
+                            )?;
+                            resolve_access(
+                                global_scope,
+                                symbol_tables,
+                                return_type,
+                                i + 1,
+                                access_nodes,
+                            )
                         }
-                        let return_type = resolve_function_call(
-                            global_scope,
-                            symbol_tables,
-                            method_symbol,
-                            member.deref(),
-                        )?;
-                        let args_types_res: Result<Vec<ResolveResult>, String> = arguments
-                            .first()
-                            .expect("at least one arg group is required")
-                            .iter()
-                            .map(|arg| resolve_type(global_scope, symbol_tables, arg, None))
-                            .collect();
-                        let args_types = args_types_res?; // why ?
-                                                          // println!("args_types = {:?}", args_types);
-
-                        resolve_access(
-                            global_scope,
-                            symbol_tables,
-                            return_type,
-                            i + 1,
-                            access_nodes,
-                        )
+                        _ => panic!("expected member access node"),
                     }
-                    _ => panic!("expected member access node"),
-                }
                 }
             }
             _ => Err(format!("access to member access to not instance structs")),
@@ -1983,6 +1987,55 @@ fn resolve_function_call(
     }
 }
 
+fn resolve_static_attached_call(
+    global_scope: &GlobalScope,
+    symbol_tables: &mut SymbolTables,
+    function_symbol: &Symbol,
+    function_name: &str,
+    arguments: &[Node],
+    metadata: &Metadata,
+) -> Result<Option<Type>, String> {
+    let Type::Function {
+        parameters,
+        return_type,
+    } = &function_symbol.sk_type
+    else {
+        return Ok(None);
+    };
+    if parameters.first().is_some_and(is_self_type) {
+        return Ok(None);
+    }
+    if arguments.len() != parameters.len() {
+        return Err(format!(
+            "error {}:{}: static function `{}` expects {} argument(s), got {}",
+            metadata.span.line,
+            metadata.span.start,
+            function_name,
+            parameters.len(),
+            arguments.len()
+        ));
+    }
+    for (argument, parameter_type) in arguments.iter().zip(parameters.iter()) {
+        let argument_type = resolve_type(
+            global_scope,
+            symbol_tables,
+            argument,
+            Some(parameter_type),
+        )?;
+        if !is_assignable(global_scope, parameter_type, &argument_type.sk_type) {
+            return Err(format!(
+                "error {}:{}: static function `{}` expected `{}` but got `{}`",
+                metadata.span.line,
+                metadata.span.start,
+                function_name,
+                type_to_string(parameter_type),
+                type_to_string(&argument_type.sk_type)
+            ));
+        }
+    }
+    Ok(Some(return_type.deref().clone()))
+}
+
 #[derive(Debug, PartialEq, Clone)]
 struct ResolveResult {
     sk_type: Type,
@@ -2132,7 +2185,29 @@ fn resolve_type(
             }
             Ok(ResolveResult::new(Type::Custom(name.clone())))
         }
-        Node::EnumDeclaration { name, .. } => Ok(ResolveResult::new(Type::Custom(name.clone()))),
+        Node::EnumDeclaration {
+            name, functions, ..
+        } => {
+            for function in functions {
+                if let Node::FunctionDeclaration {
+                    parameters,
+                    return_type,
+                    body,
+                    ..
+                } = function
+                {
+                    resolve_function_body(
+                        global_scope,
+                        symbol_tables,
+                        parameters,
+                        return_type,
+                        body,
+                        Some(Type::Custom(name.clone())),
+                    )?;
+                }
+            }
+            Ok(ResolveResult::new(Type::Custom(name.clone())))
+        }
         Node::GenericStructDeclaration { .. }
         | Node::GenericEnumDeclaration { .. }
         | Node::ShapeDeclaration { .. }
@@ -2888,95 +2963,78 @@ fn resolve_type(
                 }
                 Type::Custom(custom_name) if global_scope.enums.contains_key(custom_name) => {
                     let enum_symbol = global_scope.enums.get(custom_name).unwrap();
-                    let variant_symbol = enum_symbol.variants.get(name).ok_or_else(|| {
-                        format!(
-                            "error {}:{}: enum `{}` does not support variant `{}`",
-                            metadata.span.line, metadata.span.start, custom_name, name
-                        )
-                    })?;
-                    if arguments.len() != variant_symbol.payload_types.len() {
-                        return Err(format!(
-                            "error {}:{}: enum variant `{}` expects {} argument(s), got {}",
-                            metadata.span.line,
-                            metadata.span.start,
-                            name,
-                            variant_symbol.payload_types.len(),
-                            arguments.len()
-                        ));
-                    }
-                    for (argument, payload_type) in
-                        arguments.iter().zip(variant_symbol.payload_types.iter())
-                    {
-                        let arg_type = resolve_type(
-                            global_scope,
-                            symbol_tables,
-                            argument,
-                            Some(payload_type),
-                        )?;
-                        if !is_assignable(global_scope, payload_type, &arg_type.sk_type) {
+                    if let Some(variant_symbol) = enum_symbol.variants.get(name) {
+                        if arguments.len() != variant_symbol.payload_types.len() {
                             return Err(format!(
-                                "error {}:{}: enum variant `{}` expected `{}` but got `{}`",
+                                "error {}:{}: enum variant `{}` expects {} argument(s), got {}",
                                 metadata.span.line,
                                 metadata.span.start,
                                 name,
-                                type_to_string(payload_type),
-                                type_to_string(&arg_type.sk_type)
+                                variant_symbol.payload_types.len(),
+                                arguments.len()
                             ));
                         }
+                        for (argument, payload_type) in
+                            arguments.iter().zip(variant_symbol.payload_types.iter())
+                        {
+                            let arg_type = resolve_type(
+                                global_scope,
+                                symbol_tables,
+                                argument,
+                                Some(payload_type),
+                            )?;
+                            if !is_assignable(global_scope, payload_type, &arg_type.sk_type) {
+                                return Err(format!(
+                                    "error {}:{}: enum variant `{}` expected `{}` but got `{}`",
+                                    metadata.span.line,
+                                    metadata.span.start,
+                                    name,
+                                    type_to_string(payload_type),
+                                    type_to_string(&arg_type.sk_type)
+                                ));
+                            }
+                        }
+                        return Ok(ResolveResult::new(_type.clone()));
                     }
-                    return Ok(ResolveResult::new(_type.clone()));
+
+                    if let Some(function_symbol) = enum_symbol.functions.get(name) {
+                        if let Some(return_type) = resolve_static_attached_call(
+                            global_scope,
+                            symbol_tables,
+                            function_symbol,
+                            name,
+                            arguments,
+                            metadata,
+                        )? {
+                            return Ok(ResolveResult::new(return_type));
+                        }
+                    }
+
+                    return Err(format!(
+                        "error {}:{}: enum `{}` does not support variant or static function `{}`",
+                        metadata.span.line, metadata.span.start, custom_name, name
+                    ));
                 }
                 Type::Custom(_) | Type::GenericInstance { .. } => {
                     if name != "create" {
                         if let Type::Custom(custom_name) = _type {
-                        if let Some(struct_symbol) = global_scope.structs.get(custom_name) {
-                            if let Some(function_symbol) = struct_symbol.functions.get(name) {
-                                if let Type::Function {
-                                    parameters,
-                                    return_type,
-                                } = &function_symbol.sk_type
-                                {
-                                    if !parameters.first().is_some_and(is_self_type) {
-                                        if arguments.len() != parameters.len() {
-                                            return Err(format!(
-                                                "error {}:{}: static function `{}` expects {} argument(s), got {}",
-                                                metadata.span.line,
-                                                metadata.span.start,
-                                                name,
-                                                parameters.len(),
-                                                arguments.len()
-                                            ));
-                                        }
-                                        for (argument, parameter_type) in
-                                            arguments.iter().zip(parameters.iter())
-                                        {
-                                            let arg_type = resolve_type(
-                                                global_scope,
-                                                symbol_tables,
-                                                argument,
-                                                Some(parameter_type),
-                                            )?;
-                                            if !is_assignable(
-                                                global_scope,
-                                                parameter_type,
-                                                &arg_type.sk_type,
-                                            ) {
-                                                return Err(format!(
-                                                    "error {}:{}: static function `{}` expected `{}` but got `{}`",
-                                                    metadata.span.line,
-                                                    metadata.span.start,
-                                                    name,
-                                                    type_to_string(parameter_type),
-                                                    type_to_string(&arg_type.sk_type)
-                                                ));
-                                            }
-                                        }
-                                        return Ok(ResolveResult::new(return_type.deref().clone()));
-                                    }
+                            if let Some(function_symbol) = global_scope
+                                .structs
+                                .get(custom_name)
+                                .and_then(|struct_symbol| struct_symbol.functions.get(name))
+                            {
+                                if let Some(return_type) = resolve_static_attached_call(
+                                    global_scope,
+                                    symbol_tables,
+                                    function_symbol,
+                                    name,
+                                    arguments,
+                                    metadata,
+                                )? {
+                                    return Ok(ResolveResult::new(return_type));
                                 }
                             }
                         }
-                    }
                     }
                     if name != "create" {
                         return Err(format!(

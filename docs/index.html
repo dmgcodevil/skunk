@@ -605,31 +605,49 @@ where B &gt;: A, B &lt;: Animal {
 
             <section id="enums-and-match">
                 <h2>Enums and Match</h2>
-                <p>Skunk supports generic enums with unit variants and tuple-style payload variants, plus exhaustive enum-focused <code>match</code>.</p>
+                <p>Skunk supports generic enums with unit variants, tuple-style payload variants, attached behavior, and exhaustive enum-focused <code>match</code>.</p>
 <pre><code class="language-skunk">enum Option[T] {
     None;
     Some(T);
 }
 
-function unwrap(value: Option[int]): int {
-    match (value) {
-        case None: {
-            return 0;
+attach[T] Option[T] {
+    function is_some(self): bool {
+        match (self) {
+            case None: {
+                return false;
+            }
+            case Some(value): {
+                return true;
+            }
         }
-        case Some(v): {
-            return v;
+    }
+
+    function unwrap_or(self, fallback: T): T {
+        match (self) {
+            case None: {
+                return fallback;
+            }
+            case Some(value): {
+                return value;
+            }
         }
     }
 }
 
-function some_value(): Option[int] {
-    return Option::Some(7);
+function main(): void {
+    some: Option[int] = Option::Some(7);
+    none: Option[int] = Option::None();
+    print(some.is_some());
+    print(none.unwrap_or(42));
 }</code></pre>
                 <ul>
+                    <li><code>attach Enum { ... }</code> and <code>attach[T] Enum[T] { ... }</code> add instance methods and static functions to concrete and generic enums.</li>
                     <li>When context determines the complete generic type, construct variants concisely with forms like <code>Option::None()</code> and <code>Option::Some(7)</code>.</li>
                     <li>Explicit forms such as <code>Option[int]::Some(7)</code> remain available when inference is ambiguous.</li>
                     <li>Variants may carry multiple payload values, such as <code>Pair(A, B)</code>.</li>
                     <li><code>match</code> is exhaustiveness-checked for enums.</li>
+                    <li>Attached functions may use the enum's type parameters. Methods that declare their own additional type parameters are not yet supported.</li>
                 </ul>
             </section>
 

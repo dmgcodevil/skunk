@@ -80,6 +80,7 @@ pub enum Node {
     EnumDeclaration {
         name: String,
         variants: Vec<EnumVariant>,
+        functions: Vec<Node>,
     },
     GenericStructDeclaration {
         name: String,
@@ -95,6 +96,7 @@ pub enum Node {
         generic_bounds: HashMap<String, Vec<String>>,
         subtype_bounds: HashMap<String, SubtypeBounds>,
         variants: Vec<EnumVariant>,
+        functions: Vec<Node>,
     },
     VariableDeclaration {
         var_type: Type,
@@ -1366,7 +1368,11 @@ impl PestImpl {
             .map(|p| self.create_enum_variant_decl(p))
             .collect::<Vec<_>>();
         if generic_params.is_empty() && generic_bounds.is_empty() && subtype_bounds.is_empty() {
-            Node::EnumDeclaration { name, variants }
+            Node::EnumDeclaration {
+                name,
+                variants,
+                functions: Vec::new(),
+            }
         } else {
             Node::GenericEnumDeclaration {
                 name,
@@ -1374,6 +1380,7 @@ impl PestImpl {
                 generic_bounds,
                 subtype_bounds,
                 variants,
+                functions: Vec::new(),
             }
         }
     }
@@ -1564,18 +1571,41 @@ impl PestImpl {
             return Ok(node);
         };
 
-        let mut declared_structs = HashMap::<String, Vec<String>>::new();
+        // The boolean records whether the nominal declaration is a struct.
+        // `attach` accepts both structs and enums, while `conform` remains
+        // struct-only until enum trait conformance is implemented end to end.
+        let mut declared_nominals = HashMap::<String, (Vec<String>, bool)>::new();
+        let mut enum_variant_names = HashMap::<String, HashSet<String>>::new();
         for statement in &statements {
             match statement {
                 Node::StructDeclaration { name, .. } => {
-                    declared_structs.insert(name.clone(), Vec::new());
+                    declared_nominals.insert(name.clone(), (Vec::new(), true));
                 }
                 Node::GenericStructDeclaration {
                     name,
                     generic_params,
                     ..
                 } => {
-                    declared_structs.insert(name.clone(), generic_params.clone());
+                    declared_nominals.insert(name.clone(), (generic_params.clone(), true));
+                }
+                Node::EnumDeclaration { name, variants, .. } => {
+                    declared_nominals.insert(name.clone(), (Vec::new(), false));
+                    enum_variant_names.insert(
+                        name.clone(),
+                        variants.iter().map(|variant| variant.name.clone()).collect(),
+                    );
+                }
+                Node::GenericEnumDeclaration {
+                    name,
+                    generic_params,
+                    variants,
+                    ..
+                } => {
+                    declared_nominals.insert(name.clone(), (generic_params.clone(), false));
+                    enum_variant_names.insert(
+                        name.clone(),
+                        variants.iter().map(|variant| variant.name.clone()).collect(),
+                    );
                 }
                 _ => {}
             }
@@ -1605,8 +1635,26 @@ impl PestImpl {
                         generic_bounds,
                         subtype_bounds,
                         target_type,
-                        &declared_structs,
+                        &declared_nominals,
                     )?;
+                    if let Some(variant_names) = enum_variant_names.get(&target_name) {
+                        for function in functions {
+                            if let Node::FunctionDeclaration {
+                                name, parameters, ..
+                            } = function
+                            {
+                                let is_static = !parameters
+                                    .first()
+                                    .is_some_and(|(_, sk_type)| is_self_type(sk_type));
+                                if is_static && variant_names.contains(name) {
+                                    return Err(format!(
+                                        "static attached function `{}` on enum `{}` conflicts with a variant constructor",
+                                        name, target_name
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     self.merge_behavior_functions(
                         "attach",
                         &target_name,
@@ -1635,7 +1683,7 @@ impl PestImpl {
                         generic_bounds,
                         subtype_bounds,
                         target_type,
-                        &declared_structs,
+                        &declared_nominals,
                     )?;
                     self.merge_behavior_functions(
                         &format!("conform `{}`", trait_name),
@@ -1711,6 +1759,7 @@ impl PestImpl {
                     generic_bounds,
                     subtype_bounds,
                     variants,
+                    ..
                 } => {
                     self.validate_declared_generic_bounds(
                         &format!("enum `{}`", name),
@@ -1719,10 +1768,18 @@ impl PestImpl {
                         &subtype_bounds,
                     )?;
                     output.push(Node::GenericEnumDeclaration {
+                        functions: merged_functions.remove(&name).unwrap_or_default(),
                         name,
                         generic_params,
                         generic_bounds,
                         subtype_bounds,
+                        variants,
+                    });
+                }
+                Node::EnumDeclaration { name, variants, .. } => {
+                    output.push(Node::EnumDeclaration {
+                        functions: merged_functions.remove(&name).unwrap_or_default(),
+                        name,
                         variants,
                     });
                 }
@@ -1767,21 +1824,28 @@ impl PestImpl {
         generic_bounds: &HashMap<String, Vec<String>>,
         subtype_bounds: &HashMap<String, SubtypeBounds>,
         target_type: &Type,
-        declared_structs: &HashMap<String, Vec<String>>,
+        declared_nominals: &HashMap<String, (Vec<String>, bool)>,
     ) -> Result<String, String> {
-        let (target_name, declared_generic_params) = match target_type {
+        let target_kind = if kind == "attach" { "nominal" } else { "struct" };
+        let (target_name, declared_generic_params, target_is_struct) = match target_type {
             Type::Custom(name) => {
-                let declared = declared_structs.get(name).ok_or_else(|| {
-                    format!("`{}` target `{}` must name an existing struct type", kind, name)
+                let (declared, is_struct) = declared_nominals.get(name).ok_or_else(|| {
+                    format!(
+                        "`{}` target `{}` must name an existing {} type",
+                        kind, name, target_kind
+                    )
                 })?;
-                (name.clone(), declared.clone())
+                (name.clone(), declared.clone(), *is_struct)
             }
             Type::GenericInstance {
                 base,
                 type_arguments,
             } => {
-                let declared = declared_structs.get(base).ok_or_else(|| {
-                    format!("`{}` target `{}` must name an existing struct type", kind, base)
+                let (declared, is_struct) = declared_nominals.get(base).ok_or_else(|| {
+                    format!(
+                        "`{}` target `{}` must name an existing {} type",
+                        kind, base, target_kind
+                    )
                 })?;
                 if generic_params.is_empty() {
                     return Err(format!(
@@ -1802,16 +1866,24 @@ impl PestImpl {
                         type_to_string(target_type)
                     ));
                 }
-                (base.clone(), declared.clone())
+                (base.clone(), declared.clone(), *is_struct)
             }
             other => {
                 return Err(format!(
-                    "`{}` target must be a struct type, found `{}`",
+                    "`{}` target must be a {} type, found `{}`",
                     kind,
+                    target_kind,
                     type_to_string(other)
                 ))
             }
         };
+
+        if kind != "attach" && !target_is_struct {
+            return Err(format!(
+                "`{}` target `{}` must name an existing struct type",
+                kind, target_name
+            ));
+        }
 
         if declared_generic_params.is_empty() {
             if !generic_params.is_empty() {
@@ -4310,6 +4382,80 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_enum_attach_merges_functions_into_declaration() {
+        let Node::Program { statements } = parse(
+            r#"
+            enum Option[T] {
+                Some(T);
+                None;
+            }
+
+            attach[T] Option[T] {
+                function is_some(self): bool {
+                    return true;
+                }
+
+                function empty(): Option[T] {
+                    return Option::None();
+                }
+            }
+            "#,
+        ) else {
+            panic!("expected program");
+        };
+
+        let Node::GenericEnumDeclaration {
+            name,
+            generic_params,
+            functions,
+            ..
+        } = &statements[0]
+        else {
+            panic!("expected generic enum declaration");
+        };
+        assert_eq!(name, "Option");
+        assert_eq!(generic_params, &["T".to_string()]);
+        assert_eq!(functions.len(), 2);
+        assert!(matches!(
+            &functions[0],
+            Node::FunctionDeclaration { name, parameters, .. }
+                if name == "is_some" && parameters[0].1 == Type::SkSelf
+        ));
+        assert!(matches!(
+            &functions[1],
+            Node::FunctionDeclaration { name, return_type, .. }
+                if name == "empty"
+                    && return_type == &Type::GenericInstance {
+                        base: "Option".to_string(),
+                        type_arguments: vec![Type::Custom("T".to_string())],
+                    }
+        ));
+    }
+
+    #[test]
+    fn test_enum_attach_rejects_static_function_that_conflicts_with_variant() {
+        let error = try_parse(
+            r#"
+            enum Option[T] {
+                Some(T);
+                None;
+            }
+
+            attach[T] Option[T] {
+                function Some(value: T): Option[T] {
+                    return Option::Some(value);
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains(
+            "static attached function `Some` on enum `Option` conflicts with a variant constructor"
+        ));
+    }
+
+    #[test]
     fn test_generic_function_declaration() {
         let source_code = r#"
             function id[T](value: T): T {
@@ -4882,6 +5028,7 @@ mod tests {
                             ],
                         },
                     ],
+                    functions: vec![],
                 },
                 Node::Match {
                     value: Box::new(Node::Access {
