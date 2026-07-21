@@ -1266,7 +1266,11 @@ impl<'a> FunctionCompiler<'a> {
                     }
                 };
                 match expected {
-                    Some(LlvmType::TraitObject(_) | LlvmType::TraitIntersection(_)) => {
+                    Some(
+                        LlvmType::TraitObject(_)
+                        | LlvmType::TraitIntersection(_)
+                        | LlvmType::Union(_),
+                    ) => {
                         let inferred = LlvmType::Struct(struct_name.to_string());
                         self.compile_struct_literal(struct_name, fields, &inferred)
                     }
@@ -7319,6 +7323,40 @@ mod tests {
                 second: Value = "skunk";
                 a: Either[int] = forward(first);
                 b: Either[int] = forward(second);
+                print(42);
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(stdout, "42\n");
+    }
+
+    #[test]
+    fn runs_compiled_generic_subtype_bounds_program() {
+        let stdout = compile_and_run(
+            r#"
+            trait Animal {}
+
+            struct Dog {}
+            struct Cat {}
+
+            conform Animal for Dog {}
+            conform Animal for Cat {}
+
+            function choose[T <: Animal](left: T, right: T, first: bool): T {
+                if (first) {
+                    return left;
+                }
+                return right;
+            }
+
+            function widen[A, B >: A <: Animal](left: A, right: B): B {
+                return left;
+            }
+
+            function main(): void {
+                first: Dog | Cat = choose(Dog {}, Cat {}, true);
+                second: Dog | Cat = widen(Dog {}, Cat {});
                 print(42);
             }
             "#,

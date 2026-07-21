@@ -207,6 +207,7 @@ impl ModuleNormalizer {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 target_type,
             } => {
                 if !top_level {
@@ -223,12 +224,18 @@ impl ModuleNormalizer {
                 let type_scope = generic_params.iter().cloned().collect::<HashSet<_>>();
                 type_scopes.push(type_scope);
                 let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let subtype_bounds = self.rename_subtype_bounds(
+                    subtype_bounds,
+                    value_scopes,
+                    type_scopes,
+                )?;
                 let target_type = self.rename_type(target_type, value_scopes, type_scopes)?;
                 type_scopes.pop();
                 Node::TypeAliasDeclaration {
                     name: renamed_name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     target_type,
                 }
             }
@@ -370,6 +377,7 @@ impl ModuleNormalizer {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 parameters,
                 return_type,
                 body,
@@ -389,6 +397,11 @@ impl ModuleNormalizer {
                 }
                 type_scopes.push(type_scope);
                 let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let subtype_bounds = self.rename_subtype_bounds(
+                    subtype_bounds,
+                    value_scopes,
+                    type_scopes,
+                )?;
                 let mut local_scope = HashSet::new();
                 let parameters = parameters
                     .into_iter()
@@ -409,6 +422,7 @@ impl ModuleNormalizer {
                     name: renamed_name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     parameters,
                     return_type,
                     body,
@@ -511,6 +525,7 @@ impl ModuleNormalizer {
             Node::ImplDeclaration {
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 trait_names,
                 target_type,
             } => {
@@ -520,6 +535,11 @@ impl ModuleNormalizer {
                 }
                 type_scopes.push(type_scope);
                 let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let subtype_bounds = self.rename_subtype_bounds(
+                    subtype_bounds,
+                    value_scopes,
+                    type_scopes,
+                )?;
                 let trait_names = trait_names
                     .into_iter()
                     .map(|name| self.rename_type_name(&name, type_scopes))
@@ -529,6 +549,7 @@ impl ModuleNormalizer {
                 Node::ImplDeclaration {
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     trait_names,
                     target_type,
                 }
@@ -569,6 +590,7 @@ impl ModuleNormalizer {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 fields,
                 functions,
             } => {
@@ -586,6 +608,11 @@ impl ModuleNormalizer {
                 }
                 type_scopes.push(type_scope);
                 let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let subtype_bounds = self.rename_subtype_bounds(
+                    subtype_bounds,
+                    value_scopes,
+                    type_scopes,
+                )?;
                 let fields = fields
                     .into_iter()
                     .map(|(field_name, field_type)| {
@@ -604,6 +631,7 @@ impl ModuleNormalizer {
                     name: renamed_name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     fields,
                     functions,
                 }
@@ -641,6 +669,7 @@ impl ModuleNormalizer {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 variants,
             } => {
                 let renamed_name = if top_level && !exported {
@@ -657,6 +686,11 @@ impl ModuleNormalizer {
                 }
                 type_scopes.push(type_scope);
                 let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let subtype_bounds = self.rename_subtype_bounds(
+                    subtype_bounds,
+                    value_scopes,
+                    type_scopes,
+                )?;
                 let variants = variants
                     .into_iter()
                     .map(|variant| {
@@ -677,6 +711,7 @@ impl ModuleNormalizer {
                     name: renamed_name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     variants,
                 }
             }
@@ -1042,6 +1077,32 @@ impl ModuleNormalizer {
                 )
             })
             .collect())
+    }
+
+    fn rename_subtype_bounds(
+        &self,
+        subtype_bounds: HashMap<String, ast::SubtypeBounds>,
+        value_scopes: &mut Vec<HashSet<String>>,
+        type_scopes: &mut Vec<HashSet<String>>,
+    ) -> Result<HashMap<String, ast::SubtypeBounds>, String> {
+        subtype_bounds
+            .into_iter()
+            .map(|(param, bounds)| {
+                Ok((
+                    param,
+                    ast::SubtypeBounds {
+                        lower: bounds
+                            .lower
+                            .map(|bound| self.rename_type(bound, value_scopes, type_scopes))
+                            .transpose()?,
+                        upper: bounds
+                            .upper
+                            .map(|bound| self.rename_type(bound, value_scopes, type_scopes))
+                            .transpose()?,
+                    },
+                ))
+            })
+            .collect()
     }
 
     fn rename_type(

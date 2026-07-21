@@ -285,6 +285,7 @@ impl GlobalScope {
             Node::ImplDeclaration {
                 generic_params,
                 generic_bounds: _,
+                subtype_bounds: _,
                 trait_names,
                 target_type,
             } => {

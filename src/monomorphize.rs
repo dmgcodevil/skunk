@@ -7,6 +7,7 @@ struct FunctionTemplate {
     name: String,
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
+    subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     parameters: Vec<(String, Type)>,
     return_type: Type,
     body: Vec<Node>,
@@ -17,6 +18,7 @@ struct StructTemplate {
     name: String,
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
+    subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     fields: Vec<(String, Type)>,
     functions: Vec<Node>,
 }
@@ -26,6 +28,7 @@ struct EnumTemplate {
     name: String,
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
+    subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     variants: Vec<ast::EnumVariant>,
 }
 
@@ -46,6 +49,7 @@ struct ShapeTemplate {
 struct ImplTemplate {
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
+    subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     trait_names: Vec<String>,
     target_type: Type,
 }
@@ -61,6 +65,7 @@ struct TypeAliasTemplate {
     name: String,
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
+    subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     target_type: Type,
 }
 
@@ -171,6 +176,7 @@ impl Monomorphizer {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     parameters,
                     return_type,
                     body,
@@ -182,6 +188,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
                             generic_bounds: generic_bounds.clone(),
+                            subtype_bounds: subtype_bounds.clone(),
                             parameters: parameters.clone(),
                             return_type: return_type.clone(),
                             body: body.clone(),
@@ -201,6 +208,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: Vec::new(),
                             generic_bounds: HashMap::new(),
+                            subtype_bounds: HashMap::new(),
                             parameters: parameters.clone(),
                             return_type: return_type.clone(),
                             body: body.clone(),
@@ -212,6 +220,7 @@ impl Monomorphizer {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     fields,
                     functions,
                 } => {
@@ -221,6 +230,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
                             generic_bounds: generic_bounds.clone(),
+                            subtype_bounds: subtype_bounds.clone(),
                             fields: fields.clone(),
                             functions: functions.clone(),
                         },
@@ -237,6 +247,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: Vec::new(),
                             generic_bounds: HashMap::new(),
+                            subtype_bounds: HashMap::new(),
                             fields: fields.clone(),
                             functions: functions.clone(),
                         },
@@ -247,6 +258,7 @@ impl Monomorphizer {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     variants,
                 } => {
                     generic_enums.insert(
@@ -255,6 +267,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
                             generic_bounds: generic_bounds.clone(),
+                            subtype_bounds: subtype_bounds.clone(),
                             variants: variants.clone(),
                         },
                     );
@@ -266,6 +279,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: Vec::new(),
                             generic_bounds: HashMap::new(),
+                            subtype_bounds: HashMap::new(),
                             variants: variants.clone(),
                         },
                     );
@@ -299,6 +313,7 @@ impl Monomorphizer {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     target_type,
                 } => {
                     if type_aliases.contains_key(name) {
@@ -310,6 +325,7 @@ impl Monomorphizer {
                             name: name.clone(),
                             generic_params: generic_params.clone(),
                             generic_bounds: generic_bounds.clone(),
+                            subtype_bounds: subtype_bounds.clone(),
                             target_type: target_type.clone(),
                         },
                     );
@@ -317,12 +333,14 @@ impl Monomorphizer {
                 Node::ImplDeclaration {
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     trait_names,
                     target_type,
                 } => {
                     impls.push(ImplTemplate {
                         generic_params: generic_params.clone(),
                         generic_bounds: generic_bounds.clone(),
+                        subtype_bounds: subtype_bounds.clone(),
                         trait_names: trait_names.clone(),
                         target_type: target_type.clone(),
                     });
@@ -521,8 +539,9 @@ impl Monomorphizer {
                     .cloned()
                     .zip(expanded_arguments)
                     .collect::<HashMap<_, _>>();
-                self.check_trait_bounds(
+                self.check_generic_bounds(
                     &template.generic_bounds,
+                    &template.subtype_bounds,
                     &substitutions,
                     &format!("type alias `{}`", template.name),
                 )?;
@@ -762,9 +781,10 @@ impl Monomorphizer {
                         implemented.insert(implied_trait.clone());
                         let implied_key = format!("{}=>{}", implied_trait, target_key);
                         if self.generated_impl_keys.insert(implied_key) {
-                            self.generated_impls.push(Node::ImplDeclaration {
-                                generic_params: Vec::new(),
-                                generic_bounds: HashMap::new(),
+                                self.generated_impls.push(Node::ImplDeclaration {
+                                    generic_params: Vec::new(),
+                                    generic_bounds: HashMap::new(),
+                                    subtype_bounds: HashMap::new(),
                                 trait_names: vec![implied_trait],
                                 target_type: impl_block.target_type.clone(),
                             });
@@ -1047,6 +1067,138 @@ impl Monomorphizer {
         Ok(())
     }
 
+    fn check_generic_bounds(
+        &mut self,
+        generic_bounds: &HashMap<String, Vec<String>>,
+        subtype_bounds: &HashMap<String, ast::SubtypeBounds>,
+        substitutions: &HashMap<String, Type>,
+        context: &str,
+    ) -> Result<(), String> {
+        self.check_trait_bounds(generic_bounds, substitutions, context)?;
+        for (param, bounds) in subtype_bounds {
+            let actual = substitutions
+                .get(param)
+                .ok_or_else(|| format!("missing type argument `{}` for {}", param, context))?;
+            let actual = self.expand_type(actual)?;
+            if let Some(lower) = &bounds.lower {
+                let lower = self.apply_substitutions(lower, substitutions);
+                let lower = self.expand_type(&lower)?;
+                if !self.is_subtype(&lower, &actual)? {
+                    return Err(format!(
+                        "{} requires `{}` to be a supertype of `{}`, but found `{}`",
+                        context,
+                        param,
+                        ast::type_to_string(&lower),
+                        ast::type_to_string(&actual)
+                    ));
+                }
+            }
+            if let Some(upper) = &bounds.upper {
+                let upper = self.apply_substitutions(upper, substitutions);
+                let upper = self.expand_type(&upper)?;
+                if !self.is_subtype(&actual, &upper)? {
+                    return Err(format!(
+                        "{} requires `{}` to be a subtype of `{}`, but found `{}`",
+                        context,
+                        param,
+                        ast::type_to_string(&upper),
+                        ast::type_to_string(&actual)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_subtype(&mut self, subtype: &Type, supertype: &Type) -> Result<bool, String> {
+        let subtype = ast::strip_binding_const(subtype);
+        let supertype = ast::strip_binding_const(supertype);
+        let subtype = ast::unwrap_const_view(&subtype);
+        let supertype = ast::unwrap_const_view(&supertype);
+
+        if subtype == supertype {
+            return Ok(true);
+        }
+        match (subtype, supertype) {
+            (Type::Intersection(children), Type::Intersection(parents)) => {
+                for parent in parents {
+                    let mut implied = false;
+                    for child in children {
+                        if self.is_subtype(child, parent)? {
+                            implied = true;
+                            break;
+                        }
+                    }
+                    if !implied {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Type::Union(members), supertype) => {
+                for member in members {
+                    if !self.is_subtype(member, supertype)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (subtype, Type::Union(members)) => {
+                for member in members {
+                    if self.is_subtype(subtype, member)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            (Type::Intersection(members), supertype) => {
+                for member in members {
+                    if self.is_subtype(member, supertype)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            (subtype, Type::Intersection(members)) => {
+                for member in members {
+                    if !self.is_subtype(subtype, member)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Type::Custom(child), Type::Custom(parent))
+                if self.traits.contains_key(child) && self.traits.contains_key(parent) =>
+            {
+                self.trait_extends(child, parent)
+            }
+            (subtype, Type::Custom(trait_name)) if self.traits.contains_key(trait_name) => {
+                self.type_implements_trait(subtype, trait_name)
+            }
+            (
+                Type::Reference {
+                    target_type: child,
+                    mutable: false,
+                },
+                Type::Reference {
+                    target_type: parent,
+                    mutable: false,
+                },
+            ) => self.is_subtype(child, parent),
+            (
+                Type::Reference {
+                    target_type: child,
+                    mutable: true,
+                },
+                Type::Reference {
+                    target_type: parent,
+                    mutable: true,
+                },
+            ) => Ok(child == parent),
+            _ => Ok(false),
+        }
+    }
+
     fn constraint_kind(&self, name: &str) -> Option<ConstraintKind> {
         if self.traits.contains_key(name) {
             Some(ConstraintKind::Trait)
@@ -1091,8 +1243,9 @@ impl Monomorphizer {
             {
                 continue;
             }
-            self.check_trait_bounds(
+            self.check_generic_bounds(
                 &impl_block.generic_bounds,
+                &impl_block.subtype_bounds,
                 &substitutions,
                 &format!(
                     "generic impl of trait `{}` for `{}`",
@@ -1208,8 +1361,9 @@ impl Monomorphizer {
             {
                 continue;
             } else {
-                self.check_trait_bounds(
+                self.check_generic_bounds(
                     &impl_block.generic_bounds,
+                    &impl_block.subtype_bounds,
                     &substitutions,
                     &format!(
                         "generic impl target `{}`",
@@ -1227,6 +1381,7 @@ impl Monomorphizer {
                     self.generated_impls.push(Node::ImplDeclaration {
                         generic_params: Vec::new(),
                         generic_bounds: HashMap::new(),
+                        subtype_bounds: HashMap::new(),
                         trait_names: vec![implied_trait],
                         target_type: concrete_type.clone(),
                     });
@@ -2990,8 +3145,9 @@ impl Monomorphizer {
                     )
                     .collect::<HashMap<_, _>>()
             };
-            self.check_trait_bounds(
+            self.check_generic_bounds(
                 &template.generic_bounds,
+                &template.subtype_bounds,
                 &substitutions,
                 &format!("generic function `{}`", template.name),
             )?;
@@ -3052,7 +3208,7 @@ impl Monomorphizer {
     }
 
     fn infer_generic_function_arguments(
-        &self,
+        &mut self,
         template: &FunctionTemplate,
         argument_types: &[Vec<Type>],
         expected_type: Option<&Type>,
@@ -3069,20 +3225,62 @@ impl Monomorphizer {
             ));
         }
         for ((_, parameter_type), argument_type) in parameter_types.iter().zip(first_args.iter()) {
-            self.unify_generic_type(
+            if let Some((param, candidate)) = self.direct_generic_candidate(
                 parameter_type,
                 argument_type,
                 &template.generic_params,
-                &mut substitutions,
-            )?;
+            ) {
+                self.merge_inferred_lower(&param, &candidate, &mut substitutions)?;
+            } else {
+                self.unify_generic_type(
+                    parameter_type,
+                    argument_type,
+                    &template.generic_params,
+                    &mut substitutions,
+                )?;
+            }
         }
         if let Some(expected_type) = expected_type {
-            self.unify_generic_type(
+            if let Some((param, candidate)) = self.direct_generic_candidate(
                 &template.return_type,
                 expected_type,
                 &template.generic_params,
-                &mut substitutions,
-            )?;
+            ) {
+                substitutions.entry(param).or_insert(candidate);
+            } else {
+                self.unify_generic_type(
+                    &template.return_type,
+                    expected_type,
+                    &template.generic_params,
+                    &mut substitutions,
+                )?;
+            }
+        }
+
+        for _ in 0..=template.generic_params.len() {
+            let mut changed = false;
+            for param in &template.generic_params {
+                let Some(bounds) = template.subtype_bounds.get(param) else {
+                    continue;
+                };
+                let Some(lower) = &bounds.lower else {
+                    continue;
+                };
+                let lower = self.apply_substitutions(lower, &substitutions);
+                if contains_unresolved_generic(
+                    &lower,
+                    &template.generic_params,
+                    &substitutions,
+                ) {
+                    continue;
+                }
+                let previous = substitutions.get(param).cloned();
+                self.merge_inferred_lower(param, &lower, &mut substitutions)?;
+                changed |= substitutions.get(param) != previous.as_ref();
+            }
+            if !changed {
+                break;
+            }
         }
         for generic_param in &template.generic_params {
             if !substitutions.contains_key(generic_param) {
@@ -3093,6 +3291,53 @@ impl Monomorphizer {
             }
         }
         Ok(substitutions)
+    }
+
+    fn direct_generic_candidate(
+        &self,
+        pattern: &Type,
+        actual: &Type,
+        generic_params: &[String],
+    ) -> Option<(String, Type)> {
+        match pattern {
+            Type::BindingConst { inner } => self.direct_generic_candidate(
+                inner,
+                ast::unwrap_binding_const(actual),
+                generic_params,
+            ),
+            Type::Const { inner } => self.direct_generic_candidate(
+                inner,
+                ast::unwrap_const_view(actual),
+                generic_params,
+            ),
+            Type::Custom(name) if generic_params.iter().any(|param| param == name) => {
+                Some((name.clone(), actual.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn merge_inferred_lower(
+        &mut self,
+        param: &str,
+        candidate: &Type,
+        substitutions: &mut HashMap<String, Type>,
+    ) -> Result<(), String> {
+        let candidate = self.expand_type(candidate)?;
+        let Some(existing) = substitutions.get(param).cloned() else {
+            substitutions.insert(param.to_string(), candidate);
+            return Ok(());
+        };
+        let existing = self.expand_type(&existing)?;
+        let widened = if self.is_subtype(&existing, &candidate)? {
+            candidate
+        } else if self.is_subtype(&candidate, &existing)? {
+            existing
+        } else {
+            self.expand_type(&Type::Union(vec![existing, candidate]))?
+        };
+        substitutions.insert(param.to_string(), widened);
+        Ok(())
     }
 
     fn unify_generic_type(
@@ -3297,8 +3542,9 @@ impl Monomorphizer {
         template: &FunctionTemplate,
         substitutions: &HashMap<String, Type>,
     ) -> Result<String, String> {
-        self.check_trait_bounds(
+        self.check_generic_bounds(
             &template.generic_bounds,
+            &template.subtype_bounds,
             substitutions,
             &format!("generic function `{}`", template.name),
         )?;
@@ -3358,8 +3604,9 @@ impl Monomorphizer {
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
-                self.check_trait_bounds(
+                self.check_generic_bounds(
                     &template.generic_bounds,
+                    &template.subtype_bounds,
                     &substitutions,
                     &format!("generic struct `{}`", base),
                 )?;
@@ -3416,8 +3663,9 @@ impl Monomorphizer {
                     .cloned()
                     .zip(type_arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
-                self.check_trait_bounds(
+                self.check_generic_bounds(
                     &template.generic_bounds,
+                    &template.subtype_bounds,
                     &substitutions,
                     &format!("generic enum `{}`", base),
                 )?;
@@ -3944,6 +4192,42 @@ impl Monomorphizer {
             Literal::Boolean(_) => Ok(Type::Boolean),
             Literal::Char(_) => Ok(Type::Char),
         }
+    }
+}
+
+fn contains_unresolved_generic(
+    sk_type: &Type,
+    generic_params: &[String],
+    substitutions: &HashMap<String, Type>,
+) -> bool {
+    match sk_type {
+        Type::Custom(name) => {
+            generic_params.iter().any(|param| param == name)
+                && !substitutions.contains_key(name)
+        }
+        Type::Const { inner } | Type::BindingConst { inner } => {
+            contains_unresolved_generic(inner, generic_params, substitutions)
+        }
+        Type::Array { elem_type, .. } | Type::Slice { elem_type } => {
+            contains_unresolved_generic(elem_type, generic_params, substitutions)
+        }
+        Type::Reference { target_type, .. } | Type::Pointer { target_type } => {
+            contains_unresolved_generic(target_type, generic_params, substitutions)
+        }
+        Type::GenericInstance { type_arguments, .. }
+        | Type::Union(type_arguments)
+        | Type::Intersection(type_arguments) => type_arguments
+            .iter()
+            .any(|argument| contains_unresolved_generic(argument, generic_params, substitutions)),
+        Type::Function {
+            parameters,
+            return_type,
+        } => {
+            parameters.iter().any(|parameter| {
+                contains_unresolved_generic(parameter, generic_params, substitutions)
+            }) || contains_unresolved_generic(return_type, generic_params, substitutions)
+        }
+        _ => false,
     }
 }
 
@@ -4530,5 +4814,196 @@ mod tests {
         );
         let error = prepare_program(&program).unwrap_err();
         assert!(error.contains("intersection member `int` is not a trait"));
+    }
+
+    #[test]
+    fn accepts_upper_subtype_bound_for_conforming_type() {
+        let statements = prepared_statements(
+            r#"
+            trait Animal {
+                function sound(self): int;
+            }
+
+            struct Dog {}
+
+            conform Animal for Dog {
+                function sound(self): int { return 1; }
+            }
+
+            function identity[T <: Animal](value: T): T {
+                return value;
+            }
+
+            function main(): void {
+                dog: Dog = identity(Dog {});
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::FunctionDeclaration { name, .. } if name == "identity__Dog"
+        )));
+    }
+
+    #[test]
+    fn accepts_trait_intersection_as_upper_bound() {
+        let statements = prepared_statements(
+            r#"
+            trait Animal {}
+            trait Serializable {}
+
+            struct Dog {}
+            conform Animal for Dog {}
+            conform Serializable for Dog {}
+
+            function identity[T <: Animal & Serializable](value: T): T {
+                return value;
+            }
+
+            function main(): void {
+                dog: Dog = identity(Dog {});
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::FunctionDeclaration { name, .. } if name == "identity__Dog"
+        )));
+    }
+
+    #[test]
+    fn rejects_upper_subtype_bound_violation() {
+        let program = ast::parse(
+            r#"
+            trait Animal {}
+
+            function identity[T <: Animal](value: T): T {
+                return value;
+            }
+
+            function main(): void {
+                value: int = identity(1);
+            }
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains(
+            "generic function `identity` requires `T` to be a subtype of `Animal`, but found `int`"
+        ));
+    }
+
+    #[test]
+    fn numeric_conversion_is_not_subtyping() {
+        let program = ast::parse(
+            r#"
+            function identity[T <: long](value: T): T {
+                return value;
+            }
+
+            function main(): void {
+                value: int = identity(1);
+            }
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains(
+            "generic function `identity` requires `T` to be a subtype of `long`, but found `int`"
+        ));
+    }
+
+    #[test]
+    fn checks_subtype_bounds_on_generic_type_aliases() {
+        let program = ast::parse(
+            r#"
+            trait Animal {}
+            type Pet[T <: Animal] = T | string;
+
+            function main(): void {
+                pet: Pet[int] = 1;
+            }
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains(
+            "type alias `Pet` requires `T` to be a subtype of `Animal`, but found `int`"
+        ));
+    }
+
+    #[test]
+    fn rejects_lower_subtype_bound_violation_for_explicit_argument() {
+        let program = ast::parse(
+            r#"
+            struct Dog {}
+            struct Cat {}
+
+            function keep[T >: Dog](value: T): T {
+                return value;
+            }
+
+            function main(): void {
+                cat: Cat = keep[Cat](Cat {});
+            }
+            "#,
+        );
+        let error = prepare_program(&program).unwrap_err();
+        assert!(error.contains(
+            "generic function `keep` requires `T` to be a supertype of `Dog`, but found `Cat`"
+        ));
+    }
+
+    #[test]
+    fn widens_direct_generic_lower_constraints_to_union() {
+        let statements = prepared_statements(
+            r#"
+            struct Dog {}
+            struct Cat {}
+
+            function choose[T](left: T, right: T, first: bool): T {
+                if (first) {
+                    return left;
+                }
+                return right;
+            }
+
+            function main(): void {
+                pet: Dog | Cat = choose(Dog {}, Cat {}, true);
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::FunctionDeclaration { name, .. }
+                if name == "choose__union_Cat_or_Dog"
+        )));
+    }
+
+    #[test]
+    fn inferred_lower_bound_can_reference_another_type_parameter() {
+        let statements = prepared_statements(
+            r#"
+            struct Dog {}
+            struct Cat {}
+
+            function choose[A, B >: A](left: A, right: B, first: bool): B {
+                if (first) {
+                    return left;
+                }
+                return right;
+            }
+
+            function main(): void {
+                pet: Dog | Cat = choose(Dog {}, Cat {}, true);
+            }
+            "#,
+        );
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            Node::FunctionDeclaration { name, .. }
+                if name == "choose__Dog__union_Cat_or_Dog"
+        )));
     }
 }

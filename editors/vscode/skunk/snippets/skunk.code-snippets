@@ -17,6 +17,15 @@
     ],
     "description": "Create a Skunk function"
   },
+  "Bounded Generic Function": {
+    "prefix": "fn-bound",
+    "body": [
+      "function ${1:name}[${2:T} >: ${3:Lower} <: ${4:Upper}](${5:value}: ${2:T}): ${2:T} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Create a function with lower and upper subtype bounds"
+  },
   "Struct": {
     "prefix": "struct",
     "body": [

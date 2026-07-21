@@ -6,6 +6,12 @@ use pest::Parser;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct SubtypeBounds {
+    pub lower: Option<Type>,
+    pub upper: Option<Type>,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Node {
     Program {
@@ -24,6 +30,7 @@ pub enum Node {
         name: String,
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         target_type: Type,
     },
     Block {
@@ -51,12 +58,14 @@ pub enum Node {
     AttachDeclaration {
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         target_type: Type,
         functions: Vec<Node>,
     },
     ConformDeclaration {
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         trait_name: String,
         target_type: Type,
         functions: Vec<Node>,
@@ -64,6 +73,7 @@ pub enum Node {
     ImplDeclaration {
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         trait_names: Vec<String>,
         target_type: Type,
     },
@@ -75,6 +85,7 @@ pub enum Node {
         name: String,
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         fields: Vec<(String, Type)>,
         functions: Vec<Node>,
     },
@@ -82,6 +93,7 @@ pub enum Node {
         name: String,
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         variants: Vec<EnumVariant>,
     },
     VariableDeclaration {
@@ -101,6 +113,7 @@ pub enum Node {
         name: String,
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         parameters: Vec<(String, Type)>,
         return_type: Type,
         body: Vec<Node>,
@@ -820,6 +833,7 @@ impl PestImpl {
         let mut lambda: bool = false;
         let mut generic_params = Vec::<String>::new();
         let mut generic_bounds = HashMap::<String, Vec<String>>::new();
+        let mut subtype_bounds = HashMap::<String, SubtypeBounds>::new();
         let name = match inner_pairs.peek().unwrap().as_rule() {
             Rule::IDENTIFIER => self.create_identifier(inner_pairs.next().unwrap()),
             _ => {
@@ -830,7 +844,7 @@ impl PestImpl {
         if !lambda {
             if let Some(peeked) = inner_pairs.peek() {
                 if peeked.as_rule() == Rule::generic_params {
-                    (generic_params, generic_bounds) =
+                    (generic_params, generic_bounds, subtype_bounds) =
                         self.create_generic_params(inner_pairs.next().unwrap());
                 }
             }
@@ -848,10 +862,12 @@ impl PestImpl {
         };
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::where_clause {
-                generic_bounds = self.merge_generic_bounds(
-                    generic_bounds,
-                    self.create_where_clause(inner_pairs.next().unwrap()),
-                );
+                let (additional_generic_bounds, additional_subtype_bounds) =
+                    self.create_where_clause(inner_pairs.next().unwrap());
+                generic_bounds =
+                    self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+                subtype_bounds =
+                    self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
             }
         }
         let mut body: Vec<Node> = Vec::new();
@@ -859,7 +875,10 @@ impl PestImpl {
             body.push(self.create_ast(statement))
         }
         if let Identifier(s) = name {
-            if generic_params.is_empty() && generic_bounds.is_empty() {
+            if generic_params.is_empty()
+                && generic_bounds.is_empty()
+                && subtype_bounds.is_empty()
+            {
                 Node::FunctionDeclaration {
                     name: s,
                     parameters,
@@ -872,6 +891,7 @@ impl PestImpl {
                     name: s,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     parameters,
                     return_type,
                     body,
@@ -1221,18 +1241,21 @@ impl PestImpl {
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut generic_params = Vec::<String>::new();
         let mut generic_bounds = HashMap::<String, Vec<String>>::new();
+        let mut subtype_bounds = HashMap::<String, SubtypeBounds>::new();
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::generic_params {
-                (generic_params, generic_bounds) =
+                (generic_params, generic_bounds, subtype_bounds) =
                     self.create_generic_params(inner_pairs.next().unwrap());
             }
         }
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::where_clause {
-                generic_bounds = self.merge_generic_bounds(
-                    generic_bounds,
-                    self.create_where_clause(inner_pairs.next().unwrap()),
-                );
+                let (additional_generic_bounds, additional_subtype_bounds) =
+                    self.create_where_clause(inner_pairs.next().unwrap());
+                generic_bounds =
+                    self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+                subtype_bounds =
+                    self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
             }
         }
         let mut fields: Vec<(String, Type)> = Vec::new();
@@ -1242,7 +1265,7 @@ impl PestImpl {
                 _ => panic!("unsupported rule {}", p),
             }
         }
-        if generic_params.is_empty() && generic_bounds.is_empty() {
+        if generic_params.is_empty() && generic_bounds.is_empty() && subtype_bounds.is_empty() {
             Node::StructDeclaration {
                 name,
                 fields,
@@ -1253,6 +1276,7 @@ impl PestImpl {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 fields,
                 functions: Vec::new(),
             }
@@ -1265,30 +1289,34 @@ impl PestImpl {
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut generic_params = Vec::<String>::new();
         let mut generic_bounds = HashMap::<String, Vec<String>>::new();
+        let mut subtype_bounds = HashMap::<String, SubtypeBounds>::new();
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::generic_params {
-                (generic_params, generic_bounds) =
+                (generic_params, generic_bounds, subtype_bounds) =
                     self.create_generic_params(inner_pairs.next().unwrap());
             }
         }
         if let Some(peeked) = inner_pairs.peek() {
             if peeked.as_rule() == Rule::where_clause {
-                generic_bounds = self.merge_generic_bounds(
-                    generic_bounds,
-                    self.create_where_clause(inner_pairs.next().unwrap()),
-                );
+                let (additional_generic_bounds, additional_subtype_bounds) =
+                    self.create_where_clause(inner_pairs.next().unwrap());
+                generic_bounds =
+                    self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+                subtype_bounds =
+                    self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
             }
         }
         let variants = inner_pairs
             .map(|p| self.create_enum_variant_decl(p))
             .collect::<Vec<_>>();
-        if generic_params.is_empty() && generic_bounds.is_empty() {
+        if generic_params.is_empty() && generic_bounds.is_empty() && subtype_bounds.is_empty() {
             Node::EnumDeclaration { name, variants }
         } else {
             Node::GenericEnumDeclaration {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds,
                 variants,
             }
         }
@@ -1298,19 +1326,20 @@ impl PestImpl {
         assert_eq!(pair.as_rule(), Rule::type_alias_decl);
         let mut inner_pairs = pair.into_inner().peekable();
         let name = inner_pairs.next().unwrap().as_str().to_string();
-        let (generic_params, generic_bounds) = if inner_pairs
+        let (generic_params, generic_bounds, subtype_bounds) = if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
         {
             self.create_generic_params(inner_pairs.next().unwrap())
         } else {
-            (Vec::new(), HashMap::new())
+            (Vec::new(), HashMap::new(), HashMap::new())
         };
         let target_type = self.create_type(inner_pairs.next().unwrap());
         Node::TypeAliasDeclaration {
             name,
             generic_params,
             generic_bounds,
+            subtype_bounds,
             target_type,
         }
     }
@@ -1409,28 +1438,31 @@ impl PestImpl {
     fn create_attach_decl(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::attach_decl);
         let mut inner_pairs = pair.into_inner().peekable();
-        let (generic_params, mut generic_bounds) = if inner_pairs
+        let (generic_params, mut generic_bounds, mut subtype_bounds) = if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
         {
             self.create_generic_params(inner_pairs.next().unwrap())
         } else {
-            (Vec::new(), HashMap::new())
+            (Vec::new(), HashMap::new(), HashMap::new())
         };
         let target_type = self.create_type(inner_pairs.next().unwrap());
         if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::where_clause)
         {
-            generic_bounds = self.merge_generic_bounds(
-                generic_bounds,
-                self.create_where_clause(inner_pairs.next().unwrap()),
-            );
+            let (additional_generic_bounds, additional_subtype_bounds) =
+                self.create_where_clause(inner_pairs.next().unwrap());
+            generic_bounds =
+                self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+            subtype_bounds =
+                self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
         }
         let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
         Node::AttachDeclaration {
             generic_params,
             generic_bounds,
+            subtype_bounds,
             target_type,
             functions,
         }
@@ -1439,13 +1471,13 @@ impl PestImpl {
     fn create_conform_decl(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::conform_decl);
         let mut inner_pairs = pair.into_inner().peekable();
-        let (generic_params, mut generic_bounds) = if inner_pairs
+        let (generic_params, mut generic_bounds, mut subtype_bounds) = if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
         {
             self.create_generic_params(inner_pairs.next().unwrap())
         } else {
-            (Vec::new(), HashMap::new())
+            (Vec::new(), HashMap::new(), HashMap::new())
         };
         let trait_name = inner_pairs.next().unwrap().as_str().to_string();
         let target_type = self.create_type(inner_pairs.next().unwrap());
@@ -1453,15 +1485,18 @@ impl PestImpl {
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::where_clause)
         {
-            generic_bounds = self.merge_generic_bounds(
-                generic_bounds,
-                self.create_where_clause(inner_pairs.next().unwrap()),
-            );
+            let (additional_generic_bounds, additional_subtype_bounds) =
+                self.create_where_clause(inner_pairs.next().unwrap());
+            generic_bounds =
+                self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+            subtype_bounds =
+                self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
         }
         let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
         Node::ConformDeclaration {
             generic_params,
             generic_bounds,
+            subtype_bounds,
             trait_name,
             target_type,
             functions,
@@ -1498,14 +1533,21 @@ impl PestImpl {
                 Node::AttachDeclaration {
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     target_type,
                     functions,
                 } => {
-                    self.validate_declared_generic_bounds("attach", generic_params, generic_bounds)?;
+                    self.validate_declared_generic_bounds(
+                        "attach",
+                        generic_params,
+                        generic_bounds,
+                        subtype_bounds,
+                    )?;
                     let target_name = self.validate_behavior_target(
                         "attach",
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                         target_type,
                         &declared_structs,
                     )?;
@@ -1520,6 +1562,7 @@ impl PestImpl {
                 Node::ConformDeclaration {
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     trait_name,
                     target_type,
                     functions,
@@ -1528,11 +1571,13 @@ impl PestImpl {
                         &format!("conform `{}`", trait_name),
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                     )?;
                     let target_name = self.validate_behavior_target(
                         &format!("conform `{}`", trait_name),
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                         target_type,
                         &declared_structs,
                     )?;
@@ -1562,6 +1607,7 @@ impl PestImpl {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     fields,
                     ..
                 } => {
@@ -1569,12 +1615,14 @@ impl PestImpl {
                         &format!("struct `{}`", name),
                         &generic_params,
                         &generic_bounds,
+                        &subtype_bounds,
                     )?;
                     output.push(Node::GenericStructDeclaration {
                         functions: merged_functions.remove(&name).unwrap_or_default(),
                         name,
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                         fields,
                     });
                 }
@@ -1582,6 +1630,7 @@ impl PestImpl {
                 Node::ConformDeclaration {
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     trait_name,
                     target_type,
                     ..
@@ -1590,10 +1639,12 @@ impl PestImpl {
                         &format!("conform `{}`", trait_name),
                         &generic_params,
                         &generic_bounds,
+                        &subtype_bounds,
                     )?;
                     output.push(Node::ImplDeclaration {
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                         trait_names: vec![trait_name],
                         target_type,
                     });
@@ -1602,17 +1653,20 @@ impl PestImpl {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     variants,
                 } => {
                     self.validate_declared_generic_bounds(
                         &format!("enum `{}`", name),
                         &generic_params,
                         &generic_bounds,
+                        &subtype_bounds,
                     )?;
                     output.push(Node::GenericEnumDeclaration {
                         name,
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                         variants,
                     });
                 }
@@ -1620,6 +1674,7 @@ impl PestImpl {
                     name,
                     generic_params,
                     generic_bounds,
+                    subtype_bounds,
                     parameters,
                     return_type,
                     body,
@@ -1629,11 +1684,13 @@ impl PestImpl {
                         &format!("function `{}`", name),
                         &generic_params,
                         &generic_bounds,
+                        &subtype_bounds,
                     )?;
                     output.push(Node::GenericFunctionDeclaration {
                         name,
                         generic_params,
                         generic_bounds,
+                        subtype_bounds,
                         parameters,
                         return_type,
                         body,
@@ -1652,6 +1709,7 @@ impl PestImpl {
         kind: &str,
         generic_params: &[String],
         generic_bounds: &HashMap<String, Vec<String>>,
+        subtype_bounds: &HashMap<String, SubtypeBounds>,
         target_type: &Type,
         declared_structs: &HashMap<String, Vec<String>>,
     ) -> Result<String, String> {
@@ -1715,7 +1773,7 @@ impl PestImpl {
             ));
         }
 
-        if kind == "attach" && !generic_bounds.is_empty() {
+        if kind == "attach" && (!generic_bounds.is_empty() || !subtype_bounds.is_empty()) {
             return Err("`attach` does not support generic bounds yet".to_string());
         }
 
@@ -1945,32 +2003,92 @@ impl PestImpl {
     fn create_generic_params(
         &self,
         pair: Pair<Rule>,
-    ) -> (Vec<String>, HashMap<String, Vec<String>>) {
+    ) -> (
+        Vec<String>,
+        HashMap<String, Vec<String>>,
+        HashMap<String, SubtypeBounds>,
+    ) {
         assert_eq!(pair.as_rule(), Rule::generic_params);
         let mut params = Vec::new();
         let mut bounds = HashMap::new();
+        let mut subtype_bounds = HashMap::new();
         for param in pair.into_inner() {
             let mut inner_pairs = param.into_inner();
             let name = inner_pairs.next().unwrap().as_str().to_string();
-            let trait_bounds = inner_pairs
-                .map(|p| p.as_str().to_string())
-                .collect::<Vec<_>>();
-            if !trait_bounds.is_empty() {
-                bounds.insert(name.clone(), trait_bounds);
+            for bound in inner_pairs {
+                match bound.as_rule() {
+                    Rule::capability_bounds => {
+                        bounds.insert(
+                            name.clone(),
+                            bound
+                                .into_inner()
+                                .map(|pair| pair.as_str().to_string())
+                                .collect(),
+                        );
+                    }
+                    Rule::subtype_bounds => {
+                        subtype_bounds
+                            .insert(name.clone(), self.create_subtype_bounds(bound));
+                    }
+                    other => panic!("unexpected generic bound rule {:?}", other),
+                }
             }
             params.push(name);
         }
-        (params, bounds)
+        (params, bounds, subtype_bounds)
     }
 
-    fn create_where_clause(&self, pair: Pair<Rule>) -> HashMap<String, Vec<String>> {
+    fn create_where_clause(
+        &self,
+        pair: Pair<Rule>,
+    ) -> (
+        HashMap<String, Vec<String>>,
+        HashMap<String, SubtypeBounds>,
+    ) {
         assert_eq!(pair.as_rule(), Rule::where_clause);
         let mut bounds = HashMap::new();
+        let mut subtype_bounds = HashMap::new();
         for predicate in pair.into_inner() {
             let mut inner_pairs = predicate.into_inner();
             let name = inner_pairs.next().unwrap().as_str().to_string();
-            let trait_bounds = inner_pairs.map(|p| p.as_str().to_string()).collect::<Vec<_>>();
-            bounds.insert(name, trait_bounds);
+            let bound = inner_pairs.next().unwrap();
+            match bound.as_rule() {
+                Rule::capability_bounds => {
+                    let trait_bounds = bound
+                        .into_inner()
+                        .map(|pair| pair.as_str().to_string())
+                        .collect::<Vec<_>>();
+                    let entry = bounds.entry(name).or_insert_with(Vec::new);
+                    for trait_bound in trait_bounds {
+                        if !entry.contains(&trait_bound) {
+                            entry.push(trait_bound);
+                        }
+                    }
+                }
+                Rule::subtype_bounds => {
+                    let additional = HashMap::from([(
+                        name,
+                        self.create_subtype_bounds(bound),
+                    )]);
+                    subtype_bounds = self.merge_subtype_bounds(subtype_bounds, additional);
+                }
+                other => panic!("unexpected where-bound rule {:?}", other),
+            }
+        }
+        (bounds, subtype_bounds)
+    }
+
+    fn create_subtype_bounds(&self, pair: Pair<Rule>) -> SubtypeBounds {
+        assert_eq!(pair.as_rule(), Rule::subtype_bounds);
+        let mut bounds = SubtypeBounds::default();
+        for bound in pair.into_inner() {
+            let rule = bound.as_rule();
+            let target = self.create_type(bound.into_inner().next().unwrap());
+            match rule {
+                Rule::lower_type_bound => bounds.lower = Some(target),
+                Rule::upper_type_bound => bounds.upper = Some(target),
+                other => panic!("unexpected subtype bound rule {:?}", other),
+            }
         }
         bounds
     }
@@ -1991,13 +2109,37 @@ impl PestImpl {
         generic_bounds
     }
 
+    fn merge_subtype_bounds(
+        &self,
+        mut subtype_bounds: HashMap<String, SubtypeBounds>,
+        additional_bounds: HashMap<String, SubtypeBounds>,
+    ) -> HashMap<String, SubtypeBounds> {
+        for (param, additional) in additional_bounds {
+            let entry = subtype_bounds.entry(param).or_default();
+            if let Some(lower) = additional.lower {
+                entry.lower = Some(match entry.lower.take() {
+                    Some(existing) => Type::Union(vec![existing, lower]),
+                    None => lower,
+                });
+            }
+            if let Some(upper) = additional.upper {
+                entry.upper = Some(match entry.upper.take() {
+                    Some(existing) => Type::Intersection(vec![existing, upper]),
+                    None => upper,
+                });
+            }
+        }
+        subtype_bounds
+    }
+
     fn validate_declared_generic_bounds(
         &self,
         kind: &str,
         generic_params: &[String],
         generic_bounds: &HashMap<String, Vec<String>>,
+        subtype_bounds: &HashMap<String, SubtypeBounds>,
     ) -> Result<(), String> {
-        for param in generic_bounds.keys() {
+        for param in generic_bounds.keys().chain(subtype_bounds.keys()) {
             if !generic_params.iter().any(|declared| declared == param) {
                 if generic_params.is_empty() {
                     return Err(format!(
@@ -4095,6 +4237,7 @@ mod tests {
                     name: "Box".to_string(),
                     generic_params: vec!["T".to_string()],
                     generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     functions: vec![],
                 },
@@ -4119,6 +4262,7 @@ mod tests {
                     name: "id".to_string(),
                     generic_params: vec!["T".to_string()],
                     generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     return_type: Type::Custom("T".to_string()),
                     body: vec![Node::Return(Some(Box::new(Node::Access {
@@ -4168,6 +4312,7 @@ mod tests {
                 Node::ImplDeclaration {
                     generic_params: vec![],
                     generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     trait_names: vec!["Writer".to_string()],
                     target_type: Type::Custom("TextWriter".to_string()),
                 },
@@ -4194,12 +4339,14 @@ mod tests {
                     name: "Box".to_string(),
                     generic_params: vec!["T".to_string()],
                     generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     functions: vec![],
                 },
                 Node::ImplDeclaration {
                     generic_params: vec!["T".to_string()],
                     generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     trait_names: vec!["Writer".to_string()],
                     target_type: Type::GenericInstance {
                         base: "Box".to_string(),
@@ -4379,6 +4526,7 @@ mod tests {
                         "T".to_string(),
                         vec!["Writer".to_string(), "Flushable".to_string()],
                     )]),
+                    subtype_bounds: HashMap::new(),
                     parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     return_type: Type::Custom("T".to_string()),
                     body: vec![Node::Return(Some(Box::new(Node::Access {
@@ -4410,6 +4558,7 @@ mod tests {
                         "T".to_string(),
                         vec!["Writer".to_string(), "Flushable".to_string()],
                     )]),
+                    subtype_bounds: HashMap::new(),
                     parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     return_type: Type::Custom("T".to_string()),
                     body: vec![Node::Return(Some(Box::new(Node::Access {
@@ -4441,6 +4590,7 @@ mod tests {
                         "T".to_string(),
                         vec!["Writer".to_string(), "Flushable".to_string()],
                     )]),
+                    subtype_bounds: HashMap::new(),
                     parameters: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     return_type: Type::Custom("T".to_string()),
                     body: vec![Node::Return(Some(Box::new(Node::Access {
@@ -4473,6 +4623,100 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_upper_and_lower_subtype_bounds() {
+        let Node::Program { statements } = parse(
+            r#"
+            function choose[A, B >: A <: Animal](left: A, right: B): B {
+                return right;
+            }
+            "#,
+        ) else {
+            panic!("expected program");
+        };
+
+        assert!(matches!(
+            &statements[0],
+            Node::GenericFunctionDeclaration {
+                generic_params,
+                subtype_bounds,
+                ..
+            } if generic_params == &vec!["A".to_string(), "B".to_string()]
+                && subtype_bounds.get("B") == Some(&SubtypeBounds {
+                    lower: Some(Type::Custom("A".to_string())),
+                    upper: Some(Type::Custom("Animal".to_string())),
+                })
+        ));
+    }
+
+    #[test]
+    fn test_where_clause_merges_subtype_bounds() {
+        let Node::Program { statements } = parse(
+            r#"
+            function choose[A, B](left: A, right: B): B
+                where B >: A, B <: Animal, B: Serializable {
+                return right;
+            }
+            "#,
+        ) else {
+            panic!("expected program");
+        };
+
+        assert!(matches!(
+            &statements[0],
+            Node::GenericFunctionDeclaration {
+                generic_bounds,
+                subtype_bounds,
+                ..
+            } if generic_bounds.get("B") == Some(&vec!["Serializable".to_string()])
+                && subtype_bounds.get("B") == Some(&SubtypeBounds {
+                    lower: Some(Type::Custom("A".to_string())),
+                    upper: Some(Type::Custom("Animal".to_string())),
+                })
+        ));
+    }
+
+    #[test]
+    fn test_subtype_bounds_on_generic_type_declarations() {
+        let Node::Program { statements } = parse(
+            r#"
+            type Pet[T <: Animal] = T | string;
+
+            struct Cage[T >: Dog <: Animal] {
+                value: T;
+            }
+
+            enum MaybePet[T <: Animal] {
+                None;
+                Some(T);
+            }
+            "#,
+        ) else {
+            panic!("expected program");
+        };
+
+        assert!(matches!(
+            &statements[0],
+            Node::TypeAliasDeclaration { subtype_bounds, .. }
+                if subtype_bounds.get("T").and_then(|bounds| bounds.upper.as_ref())
+                    == Some(&Type::Custom("Animal".to_string()))
+        ));
+        assert!(matches!(
+            &statements[1],
+            Node::GenericStructDeclaration { subtype_bounds, .. }
+                if subtype_bounds.get("T") == Some(&SubtypeBounds {
+                    lower: Some(Type::Custom("Dog".to_string())),
+                    upper: Some(Type::Custom("Animal".to_string())),
+                })
+        ));
+        assert!(matches!(
+            &statements[2],
+            Node::GenericEnumDeclaration { subtype_bounds, .. }
+                if subtype_bounds.get("T").and_then(|bounds| bounds.upper.as_ref())
+                    == Some(&Type::Custom("Animal".to_string()))
+        ));
+    }
+
+    #[test]
     fn test_generic_struct_where_clause() {
         let source_code = r#"
             struct Box[T] where T: Writer {
@@ -4489,6 +4733,7 @@ mod tests {
                         "T".to_string(),
                         vec!["Writer".to_string()],
                     )]),
+                    subtype_bounds: HashMap::new(),
                     fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     functions: vec![],
                 },
@@ -4562,6 +4807,7 @@ mod tests {
                     name: "PairOrNone".to_string(),
                     generic_params: vec!["A".to_string(), "B".to_string()],
                     generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     variants: vec![
                         EnumVariant {
                             name: "None".to_string(),
@@ -5446,6 +5692,7 @@ mod tests {
                 name,
                 generic_params,
                 generic_bounds,
+                subtype_bounds: _,
                 target_type: Type::Union(members),
             } if name == "Result"
                 && generic_params == &vec!["T".to_string()]

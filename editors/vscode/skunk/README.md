@@ -9,6 +9,7 @@ This extension adds lightweight editor support for Skunk:
 ## What It Supports Today
 
 - `type`, `struct`, `trait`, `shape`, `attach`, and `conform` highlighting
+- Generic capability bounds and subtype operators (`:`, `<:`, and `>:`)
 - Builtin types such as `int`, `float`, `Allocator`, and `Arena`
 - Snippets for common Skunk declarations
 - Format Document support with a simple line-based formatter

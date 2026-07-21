@@ -146,6 +146,11 @@ function createSnippetItems() {
             "function main(): void {\n\t$0\n}"
         ),
         createSnippetItem(
+            "fn-bound",
+            "Create a function with lower and upper subtype bounds",
+            "function ${1:name}[${2:T} >: ${3:Lower} <: ${4:Upper}](${5:value}: ${2:T}): ${2:T} {\n\t$0\n}"
+        ),
+        createSnippetItem(
             "type",
             "Create a type alias",
             "type ${1:Name} = ${2:int};"
