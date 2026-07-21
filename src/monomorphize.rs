@@ -150,33 +150,92 @@ pub fn prepare_program(node: &Node) -> Result<Node, String> {
 }
 
 struct Monomorphizer {
+    /// Generic function declarations indexed by their source name. These are
+    /// templates only; a concrete function node is emitted when a call supplies
+    /// enough type information to specialize one.
     generic_functions: HashMap<String, FunctionTemplate>,
+    /// Non-generic function signatures and extern signatures indexed by name.
+    /// Their original declarations are kept separately in `root_statements`.
     concrete_functions: HashMap<String, FunctionTemplate>,
+    /// Generic struct declarations indexed by their unspecialized source name.
     generic_structs: HashMap<String, StructTemplate>,
+    /// Non-generic struct declarations indexed for field and attached-function
+    /// lookup while the root declarations are transformed.
     concrete_structs: HashMap<String, StructTemplate>,
+    /// Generic enum declarations indexed by their unspecialized source name.
     generic_enums: HashMap<String, EnumTemplate>,
+    /// Non-generic enum declarations indexed for variant and attached-function
+    /// lookup while the root declarations are transformed.
     concrete_enums: HashMap<String, EnumTemplate>,
+    /// Trait templates indexed by name. This starts with source traits and is
+    /// extended with concrete specializations of generic traits as needed.
     traits: HashMap<String, TraitTemplate>,
+    /// Structural shape declarations used to validate capability bounds. Shapes
+    /// guide preparation but do not become runtime declarations.
     shapes: HashMap<String, ShapeTemplate>,
+    /// Transparent type-alias templates. Aliases are expanded during this pass
+    /// and do not appear as declarations in the prepared program.
     type_aliases: HashMap<String, TypeAliasTemplate>,
+    /// Every source `impl` template, both concrete and generic. Generic entries
+    /// are matched and specialized when a concrete target type is requested.
     impls: Vec<ImplTemplate>,
+    /// Known trait conformance by concrete target type string. It is populated
+    /// while validating non-generic impls and reused as a fast path for bound
+    /// and subtype checks; generic impl candidates are matched from `impls`.
     implemented_traits: HashMap<String, HashSet<String>>,
+    /// Non-generic source trait declarations that can be copied directly to the
+    /// beginning of the prepared program.
     root_traits: Vec<Node>,
+    /// Source impl declarations with no impl parameters and only plain named
+    /// trait references, so they can be copied directly to prepared output.
     root_concrete_impls: Vec<Node>,
+    /// Deduplication keys of the form `trait=>target` for concrete impl nodes.
+    /// This includes direct impls and generated impls implied by supertraits.
     generated_impl_keys: HashSet<String>,
+    /// Concrete impl declarations synthesized from generic impl templates,
+    /// specialized trait references, or implied supertrait conformances.
     generated_impls: Vec<Node>,
+    /// Specialized generic functions indexed by their mangled concrete symbol.
+    /// The map both memoizes completed work and stores nodes for final emission.
     generated_functions: HashMap<String, Node>,
+    /// Concrete function symbols in successful generation order. A separate
+    /// sequence is required because `HashMap` iteration order is unspecified;
+    /// it also keeps dependencies discovered during generation ahead of their
+    /// callers when possible.
     generated_function_order: Vec<String>,
+    /// Specialized generic structs indexed by their mangled concrete symbol.
     generated_structs: HashMap<String, Node>,
+    /// Concrete struct symbols in successful generation order, used to emit the
+    /// contents of `generated_structs` deterministically.
     generated_struct_order: Vec<String>,
+    /// Specialized generic enums indexed by their mangled concrete symbol.
     generated_enums: HashMap<String, Node>,
+    /// Concrete enum symbols in successful generation order, used to emit the
+    /// contents of `generated_enums` deterministically.
     generated_enum_order: Vec<String>,
+    /// Specialized generic traits indexed by their mangled concrete symbol.
+    /// These nodes are also registered in `traits` for subsequent lookups.
     generated_traits: HashMap<String, Node>,
+    /// Concrete trait symbols in successful generation order, used to emit the
+    /// contents of `generated_traits` deterministically.
     generated_trait_order: Vec<String>,
+    /// Function specialization symbols currently being constructed. Re-entering
+    /// one means a recursive reference can reuse its symbol instead of trying to
+    /// generate the same function indefinitely.
     function_stack: HashSet<String>,
+    /// Struct specialization symbols currently being constructed, used to stop
+    /// recursive nominal types from repeatedly generating the same struct.
     struct_stack: HashSet<String>,
+    /// Enum specialization symbols currently being constructed, used to stop
+    /// recursive nominal types from repeatedly generating the same enum.
     enum_stack: HashSet<String>,
+    /// Trait specialization symbols currently being constructed. For example,
+    /// a method or bound that refers back to the same concrete generic trait can
+    /// reuse the in-progress symbol instead of recursing forever.
     trait_stack: HashSet<String>,
+    /// Source statements scheduled for normal transformation and emission.
+    /// Declarations retained only as templates, or emitted separately through
+    /// `root_traits` and `root_concrete_impls`, are excluded from this list.
     root_statements: Vec<Node>,
 }
 
