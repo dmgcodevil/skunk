@@ -112,10 +112,21 @@ under version-keyed paths, switching versions never mixes SDK files.
    ```
 
 4. The `Release` workflow (`.github/workflows/release.yml`) triggers on the tag.
-   It runs the test suite, builds all four targets, packages tarballs, generates
-   `SHA256SUMS`, and creates a GitHub Release with the artifacts attached.
-5. Verify the release: download a tarball for your platform, extract, and run
-   `./skunk run examples/fibonacci_recursive.skunk`.
+   It first verifies that the tag matches `Cargo.toml`, then runs the test suite,
+   builds all four targets, smoke-tests native artifacts, verifies that Linux
+   artifacts are static, packages tarballs, generates `SHA256SUMS`, and creates
+   a GitHub Release with the artifacts attached.
+5. Verify the release from a clean temporary directory. For example, on Apple
+   Silicon macOS:
+
+   ```bash
+   TARGET=aarch64-apple-darwin
+   curl -fsSLO "https://github.com/dmgcodevil/skunk/releases/download/v0.1.0/skunk-$TARGET.tar.gz"
+   tar -xzf "skunk-$TARGET.tar.gz"
+   "./skunk-$TARGET/skunk" --version
+   printf 'function main(): void { print("release smoke test"); }\n' > smoke.skunk
+   "./skunk-$TARGET/skunk" run smoke.skunk
+   ```
 
 Nothing is built or packaged on a developer machine; all release artifacts come
 from CI.
@@ -124,11 +135,12 @@ from CI.
 
 | Runner           | Target                        |
 | ---------------- | ----------------------------- |
-| `macos-latest`   | `aarch64-apple-darwin`        |
-| `macos-latest`   | `x86_64-apple-darwin`         |
-| `ubuntu-latest`  | `x86_64-unknown-linux-musl`   |
+| `macos-15`       | `aarch64-apple-darwin`        |
+| `macos-15`       | `x86_64-apple-darwin`         |
+| `ubuntu-24.04`   | `x86_64-unknown-linux-musl`   |
 | `ubuntu-24.04-arm` | `aarch64-unknown-linux-musl` |
 
+Release runners are pinned rather than using moving `*-latest` labels.
 macOS Intel is cross-compiled from the Apple Silicon runner via
 `rustup target add x86_64-apple-darwin` (same OS, different arch — no extra
 toolchain needed). Linux ARM64 builds natively on GitHub's ARM runners, so no

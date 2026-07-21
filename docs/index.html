@@ -27,6 +27,7 @@
                 <a href="#install">Install</a>
                 <a href="#toolchain">Toolchain</a>
                 <a href="#building-an-app">Building an App</a>
+                <a href="#c-interop">C Interop</a>
                 <a href="#standard-library">Standard Library</a>
                 <a href="#native-tests">Native Tests</a>
                 <a href="#programs-and-modules">Programs and Modules</a>
@@ -139,7 +140,66 @@ entry = "src/main.skunk"
 optimize = true
 libraries = ["sqlite3"]
 frameworks = ["Cocoa"]</code></pre>
+                <p>The manifest format is intentionally small. Settings unknown to the current compiler are ignored for forward compatibility and reported as warnings, so misspellings do not disappear silently.</p>
                 <p>Single files still work without a project: <code>skunk run file.skunk</code> and <code>skunk compile file.skunk out</code> are unchanged.</p>
+            </section>
+
+            <section id="c-interop">
+                <h2>C Interop</h2>
+                <p>Skunk can import functions from native libraries with an <code>extern "C"</code> declaration. The declared name is emitted as an unmangled C symbol and can be called like an ordinary Skunk function:</p>
+<pre><code class="language-skunk">extern "C" function cos(value: double): double;
+extern "C" function strlen(value: string): long;
+
+function main(): void {
+    print(cos(0.0));
+    print(strlen("skunk"));
+}</code></pre>
+                <p>The first interop version deliberately exposes a small ABI-safe surface:</p>
+                <table class="reference-table">
+                    <thead>
+                        <tr>
+                            <th>Skunk type</th>
+                            <th>C boundary representation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>byte</code>, <code>short</code>, <code>int</code>, <code>long</code></td>
+                            <td>Signed 8-, 16-, 32-, and 64-bit integers</td>
+                        </tr>
+                        <tr>
+                            <td><code>float</code>, <code>double</code></td>
+                            <td>32- and 64-bit floating-point values</td>
+                        </tr>
+                        <tr>
+                            <td><code>bool</code> / <code>boolean</code></td>
+                            <td>C-compatible boolean value</td>
+                        </tr>
+                        <tr>
+                            <td><code>string</code></td>
+                            <td>C string pointer; ownership and lifetime remain part of the native API contract</td>
+                        </tr>
+                        <tr>
+                            <td><code>*T</code></td>
+                            <td>Raw pointer; aggregates may be passed behind pointers</td>
+                        </tr>
+                        <tr>
+                            <td><code>void</code></td>
+                            <td>Allowed only as a return type</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p>Native libraries are selected through a project manifest. Each <code>libraries</code> entry becomes <code>-l&lt;name&gt;</code>; each <code>frameworks</code> entry becomes <code>-framework &lt;name&gt;</code> on macOS. Both <code>skunk build</code> and project-level <code>skunk test</code> use these settings.</p>
+<pre><code class="language-toml">[build]
+libraries = ["sqlite3"]
+frameworks = ["Cocoa"]</code></pre>
+                <ul>
+                    <li>Skunk currently imports C functions; exporting Skunk functions with a C ABI is not implemented.</li>
+                    <li>Headers are not parsed. Declarations must be written explicitly and must match the native signature.</li>
+                    <li>Variadic functions, link-name aliases, callbacks, and aggregates passed by value are not supported yet.</li>
+                    <li>Safe references, slices, arrays, structs, enums, function values, traits, unions, and intersections cannot cross the C ABI directly.</li>
+                    <li>Passing pointers or strings to native code follows the native library's safety, lifetime, and ownership rules.</li>
+                </ul>
             </section>
 
             <section id="standard-library">
@@ -179,7 +239,7 @@ skunk test --filter shorthand</code></pre>
 FAIL struct shorthand (0.02 ms)
 
 2 tests, 1 passed, 1 failed</code></pre>
-                <p>Available assertions: <code>Testing::expect(condition)</code>, <code>Testing::expect_eq(expected, actual)</code>, and <code>Testing::fail()</code>. A failed assertion marks the test failed but keeps executing, so one run reports every failing assertion. Test blocks are ignored by <code>skunk run</code>, <code>skunk compile</code>, and <code>skunk build</code> — they only compile during <code>skunk test</code>.</p>
+                <p>Available assertions: <code>Testing::expect(condition)</code>, <code>Testing::expect_eq(expected, actual)</code>, and <code>Testing::fail()</code>. In this first version, <code>expect_eq</code> compares <code>int</code> values; use <code>expect</code> for other types. Filters are case-sensitive substring matches. A failed assertion marks the test failed but keeps executing, so one run reports every failing assertion. A process crash still stops the remaining tests because tests currently share one native process. Test blocks are ignored by <code>skunk run</code>, <code>skunk compile</code>, and <code>skunk build</code> — they only compile during <code>skunk test</code>.</p>
             </section>
 
             <section id="programs-and-modules">

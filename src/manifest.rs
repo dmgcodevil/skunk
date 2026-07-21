@@ -27,6 +27,8 @@ pub struct Manifest {
     pub optimize: bool,
     pub libraries: Vec<String>,
     pub frameworks: Vec<String>,
+    /// Non-fatal diagnostics for keys this compiler does not understand.
+    pub warnings: Vec<String>,
 }
 
 impl Default for Manifest {
@@ -37,6 +39,7 @@ impl Default for Manifest {
             optimize: true,
             libraries: Vec::new(),
             frameworks: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -87,9 +90,17 @@ pub fn parse_manifest(contents: &str) -> Result<Manifest, String> {
             ("build", "frameworks") => {
                 manifest.frameworks = parse_string_array(value, line_number)?
             }
-            // Unknown keys are ignored so newer manifests still load in
-            // older compilers.
-            _ => {}
+            // Keep manifests forward-compatible, but make misspellings and
+            // newer settings visible instead of silently dropping them.
+            _ => manifest.warnings.push(format!(
+                "skunk.toml line {}: ignoring unknown key `{}`",
+                line_number,
+                if section.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{}.{}", section, key)
+                }
+            )),
         }
     }
 
@@ -202,13 +213,17 @@ mod tests {
     }
 
     #[test]
-    fn ignores_comments_and_unknown_keys() {
+    fn preserves_comments_and_warns_for_unknown_keys() {
         let manifest = parse_manifest(
             "[package]\nname = \"x\" # inline comment\nfuture_key = \"whatever\"\n",
         )
         .unwrap();
 
         assert_eq!(manifest.name, "x");
+        assert_eq!(
+            manifest.warnings,
+            vec!["skunk.toml line 3: ignoring unknown key `package.future_key`"]
+        );
     }
 
     #[test]

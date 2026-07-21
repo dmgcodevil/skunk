@@ -8,23 +8,43 @@ env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Match tag to Cargo package version
+        id: version
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "skunk") | .version')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "release tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-latest
+          - runner: macos-15
             target: aarch64-apple-darwin
             run_tests: true
-          - runner: macos-latest
+          - runner: macos-15
             target: x86_64-apple-darwin
             run_tests: false # cross-arch build; tests run on the native target
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             run_tests: true
           - runner: ubuntu-24.04-arm
@@ -47,6 +67,28 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Smoke test native artifact
+        if: matrix.run_tests
+        run: |
+          binary="target/${{ matrix.target }}/release/skunk"
+          actual="$("$binary" --version)"
+          expected="skunk ${{ needs.validate.outputs.version }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
+
+      - name: Verify Linux artifact is static
+        if: contains(matrix.target, 'musl')
+        run: |
+          binary="target/${{ matrix.target }}/release/skunk"
+          description="$(file "$binary")"
+          echo "$description"
+          if echo "$description" | grep -q "dynamically linked"; then
+            echo "expected a static musl binary" >&2
+            exit 1
+          fi
+
       - name: Package
         run: |
           STAGE=skunk-${{ matrix.target }}
@@ -64,7 +106,9 @@ jobs:
   release:
     name: Create GitHub Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

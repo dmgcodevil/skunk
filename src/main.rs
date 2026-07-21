@@ -164,9 +164,28 @@ fn prepare_and_check(node: &ast::Node) -> Result<ast::Node, String> {
 
 /// Compiles and executes a program natively, then removes its temporary build artifacts.
 fn run_native(program: &ast::Node, source_path: &Path) -> Result<ExitStatus, String> {
+    run_native_with_options(
+        program,
+        source_path,
+        &compiler::BuildOptions::default(),
+    )
+}
+
+/// Compiles and executes a program with explicit linker and optimization
+/// options, then removes its temporary build artifacts.
+fn run_native_with_options(
+    program: &ast::Node,
+    source_path: &Path,
+    options: &compiler::BuildOptions,
+) -> Result<ExitStatus, String> {
     let output_path = temporary_run_output_path();
     let llvm_ir_path = output_path.with_extension("ll");
-    let artifact = match compiler::compile_to_executable(program, source_path, &output_path) {
+    let artifact = match compiler::compile_to_executable_with_options(
+        program,
+        source_path,
+        &output_path,
+        options,
+    ) {
         Ok(artifact) => artifact,
         Err(err) => {
             let _ = fs::remove_file(&llvm_ir_path);
@@ -187,16 +206,39 @@ fn run_native(program: &ast::Node, source_path: &Path) -> Result<ExitStatus, Str
     status
 }
 
-/// Resolves the source file for `skunk test`: an explicit path wins, otherwise
-/// the manifest entry from `skunk.toml` in the current directory.
-fn resolve_test_source(source: Option<String>) -> Result<PathBuf, String> {
+/// Converts a project manifest's build table into compiler options.
+fn manifest_build_options(manifest: &manifest::Manifest) -> compiler::BuildOptions {
+    compiler::BuildOptions {
+        optimize: manifest.optimize,
+        libraries: manifest.libraries.clone(),
+        frameworks: manifest.frameworks.clone(),
+    }
+}
+
+/// Prints non-fatal manifest diagnostics such as ignored future keys.
+fn emit_manifest_warnings(manifest: &manifest::Manifest) {
+    for warning in &manifest.warnings {
+        eprintln!("warning: {}", warning);
+    }
+}
+
+/// Resolves the source and build options for `skunk test`: an explicit path
+/// uses defaults, while a project test inherits the complete `[build]` table.
+fn resolve_test_configuration(
+    source: Option<String>,
+) -> Result<(PathBuf, compiler::BuildOptions), String> {
     if let Some(source) = source {
-        return Ok(PathBuf::from(source));
+        return Ok((
+            PathBuf::from(source),
+            compiler::BuildOptions::default(),
+        ));
     }
     let manifest_path = PathBuf::from(manifest::MANIFEST_FILE);
     if manifest_path.exists() {
         let manifest = manifest::load_manifest(&manifest_path)?;
-        Ok(manifest.entry)
+        emit_manifest_warnings(&manifest);
+        let options = manifest_build_options(&manifest);
+        Ok((manifest.entry, options))
     } else {
         Err(format!(
             "no source file given and no `{}` found in the current directory\n{}",
@@ -209,7 +251,7 @@ fn resolve_test_source(source: Option<String>) -> Result<PathBuf, String> {
 /// Runs `skunk test`: rewrites test declarations into a native runner, builds
 /// it, executes it, and returns its exit status.
 fn run_tests(source: Option<String>, filter: Option<String>) -> Result<ExitStatus, String> {
-    let source_path = resolve_test_source(source)?;
+    let (source_path, options) = resolve_test_configuration(source)?;
     let program = source::load_program(&source_path)?;
     let (test_program, test_count) =
         testing::build_test_program(&program, filter.as_deref())?;
@@ -220,7 +262,7 @@ fn run_tests(source: Option<String>, filter: Option<String>) -> Result<ExitStatu
         if test_count == 1 { "" } else { "s" },
         source_path.display()
     );
-    run_native(&test_program, &source_path)
+    run_native_with_options(&test_program, &source_path, &options)
 }
 
 /// Runs `skunk build`: compiles the manifest entry into `target/<name>`.
@@ -233,16 +275,13 @@ fn run_build() -> Result<PathBuf, String> {
         ));
     }
     let manifest = manifest::load_manifest(&manifest_path)?;
+    emit_manifest_warnings(&manifest);
     let node = load_and_check(&manifest.entry)?;
     let target_dir = PathBuf::from("target");
     fs::create_dir_all(&target_dir)
         .map_err(|err| format!("failed to create `{}`: {}", target_dir.display(), err))?;
     let output_path = target_dir.join(&manifest.name);
-    let options = compiler::BuildOptions {
-        optimize: manifest.optimize,
-        libraries: manifest.libraries.clone(),
-        frameworks: manifest.frameworks.clone(),
-    };
+    let options = manifest_build_options(&manifest);
     let artifact = compiler::compile_to_executable_with_options(
         &node,
         &manifest.entry,
@@ -582,6 +621,39 @@ mod tests {
         let args = args(&["skunk", "test", "--filter"]);
 
         assert!(parse_cli(&args).is_err());
+    }
+
+    #[test]
+    fn project_test_build_options_include_native_link_settings() {
+        let project = manifest::parse_manifest(
+            r#"
+            [package]
+            name = "native-tests"
+            entry = "src/main.skunk"
+
+            [build]
+            optimize = false
+            libraries = ["sqlite3", "z"]
+            frameworks = ["Cocoa"]
+            "#,
+        )
+        .unwrap();
+        let options = manifest_build_options(&project);
+
+        assert!(!options.optimize);
+        assert_eq!(options.libraries, vec!["sqlite3", "z"]);
+        assert_eq!(options.frameworks, vec!["Cocoa"]);
+    }
+
+    #[test]
+    fn explicit_test_file_uses_default_build_options() {
+        let (source, options) =
+            resolve_test_configuration(Some("tests/math.skunk".to_string())).unwrap();
+
+        assert_eq!(source, PathBuf::from("tests/math.skunk"));
+        assert!(options.optimize);
+        assert!(options.libraries.is_empty());
+        assert!(options.frameworks.is_empty());
     }
 
     #[test]
