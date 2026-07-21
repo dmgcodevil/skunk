@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LlvmType {
@@ -4678,6 +4679,8 @@ const RUNTIME_C_SOURCE: &str = include_str!("../runtime/skunk_runtime.c");
 #[cfg(target_os = "macos")]
 const RUNTIME_WINDOW_SOURCE: &str = include_str!("../runtime/skunk_window_runtime.m");
 
+static MATERIALIZED_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Returns the Skunk home directory: `$SKUNK_HOME`, or `~/.skunk`, or a
 /// temporary directory as a last resort.
 pub fn skunk_home() -> PathBuf {
@@ -4703,13 +4706,41 @@ pub(crate) fn write_if_changed(path: &Path, contents: &str) -> Result<(), String
             return Ok(());
         }
     }
-    let temp_path = path.with_extension(format!("tmp{}", std::process::id()));
+
+    // Native compiler tests run in parallel and all materialize the same
+    // embedded runtime. A process ID alone is therefore not enough to make the
+    // staging path unique: one thread can rename the file while another still
+    // expects it to exist. Keep the temporary file beside the destination so
+    // the final rename is atomic, but give every write its own sequence number.
+    let sequence = MATERIALIZED_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temp_name = path
+        .file_name()
+        .ok_or_else(|| format!("cannot materialize invalid path `{}`", path.display()))?
+        .to_os_string();
+    temp_name.push(format!(".tmp-{}-{}", std::process::id(), sequence));
+    let temp_path = path.with_file_name(temp_name);
     fs::write(&temp_path, contents)
         .map_err(|err| format!("failed to write `{}`: {}", temp_path.display(), err))?;
-    fs::rename(&temp_path, path).map_err(|err| {
-        let _ = fs::remove_file(&temp_path);
-        format!("failed to move `{}` into place: {}", path.display(), err)
-    })
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            // On platforms where rename does not replace an existing file,
+            // another writer may have completed the identical materialization.
+            if fs::read_to_string(path)
+                .map(|existing| existing == contents)
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failed to move `{}` into place: {}",
+                    path.display(),
+                    err
+                ))
+            }
+        }
+    }
 }
 
 /// Materializes the embedded runtime C sources into the Skunk home directory,
@@ -5420,6 +5451,40 @@ mod tests {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[test]
+    fn materialized_file_writes_are_safe_when_concurrent() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let root = env::temp_dir().join(format!(
+            "skunk_materialization_test_{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = Arc::new(root.join("skunk_runtime.c"));
+        let contents = Arc::new("/* embedded runtime */\n".repeat(16_384));
+        let barrier = Arc::new(Barrier::new(16));
+
+        let writers = (0..16)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let contents = Arc::clone(&contents);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    write_if_changed(&path, &contents)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        assert_eq!(fs::read_to_string(path.as_ref()).unwrap(), *contents);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
