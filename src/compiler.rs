@@ -6027,7 +6027,7 @@ mod tests {
                 }
             }
 
-            function use_counter[T: Writer + Resettable](counter: *T): int {
+            function use_counter[T: Writer & Resettable](counter: *T): int {
                 counter.reset();
                 return counter.write(41);
             }
@@ -6076,7 +6076,7 @@ mod tests {
             }
 
             function use_counter[T](counter: *T): int
-            where T: Writer + Resettable {
+            where T: Writer & Resettable {
                 counter.reset();
                 return counter.write(41);
             }

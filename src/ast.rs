@@ -4272,7 +4272,7 @@ mod tests {
                 function reset(mut self): void;
             }
 
-            trait Writer: Resettable + Flushable {
+            trait Writer: Resettable & Flushable {
                 function write(mut self, value: int): int;
             }
         "#;
@@ -4312,7 +4312,7 @@ mod tests {
     #[test]
     fn test_generic_function_bounds() {
         let source_code = r#"
-            function save[T: Writer + Flushable](value: T): T {
+            function save[T: Writer & Flushable](value: T): T {
                 return value;
             }
         "#;
@@ -4343,7 +4343,7 @@ mod tests {
     #[test]
     fn test_generic_function_where_clause() {
         let source_code = r#"
-            function save[T](value: T): T where T: Writer + Flushable {
+            function save[T](value: T): T where T: Writer & Flushable {
                 return value;
             }
         "#;
@@ -4374,7 +4374,7 @@ mod tests {
     #[test]
     fn test_generic_function_merges_inline_and_where_bounds() {
         let source_code = r#"
-            function save[T: Writer](value: T): T where T: Flushable + Writer {
+            function save[T: Writer](value: T): T where T: Flushable & Writer {
                 return value;
             }
         "#;
@@ -4400,6 +4400,23 @@ mod tests {
         };
 
         assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_plus_trait_bound_separator_is_rejected() {
+        let sources = [
+            "function save[T: Writer + Flushable](value: T): T { return value; }",
+            "function save[T](value: T): T where T: Writer + Flushable { return value; }",
+            "trait Writer: Resettable + Flushable {}",
+        ];
+
+        for source_code in sources {
+            let result = PestImpl {
+                metadata_creator: |_| Metadata::EMPTY,
+            }
+            .parse(source_code);
+            assert!(result.is_err(), "old `+` bounds parsed: {}", source_code);
+        }
     }
 
     #[test]
