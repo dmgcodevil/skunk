@@ -1,8 +1,11 @@
 mod ast;
 mod compiler;
+mod manifest;
 mod monomorphize;
 mod parser;
+mod sdk;
 mod source;
+mod testing;
 mod type_checker;
 use colored::*;
 use std::env;
@@ -12,39 +15,118 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "Usage: skunk <file_path>\n       skunk run <file_path>\n       skunk compile <file_path> [output_path]";
+const USAGE: &str = "Usage: skunk <file_path>\n       skunk run <file_path>\n       skunk compile <file_path> [output_path]\n       skunk test [file_path] [--filter <substring>]\n       skunk build\n       skunk new <project_name>\n       skunk --version\n       skunk versions\n       skunk use <version>";
 
+#[derive(Debug, PartialEq)]
 enum CommandKind {
-    Run,
-    Compile { output: Option<PathBuf> },
+    Run {
+        source: String,
+    },
+    Compile {
+        source: String,
+        output: Option<PathBuf>,
+    },
+    Test {
+        source: Option<String>,
+        filter: Option<String>,
+    },
+    Build,
+    New {
+        name: String,
+    },
+    Version,
+    Versions,
+    Use {
+        version: String,
+    },
 }
 
-/// Parses the command line into a high-level command and source path.
-fn parse_cli(args: &[String]) -> Result<(CommandKind, &str), String> {
-    match args.len() {
-        2 => Ok((CommandKind::Run, &args[1])),
-        _ => match args[1].as_str() {
-            "run" => {
-                if args.len() != 3 {
-                    Err(USAGE.to_string())
+/// Parses the command line into a high-level command.
+fn parse_cli(args: &[String]) -> Result<CommandKind, String> {
+    if args.len() < 2 {
+        return Err(USAGE.to_string());
+    }
+    match args[1].as_str() {
+        "run" => {
+            if args.len() != 3 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::Run {
+                    source: args[2].clone(),
+                })
+            }
+        }
+        "compile" => {
+            if args.len() < 3 || args.len() > 4 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::Compile {
+                    source: args[2].clone(),
+                    output: args.get(3).map(PathBuf::from),
+                })
+            }
+        }
+        "test" => {
+            let mut source = None;
+            let mut filter = None;
+            let mut rest = args[2..].iter();
+            while let Some(arg) = rest.next() {
+                if arg == "--filter" {
+                    match rest.next() {
+                        Some(value) => filter = Some(value.clone()),
+                        None => return Err("--filter expects a value".to_string()),
+                    }
+                } else if source.is_none() {
+                    source = Some(arg.clone());
                 } else {
-                    Ok((CommandKind::Run, &args[2]))
+                    return Err(USAGE.to_string());
                 }
             }
-            "compile" => {
-                if args.len() < 3 || args.len() > 4 {
-                    Err(USAGE.to_string())
-                } else {
-                    Ok((
-                        CommandKind::Compile {
-                            output: args.get(3).map(PathBuf::from),
-                        },
-                        &args[2],
-                    ))
-                }
+            Ok(CommandKind::Test { source, filter })
+        }
+        "build" => {
+            if args.len() != 2 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::Build)
             }
-            _ => Err(USAGE.to_string()),
-        },
+        }
+        "new" => {
+            if args.len() != 3 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::New {
+                    name: args[2].clone(),
+                })
+            }
+        }
+        "--version" | "-V" | "version" => {
+            if args.len() != 2 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::Version)
+            }
+        }
+        "versions" => {
+            if args.len() != 2 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::Versions)
+            }
+        }
+        "use" => {
+            if args.len() != 3 {
+                Err(USAGE.to_string())
+            } else {
+                Ok(CommandKind::Use {
+                    version: args[2].clone(),
+                })
+            }
+        }
+        _ if args.len() == 2 => Ok(CommandKind::Run {
+            source: args[1].clone(),
+        }),
+        _ => Err(USAGE.to_string()),
     }
 }
 
@@ -64,11 +146,20 @@ fn temporary_run_output_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    env::temp_dir().join(format!(
-        "skunk_run_{}_{}",
-        std::process::id(),
-        timestamp
-    ))
+    env::temp_dir().join(format!("skunk_run_{}_{}", std::process::id(), timestamp))
+}
+
+/// Loads, monomorphizes, and type-checks a program from disk.
+fn load_and_check(file_path: &Path) -> Result<ast::Node, String> {
+    let node = source::load_program(file_path)?;
+    prepare_and_check(&node)
+}
+
+/// Monomorphizes and type-checks an already-loaded program.
+fn prepare_and_check(node: &ast::Node) -> Result<ast::Node, String> {
+    let node = monomorphize::prepare_program(node)?;
+    type_checker::check(&node)?;
+    Ok(node)
 }
 
 /// Compiles and executes a program natively, then removes its temporary build artifacts.
@@ -96,55 +187,249 @@ fn run_native(program: &ast::Node, source_path: &Path) -> Result<ExitStatus, Str
     status
 }
 
+/// Resolves the source file for `skunk test`: an explicit path wins, otherwise
+/// the manifest entry from `skunk.toml` in the current directory.
+fn resolve_test_source(source: Option<String>) -> Result<PathBuf, String> {
+    if let Some(source) = source {
+        return Ok(PathBuf::from(source));
+    }
+    let manifest_path = PathBuf::from(manifest::MANIFEST_FILE);
+    if manifest_path.exists() {
+        let manifest = manifest::load_manifest(&manifest_path)?;
+        Ok(manifest.entry)
+    } else {
+        Err(format!(
+            "no source file given and no `{}` found in the current directory\n{}",
+            manifest::MANIFEST_FILE,
+            USAGE
+        ))
+    }
+}
+
+/// Runs `skunk test`: rewrites test declarations into a native runner, builds
+/// it, executes it, and returns its exit status.
+fn run_tests(source: Option<String>, filter: Option<String>) -> Result<ExitStatus, String> {
+    let source_path = resolve_test_source(source)?;
+    let program = source::load_program(&source_path)?;
+    let (test_program, test_count) =
+        testing::build_test_program(&program, filter.as_deref())?;
+    let test_program = prepare_and_check(&test_program)?;
+    println!(
+        "running {} test{} from {}\n",
+        test_count,
+        if test_count == 1 { "" } else { "s" },
+        source_path.display()
+    );
+    run_native(&test_program, &source_path)
+}
+
+/// Runs `skunk build`: compiles the manifest entry into `target/<name>`.
+fn run_build() -> Result<PathBuf, String> {
+    let manifest_path = PathBuf::from(manifest::MANIFEST_FILE);
+    if !manifest_path.exists() {
+        return Err(format!(
+            "`skunk build` requires a `{}` in the current directory; run `skunk new <name>` to create a project",
+            manifest::MANIFEST_FILE
+        ));
+    }
+    let manifest = manifest::load_manifest(&manifest_path)?;
+    let node = load_and_check(&manifest.entry)?;
+    let target_dir = PathBuf::from("target");
+    fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("failed to create `{}`: {}", target_dir.display(), err))?;
+    let output_path = target_dir.join(&manifest.name);
+    let options = compiler::BuildOptions {
+        optimize: manifest.optimize,
+        libraries: manifest.libraries.clone(),
+        frameworks: manifest.frameworks.clone(),
+    };
+    let artifact = compiler::compile_to_executable_with_options(
+        &node,
+        &manifest.entry,
+        &output_path,
+        &options,
+    )?;
+    Ok(artifact.binary_path)
+}
+
+/// Runs `skunk new`: scaffolds a project directory with a manifest and entry file.
+fn run_new(name: &str) -> Result<PathBuf, String> {
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+    if !valid {
+        return Err(format!(
+            "invalid project name `{}`: use letters, digits, `_`, and `-`, starting with a letter or `_`",
+            name
+        ));
+    }
+    let root = PathBuf::from(name);
+    if root.exists() {
+        return Err(format!("`{}` already exists", root.display()));
+    }
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir)
+        .map_err(|err| format!("failed to create `{}`: {}", src_dir.display(), err))?;
+
+    let manifest_contents = format!(
+        "[package]\nname = \"{}\"\nentry = \"src/main.skunk\"\n\n[build]\noptimize = true\nlibraries = []\nframeworks = []\n",
+        name
+    );
+    fs::write(root.join(manifest::MANIFEST_FILE), manifest_contents)
+        .map_err(|err| format!("failed to write skunk.toml: {}", err))?;
+
+    let main_contents = format!(
+        "function main(): void {{\n    print(\"hello from {}\");\n}}\n\ntest \"it works\" {{\n    Testing::expect(1 + 1 == 2);\n}}\n",
+        name
+    );
+    fs::write(src_dir.join("main.skunk"), main_contents)
+        .map_err(|err| format!("failed to write src/main.skunk: {}", err))?;
+
+    fs::write(root.join(".gitignore"), "/target\n*.ll\n")
+        .map_err(|err| format!("failed to write .gitignore: {}", err))?;
+
+    Ok(root)
+}
+
+/// The directory versioned binaries live in: `$SKUNK_HOME/bin`.
+fn bin_dir() -> PathBuf {
+    compiler::skunk_home().join("bin")
+}
+
+/// Returns the version the `skunk` symlink in the bin directory points at,
+/// when it is a symlink to a `skunk-<version>` binary.
+fn active_installed_version(dir: &Path) -> Option<String> {
+    let target = fs::read_link(dir.join("skunk")).ok()?;
+    let file_name = target.file_name()?.to_string_lossy().to_string();
+    file_name.strip_prefix("skunk-").map(str::to_string)
+}
+
+/// Runs `skunk versions`: lists `skunk-<version>` binaries in the bin
+/// directory and marks the one the `skunk` symlink points at.
+fn list_versions() -> Result<(), String> {
+    let dir = bin_dir();
+    let mut versions = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(version) = name.strip_prefix("skunk-") {
+                // Skip leftovers like editor backups; versions start with a digit.
+                if version.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+                    versions.push(version.to_string());
+                }
+            }
+        }
+    }
+    versions.sort();
+
+    if versions.is_empty() {
+        println!("no versioned installs found in {}", dir.display());
+        println!("this binary is skunk {}", env!("CARGO_PKG_VERSION"));
+        println!("see RELEASE.md for the versioned install layout");
+        return Ok(());
+    }
+
+    let active = active_installed_version(&dir);
+    for version in &versions {
+        if active.as_ref() == Some(version) {
+            println!("* {} (active)", version);
+        } else {
+            println!("  {}", version);
+        }
+    }
+    if active.is_none() {
+        println!(
+            "\nnote: `{}` is not a symlink to a versioned binary; run `skunk use <version>` to manage it",
+            dir.join("skunk").display()
+        );
+    }
+    Ok(())
+}
+
+/// Runs `skunk use <version>`: repoints the `skunk` symlink in the bin
+/// directory at the requested versioned binary.
+fn use_version(version: &str) -> Result<(), String> {
+    let dir = bin_dir();
+    let target = dir.join(format!("skunk-{}", version));
+    if !target.exists() {
+        return Err(format!(
+            "skunk {} is not installed (expected `{}`); run `skunk versions` to list installed versions",
+            version,
+            target.display()
+        ));
+    }
+    let link = dir.join("skunk");
+    #[cfg(unix)]
+    {
+        if fs::symlink_metadata(&link).is_ok() {
+            fs::remove_file(&link)
+                .map_err(|err| format!("failed to remove `{}`: {}", link.display(), err))?;
+        }
+        std::os::unix::fs::symlink(&target, &link).map_err(|err| {
+            format!(
+                "failed to link `{}` -> `{}`: {}",
+                link.display(),
+                target.display(),
+                err
+            )
+        })?;
+        println!("now using skunk {}", version);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = link;
+        Err("`skunk use` is only supported on macOS and Linux".to_string())
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let type_checker_enabled: bool = true;
     if args.len() < 2 {
         eprintln!("{}", USAGE);
         std::process::exit(1);
     }
-    let (command, file_path) = match parse_cli(&args) {
+    let command = match parse_cli(&args) {
         Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("{}", err.red());
             std::process::exit(1);
         }
     };
-    let node = match source::load_program(Path::new(file_path)) {
-        Ok(node) => node,
-        Err(err) => {
-            eprintln!("Error: {}", err.red());
-            std::process::exit(1);
-        }
-    };
-    let node = match monomorphize::prepare_program(&node) {
-        Ok(node) => node,
-        Err(err) => {
-            eprintln!("Error: {}", err.red());
-            std::process::exit(1);
-        }
-    };
-    if type_checker_enabled {
-        match type_checker::check(&node) {
-            Ok(_) => (),
-            Err(e) => {
-                eprintln!("Error: {}", e.red());
-                std::process::exit(1);
-            }
-        };
-    }
 
     match command {
-        CommandKind::Run => match run_native(&node, Path::new(file_path)) {
-            Ok(status) if status.success() => {}
-            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-            Err(err) => {
-                eprintln!("Run error: {}", err.red());
-                std::process::exit(1);
+        CommandKind::Run { source } => {
+            let source_path = Path::new(&source);
+            let node = match load_and_check(source_path) {
+                Ok(node) => node,
+                Err(err) => {
+                    eprintln!("Error: {}", err.red());
+                    std::process::exit(1);
+                }
+            };
+            match run_native(&node, source_path) {
+                Ok(status) if status.success() => {}
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(err) => {
+                    eprintln!("Run error: {}", err.red());
+                    std::process::exit(1);
+                }
             }
         }
-        CommandKind::Compile { output } => {
-            let source_path = Path::new(file_path);
+        CommandKind::Compile { source, output } => {
+            let source_path = Path::new(&source);
+            let node = match load_and_check(source_path) {
+                Ok(node) => node,
+                Err(err) => {
+                    eprintln!("Error: {}", err.red());
+                    std::process::exit(1);
+                }
+            };
             let output_path = output.unwrap_or_else(|| default_output_path(source_path));
             let now = Instant::now();
             match compiler::compile_to_executable(&node, source_path, &output_path) {
@@ -163,6 +448,48 @@ fn main() -> io::Result<()> {
                 }
             }
         }
+        CommandKind::Test { source, filter } => match run_tests(source, filter) {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(err) => {
+                eprintln!("Test error: {}", err.red());
+                std::process::exit(1);
+            }
+        },
+        CommandKind::Build => match run_build() {
+            Ok(binary_path) => {
+                println!("Built {}", binary_path.display());
+            }
+            Err(err) => {
+                eprintln!("Build error: {}", err.red());
+                std::process::exit(1);
+            }
+        },
+        CommandKind::Version => {
+            println!("skunk {}", env!("CARGO_PKG_VERSION"));
+        }
+        CommandKind::Versions => {
+            if let Err(err) = list_versions() {
+                eprintln!("Error: {}", err.red());
+                std::process::exit(1);
+            }
+        }
+        CommandKind::Use { version } => {
+            if let Err(err) = use_version(&version) {
+                eprintln!("Error: {}", err.red());
+                std::process::exit(1);
+            }
+        }
+        CommandKind::New { name } => match run_new(&name) {
+            Ok(root) => {
+                println!("Created project `{}`", root.display());
+                println!("  cd {} && skunk build", root.display());
+                println!("  skunk test");
+            }
+            Err(err) => {
+                eprintln!("Error: {}", err.red());
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
 }
@@ -178,19 +505,27 @@ mod tests {
     #[test]
     fn bare_source_path_uses_native_run() {
         let args = args(&["skunk", "main.skunk"]);
-        let (command, source) = parse_cli(&args).unwrap();
+        let command = parse_cli(&args).unwrap();
 
-        assert!(matches!(command, CommandKind::Run));
-        assert_eq!(source, "main.skunk");
+        assert_eq!(
+            command,
+            CommandKind::Run {
+                source: "main.skunk".to_string()
+            }
+        );
     }
 
     #[test]
     fn explicit_run_uses_native_run() {
         let args = args(&["skunk", "run", "main.skunk"]);
-        let (command, source) = parse_cli(&args).unwrap();
+        let command = parse_cli(&args).unwrap();
 
-        assert!(matches!(command, CommandKind::Run));
-        assert_eq!(source, "main.skunk");
+        assert_eq!(
+            command,
+            CommandKind::Run {
+                source: "main.skunk".to_string()
+            }
+        );
     }
 
     #[test]
@@ -198,5 +533,105 @@ mod tests {
         let args = args(&["skunk", "interpret", "main.skunk"]);
 
         assert!(parse_cli(&args).is_err());
+    }
+
+    #[test]
+    fn compile_accepts_optional_output() {
+        let args = args(&["skunk", "compile", "main.skunk", "out"]);
+        let command = parse_cli(&args).unwrap();
+
+        assert_eq!(
+            command,
+            CommandKind::Compile {
+                source: "main.skunk".to_string(),
+                output: Some(PathBuf::from("out")),
+            }
+        );
+    }
+
+    #[test]
+    fn test_command_parses_filter() {
+        let args = args(&["skunk", "test", "main.skunk", "--filter", "shorthand"]);
+        let command = parse_cli(&args).unwrap();
+
+        assert_eq!(
+            command,
+            CommandKind::Test {
+                source: Some("main.skunk".to_string()),
+                filter: Some("shorthand".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_command_allows_no_source() {
+        let args = args(&["skunk", "test"]);
+        let command = parse_cli(&args).unwrap();
+
+        assert_eq!(
+            command,
+            CommandKind::Test {
+                source: None,
+                filter: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_command_rejects_dangling_filter() {
+        let args = args(&["skunk", "test", "--filter"]);
+
+        assert!(parse_cli(&args).is_err());
+    }
+
+    #[test]
+    fn new_command_requires_a_name() {
+        assert!(parse_cli(&args(&["skunk", "new"])).is_err());
+        assert_eq!(
+            parse_cli(&args(&["skunk", "new", "demo"])).unwrap(),
+            CommandKind::New {
+                name: "demo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn version_flag_is_recognized() {
+        assert_eq!(
+            parse_cli(&args(&["skunk", "--version"])).unwrap(),
+            CommandKind::Version
+        );
+        assert_eq!(
+            parse_cli(&args(&["skunk", "-V"])).unwrap(),
+            CommandKind::Version
+        );
+        assert_eq!(
+            parse_cli(&args(&["skunk", "version"])).unwrap(),
+            CommandKind::Version
+        );
+    }
+
+    #[test]
+    fn versions_and_use_are_recognized() {
+        assert_eq!(
+            parse_cli(&args(&["skunk", "versions"])).unwrap(),
+            CommandKind::Versions
+        );
+        assert_eq!(
+            parse_cli(&args(&["skunk", "use", "0.1.0"])).unwrap(),
+            CommandKind::Use {
+                version: "0.1.0".to_string()
+            }
+        );
+        assert!(parse_cli(&args(&["skunk", "use"])).is_err());
+    }
+
+    #[test]
+    fn build_takes_no_arguments() {
+        assert_eq!(
+            parse_cli(&args(&["skunk", "build"])).unwrap(),
+            CommandKind::Build
+        );
+        assert!(parse_cli(&args(&["skunk", "build", "extra"])).is_err());
     }
 }

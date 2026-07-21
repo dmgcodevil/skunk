@@ -164,8 +164,74 @@ fn func_decl_node_to_symbol(node: &Node) -> Symbol {
                 return_type: Box::new(return_type.clone()),
             },
         },
+        Node::ExternFunctionDeclaration {
+            name,
+            parameters,
+            return_type,
+        } => Symbol {
+            name: name.to_string(),
+            sk_type: Type::Function {
+                parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+                return_type: Box::new(return_type.clone()),
+            },
+        },
         _ => panic!("expected function declaration"),
     }
+}
+
+/// Returns true when a type may cross the C ABI boundary in an
+/// `extern "C"` signature. The first version deliberately allows only
+/// primitive numerics, `bool`, `string` (a C string pointer), raw pointers,
+/// and `void`; aggregates must be passed behind a pointer.
+fn is_extern_abi_safe(sk_type: &Type) -> bool {
+    match sk_type {
+        Type::Void
+        | Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::Boolean
+        | Type::String => true,
+        Type::Const { inner } | Type::BindingConst { inner } => is_extern_abi_safe(inner),
+        // Any pointee is fine: the pointer itself is what crosses the boundary.
+        Type::Pointer { .. } => true,
+        _ => false,
+    }
+}
+
+fn check_extern_declaration(
+    name: &str,
+    parameters: &[(String, Type)],
+    return_type: &Type,
+) -> Result<(), String> {
+    for (param_name, param_type) in parameters {
+        if !is_extern_abi_safe(param_type) {
+            return Err(format!(
+                "extern function `{}` parameter `{}` has non C-ABI-safe type `{}`; \
+                 allowed: primitive numerics, bool, string, raw pointers",
+                name,
+                param_name,
+                type_to_string(param_type)
+            ));
+        }
+        if matches!(param_type, Type::Void) {
+            return Err(format!(
+                "extern function `{}` parameter `{}` cannot be void",
+                name, param_name
+            ));
+        }
+    }
+    if !is_extern_abi_safe(return_type) {
+        return Err(format!(
+            "extern function `{}` has non C-ABI-safe return type `{}`; \
+             allowed: void, primitive numerics, bool, string, raw pointers",
+            name,
+            type_to_string(return_type)
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -245,7 +311,8 @@ impl GlobalScope {
                 );
             }
             Node::FunctionDeclaration { name, .. }
-            | Node::GenericFunctionDeclaration { name, .. } => {
+            | Node::GenericFunctionDeclaration { name, .. }
+            | Node::ExternFunctionDeclaration { name, .. } => {
                 self.functions
                     .insert(name.clone(), func_decl_node_to_symbol(node));
             }
@@ -2129,6 +2196,17 @@ fn resolve_type(
             parameters: parameters.iter().map(|p| p.1.clone()).collect(),
             return_type: Box::new(return_type.clone()),
         })),
+        Node::ExternFunctionDeclaration {
+            name,
+            parameters,
+            return_type,
+        } => {
+            check_extern_declaration(name, parameters, return_type)?;
+            Ok(ResolveResult::new(Type::Function {
+                parameters: parameters.iter().map(|p| p.1.clone()).collect(),
+                return_type: Box::new(return_type.clone()),
+            }))
+        }
         Node::VariableDeclaration {
             var_type,
             name,

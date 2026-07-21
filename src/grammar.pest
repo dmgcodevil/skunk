@@ -78,13 +78,16 @@ optional_return_type = _{ return_type? }
 // Grammar Rules
 empty             = _{ WHITESPACE* }
 program           = { SOI ~ statement* ~ EOI }
-statement         = { module | import | export_decl | type_alias_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl | attach_decl | conform_decl | control_flow | io | defer_stmt | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
+statement         = { module | import | export_decl | extern_func_decl | test_decl | type_alias_decl | var_decl_stmt | struct_destructure_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl | attach_decl | conform_decl | control_flow | io | defer_stmt | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
 assignment        = { access ~ "=" ~ ( lambda_expr | expression | func_call) }
 empty_params      = { "(" ~WHITESPACE*~ ")" }
 qualified_name    = { IDENTIFIER ~ ("." ~ IDENTIFIER)* }
 module            = { "module" ~ qualified_name ~ ";"}
 import            = { "import" ~ qualified_name ~ ";"}
-export_decl       = { "export" ~ (type_alias_decl | var_decl_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl) }
+export_decl       = { "export" ~ (extern_func_decl | type_alias_decl | var_decl_stmt | func_decl | struct_decl | enum_decl | trait_decl | shape_decl) }
+extern_abi        = { STRING_LITERAL }
+extern_func_decl  = { "extern" ~ extern_abi ~ "function" ~ IDENTIFIER ~ static_func_params ~ optional_return_type ~ ";" }
+test_decl         = { "test" ~ STRING_LITERAL ~ "{" ~ statement* ~ "}" }
 type_alias_decl   = { "type" ~ IDENTIFIER ~ generic_params? ~ "=" ~ _type ~ ";" }
 param_decl        = { const_kw? ~ IDENTIFIER ~ ":" ~ _type }
 var_decl          = { const_kw? ~ IDENTIFIER ~ ":" ~ _type ~ ( "=" ~ ( lambda_expr | expression | func_call ) )? }

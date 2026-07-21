@@ -109,6 +109,20 @@ pub enum Node {
         body: Vec<Node>, // The function body is a list of nodes (statements or expressions)
         lambda: bool,
     },
+    /// A body-less declaration of a native C function, e.g.
+    /// `extern "C" function cos(value: double): double;`.
+    /// The name is the exact, unmangled linker symbol.
+    ExternFunctionDeclaration {
+        name: String,
+        parameters: Vec<(String, Type)>,
+        return_type: Type,
+    },
+    /// A native test block: `test "name" { ... }`. Converted into a plain
+    /// function plus a generated runner main by `skunk test`.
+    TestDeclaration {
+        name: String,
+        body: Vec<Node>,
+    },
     GenericFunctionDeclaration {
         name: String,
         generic_params: Vec<String>,
@@ -442,6 +456,8 @@ impl PestImpl {
                 self.create_struct_destructure(pair.into_inner().next().unwrap())
             }
             Rule::func_decl => self.create_func_decl(pair),
+            Rule::extern_func_decl => self.create_extern_func_decl(pair),
+            Rule::test_decl => self.create_test_decl(pair),
             Rule::lambda_expr => self.create_func_decl(pair),
             Rule::literal => self.create_literal(pair),
             Rule::size => self.create_literal(pair),
@@ -901,6 +917,46 @@ impl PestImpl {
         } else {
             unreachable!()
         }
+    }
+
+    /// Parses `extern "C" function name(params): ret;` into an
+    /// [`Node::ExternFunctionDeclaration`]. Only the `"C"` ABI is accepted.
+    fn create_extern_func_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::extern_func_decl);
+        let mut inner_pairs = pair.into_inner();
+        let abi_pair = inner_pairs.next().expect("extern declaration has an ABI");
+        let abi = parse_string_literal(abi_pair.as_str())
+            .unwrap_or_else(|err| panic!("invalid extern ABI literal: {}", err));
+        if abi != "C" {
+            panic!("unsupported extern ABI `{}`; only \"C\" is supported", abi);
+        }
+        let name = match inner_pairs.next() {
+            Some(p) if p.as_rule() == Rule::IDENTIFIER => p.as_str().to_string(),
+            other => panic!("extern declaration is missing a name: {:?}", other),
+        };
+        let parameters = self.create_param_list(inner_pairs.next().unwrap());
+        let return_type = match inner_pairs.peek() {
+            Some(p) if p.as_rule() == Rule::return_type => {
+                self.create_type(inner_pairs.next().unwrap().into_inner().next().unwrap())
+            }
+            _ => Type::Void,
+        };
+        Node::ExternFunctionDeclaration {
+            name,
+            parameters,
+            return_type,
+        }
+    }
+
+    /// Parses `test "name" { ... }` into a [`Node::TestDeclaration`].
+    fn create_test_decl(&self, pair: Pair<Rule>) -> Node {
+        assert_eq!(pair.as_rule(), Rule::test_decl);
+        let mut inner_pairs = pair.into_inner();
+        let name_pair = inner_pairs.next().expect("test declaration has a name");
+        let name = parse_string_literal(name_pair.as_str())
+            .unwrap_or_else(|err| panic!("invalid test name literal: {}", err));
+        let body = inner_pairs.map(|p| self.create_ast(p)).collect();
+        Node::TestDeclaration { name, body }
     }
 
     fn create_type_prefix(&self, pair: Pair<Rule>) -> TypePrefix {
@@ -2186,6 +2242,11 @@ impl PestImpl {
 /// succeed and compare directly against concrete AST shapes.
 pub fn parse(input: &str) -> Node {
     PestImpl::new().parse(input).unwrap()
+}
+
+/// Like [`parse`] but propagates parser errors instead of panicking.
+pub fn try_parse(input: &str) -> Result<Node, String> {
+    PestImpl::new().parse(input)
 }
 
 /// Renders a type into the surface-language spelling used in diagnostics.

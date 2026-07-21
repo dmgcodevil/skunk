@@ -348,6 +348,32 @@ impl Monomorphizer {
                         root_concrete_impls.push(statement.clone());
                     }
                 }
+                Node::ExternFunctionDeclaration {
+                    name,
+                    parameters,
+                    return_type,
+                } => {
+                    // Register the extern signature so calls resolve like calls
+                    // to any concrete function; the empty body is never used
+                    // because `prepare` passes the declaration through as-is.
+                    concrete_functions.insert(
+                        name.clone(),
+                        FunctionTemplate {
+                            name: name.clone(),
+                            generic_params: Vec::new(),
+                            generic_bounds: HashMap::new(),
+                            subtype_bounds: HashMap::new(),
+                            parameters: parameters.clone(),
+                            return_type: return_type.clone(),
+                            body: Vec::new(),
+                        },
+                    );
+                    root_statements.push(statement.clone());
+                }
+                // Test declarations only take part in `skunk test`, where they
+                // are rewritten into plain functions before this pass runs.
+                // In a normal build they are simply dropped.
+                Node::TestDeclaration { .. } => {}
                 Node::Module { .. } | Node::Import { .. } => {}
                 Node::EOI => {}
                 other => root_statements.push(other.clone()),
@@ -451,6 +477,9 @@ impl Monomorphizer {
                     output.push(self.transform_enum_decl(&name, &variants, &HashMap::new())?);
                 }
                 Node::EOI => {}
+                extern_decl @ Node::ExternFunctionDeclaration { .. } => {
+                    output.push(extern_decl);
+                }
                 other => {
                     let mut env = Env::new();
                     let (statement, _) = self.transform_statement(
@@ -2965,6 +2994,8 @@ impl Monomorphizer {
             | Node::GenericEnumDeclaration { .. }
             | Node::FunctionDeclaration { .. }
             | Node::GenericFunctionDeclaration { .. }
+            | Node::ExternFunctionDeclaration { .. }
+            | Node::TestDeclaration { .. }
             | Node::EMPTY
             | Node::Assignment { .. } => Err(format!(
                 "unsupported expression during monomorphization: `{:?}`",

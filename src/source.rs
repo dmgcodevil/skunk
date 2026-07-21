@@ -94,7 +94,13 @@ impl ProgramLoader {
             match statement {
                 Node::Module { .. } => {}
                 Node::Import { name } => {
-                    let import_path = self.module_path(&name);
+                    // `std.*` is reserved for the embedded SDK and never
+                    // resolves to project files.
+                    let import_path = if crate::sdk::is_std_module(&name) {
+                        crate::sdk::std_module_path(&name)?
+                    } else {
+                        self.module_path(&name)
+                    };
                     let imported = self.load_file(&import_path, Some(&name), false)?;
                     output.extend(imported);
                 }
@@ -862,6 +868,10 @@ impl ModuleNormalizer {
         Ok(match node {
             Node::Identifier(name) => Node::Identifier(self.rename_value_name(&name, value_scopes)),
             Node::Literal(_) | Node::Input | Node::EOI | Node::EMPTY => node,
+            // Extern declarations name exact C symbols and are never mangled.
+            // Test declarations are only rewritten by `skunk test`; module
+            // renaming leaves them untouched.
+            Node::ExternFunctionDeclaration { .. } | Node::TestDeclaration { .. } => node,
             Node::BinaryOp {
                 left,
                 operator,
@@ -1236,6 +1246,7 @@ fn validate_export_target(node: &Node) -> Result<(), String> {
     match node {
         Node::VariableDeclaration { .. }
         | Node::FunctionDeclaration { lambda: false, .. }
+        | Node::ExternFunctionDeclaration { .. }
         | Node::GenericFunctionDeclaration { lambda: false, .. }
         | Node::TypeAliasDeclaration { .. }
         | Node::StructDeclaration { .. }
@@ -1296,12 +1307,12 @@ mod tests {
     fn loads_imported_module_before_entry_statements() {
         let root = env::temp_dir().join(format!("skunk_modules_{}", Uuid::new_v4()));
         let entry = root.join("main.skunk");
-        let module = root.join("std").join("math.skunk");
+        let module = root.join("mylib").join("math.skunk");
 
         write_file(
             &module,
             r#"
-            module std.math;
+            module mylib.math;
 
             function inc(n: int): int {
                 return n + 1;
@@ -1311,7 +1322,7 @@ mod tests {
         write_file(
             &entry,
             r#"
-            import std.math;
+            import mylib.math;
 
             function main(): void {
                 print(inc(6));
@@ -1340,12 +1351,12 @@ mod tests {
     fn rejects_module_name_mismatch() {
         let root = env::temp_dir().join(format!("skunk_modules_{}", Uuid::new_v4()));
         let entry = root.join("main.skunk");
-        let module = root.join("std").join("math.skunk");
+        let module = root.join("mylib").join("math.skunk");
 
         write_file(
             &module,
             r#"
-            module std.wrong;
+            module mylib.wrong;
 
             function inc(n: int): int {
                 return n + 1;
@@ -1355,7 +1366,7 @@ mod tests {
         write_file(
             &entry,
             r#"
-            import std.math;
+            import mylib.math;
 
             function main(): void {}
             "#,
@@ -1371,12 +1382,12 @@ mod tests {
     fn keeps_exported_names_and_mangles_private_imported_names() {
         let root = env::temp_dir().join(format!("skunk_modules_{}", Uuid::new_v4()));
         let entry = root.join("main.skunk");
-        let module = root.join("std").join("math.skunk");
+        let module = root.join("mylib").join("math.skunk");
 
         write_file(
             &module,
             r#"
-            module std.math;
+            module mylib.math;
 
             function helper(n: int): int {
                 return n + 1;
@@ -1390,7 +1401,7 @@ mod tests {
         write_file(
             &entry,
             r#"
-            import std.math;
+            import mylib.math;
 
             function main(): void {
                 print(inc(6));
@@ -1409,7 +1420,7 @@ mod tests {
         )));
         assert!(statements.iter().any(|statement| matches!(
             statement,
-            Node::FunctionDeclaration { name, .. } if name == "__std_math_helper"
+            Node::FunctionDeclaration { name, .. } if name == "__mylib_math_helper"
         )));
         assert!(!statements.iter().any(|statement| matches!(
             statement,

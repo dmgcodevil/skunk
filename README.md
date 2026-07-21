@@ -11,6 +11,26 @@ Do not use Skunk to build critical, safety-sensitive, security-sensitive, or hig
 - The language reference lives in [Skunk](https://dmgcodevil.github.io/skunk/)
 - Syntax and implemented behavior are defined by [`src/grammar.pest`](src/grammar.pest) and the test suite.
 
+## Install
+
+Skunk needs `clang` at runtime to link native executables (macOS: `xcode-select --install`, Linux: install `clang` via your package manager).
+
+Install the latest release (macOS and Linux):
+
+```bash
+curl -fsSL https://dmgcodevil.github.io/skunk/install.sh | sh
+```
+
+This downloads the prebuilt binary for your platform from [GitHub Releases](https://github.com/dmgcodevil/skunk/releases), verifies its checksum, and installs it to `~/.skunk/bin`. Pin a version with `SKUNK_VERSION=v0.1.0`. Installs are versioned side by side: `skunk --version` shows the running version, `skunk versions` lists installed ones, and `skunk use <version>` switches. See [RELEASE.md](RELEASE.md) for building and installing a release locally.
+
+Alternatively, download a tarball from the [releases page](https://github.com/dmgcodevil/skunk/releases) manually, or build from source with Rust:
+
+```bash
+cargo install --git https://github.com/dmgcodevil/skunk
+```
+
+The release process is documented in [RELEASE.md](RELEASE.md).
+
 ## Build
 
 Skunk currently requires Rust and `clang`.
@@ -42,6 +62,22 @@ cargo run -- path/to/main.skunk
 # Equivalent explicit form:
 cargo run -- run path/to/main.skunk
 ```
+
+## Projects and Tests
+
+Scaffold a project with a `skunk.toml` manifest, build it, and run its native tests:
+
+```bash
+skunk new demo
+cd demo
+skunk build        # compiles src/main.skunk into target/demo
+skunk test         # runs `test "name" { ... }` blocks natively
+skunk test --filter shorthand
+```
+
+`skunk.toml` configures linking for `extern "C"` interop (`libraries = ["sqlite3"]`, `frameworks = ["Cocoa"]`). The standard library ships embedded in the compiler; `import std.math;` resolves to the SDK (the `std.` prefix is reserved) and provides libm bindings plus integer helpers.
+
+See the [language reference](https://dmgcodevil.github.io/skunk/) for the C interop, standard library, and native test sections, and `examples/c_interop.skunk`, `examples/math_test.skunk`, and `examples/calculator/` for runnable samples.
 
 ## VS Code
 

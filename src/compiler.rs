@@ -4649,11 +4649,106 @@ pub struct CompiledArtifact {
     pub binary_path: PathBuf,
 }
 
-/// Compiles a checked Skunk program into LLVM IR and a native executable.
+/// Linker and optimization options for a native build, typically sourced from
+/// a project's `skunk.toml`.
+#[derive(Clone, Debug)]
+pub struct BuildOptions {
+    /// When true (the default), compile with `-O2`; otherwise `-O0`.
+    pub optimize: bool,
+    /// Extra libraries linked as `-l<name>`.
+    pub libraries: Vec<String>,
+    /// macOS frameworks linked as `-framework <name>`; ignored elsewhere.
+    pub frameworks: Vec<String>,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        BuildOptions {
+            optimize: true,
+            libraries: Vec::new(),
+            frameworks: Vec::new(),
+        }
+    }
+}
+
+// The C runtime sources are embedded into the compiler binary so an installed
+// `skunk` works without a source checkout. They are materialized on demand
+// into `$SKUNK_HOME/runtime/<version>/` (default `~/.skunk`).
+const RUNTIME_C_SOURCE: &str = include_str!("../runtime/skunk_runtime.c");
+#[cfg(target_os = "macos")]
+const RUNTIME_WINDOW_SOURCE: &str = include_str!("../runtime/skunk_window_runtime.m");
+
+/// Returns the Skunk home directory: `$SKUNK_HOME`, or `~/.skunk`, or a
+/// temporary directory as a last resort.
+pub fn skunk_home() -> PathBuf {
+    if let Ok(home) = std::env::var("SKUNK_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".skunk");
+        }
+    }
+    std::env::temp_dir().join("skunk-home")
+}
+
+/// Writes `contents` to `path` unless the file already has identical contents.
+/// The write goes through a temporary file plus rename so concurrent readers
+/// never observe a partially written file.
+pub(crate) fn write_if_changed(path: &Path, contents: &str) -> Result<(), String> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == contents {
+            return Ok(());
+        }
+    }
+    let temp_path = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&temp_path, contents)
+        .map_err(|err| format!("failed to write `{}`: {}", temp_path.display(), err))?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!("failed to move `{}` into place: {}", path.display(), err)
+    })
+}
+
+/// Materializes the embedded runtime C sources into the Skunk home directory,
+/// keyed by compiler version, and returns their paths. The first path is the
+/// core runtime; the second is the macOS window runtime when applicable.
+fn materialize_runtime_sources() -> Result<(PathBuf, Option<PathBuf>), String> {
+    let dir = skunk_home()
+        .join("runtime")
+        .join(env!("CARGO_PKG_VERSION"));
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create `{}`: {}", dir.display(), err))?;
+    let runtime_c = dir.join("skunk_runtime.c");
+    write_if_changed(&runtime_c, RUNTIME_C_SOURCE)?;
+    #[cfg(target_os = "macos")]
+    {
+        let runtime_window = dir.join("skunk_window_runtime.m");
+        write_if_changed(&runtime_window, RUNTIME_WINDOW_SOURCE)?;
+        Ok((runtime_c, Some(runtime_window)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok((runtime_c, None))
+}
+
+/// Compiles a checked Skunk program into LLVM IR and a native executable
+/// using default build options.
 pub fn compile_to_executable(
     program: &Node,
     source_path: &Path,
     output_path: &Path,
+) -> Result<CompiledArtifact, String> {
+    compile_to_executable_with_options(program, source_path, output_path, &BuildOptions::default())
+}
+
+/// Compiles a checked Skunk program into LLVM IR and a native executable.
+pub fn compile_to_executable_with_options(
+    program: &Node,
+    source_path: &Path,
+    output_path: &Path,
+    options: &BuildOptions,
 ) -> Result<CompiledArtifact, String> {
     let llvm_ir = compile_to_llvm_ir(program)?;
     let llvm_ir_path = output_path.with_extension("ll");
@@ -4665,9 +4760,7 @@ pub fn compile_to_executable(
         )
     })?;
 
-    let runtime_c_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_runtime.c");
-    let runtime_window_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/skunk_window_runtime.m");
+    let (runtime_c_path, runtime_window_path) = materialize_runtime_sources()?;
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("xcrun");
         command.args(["--sdk", "macosx", "clang"]);
@@ -4677,19 +4770,30 @@ pub fn compile_to_executable(
     };
     command.arg(&llvm_ir_path).arg(&runtime_c_path);
     if cfg!(target_os = "macos") {
-        command
-            .arg(&runtime_window_path)
-            .arg("-framework")
-            .arg("Cocoa");
+        if let Some(runtime_window_path) = &runtime_window_path {
+            command.arg(runtime_window_path);
+        }
+        command.arg("-framework").arg("Cocoa");
+        for framework in &options.frameworks {
+            command.arg("-framework").arg(framework);
+        }
+    } else {
+        // libm is linked by default on macOS but not on Linux.
+        command.arg("-lm");
+    }
+    for library in &options.libraries {
+        command.arg(format!("-l{}", library));
     }
     let status = command
-        .arg("-O2")
+        .arg(if options.optimize { "-O2" } else { "-O0" })
         .arg("-o")
         .arg(output_path)
         .status()
         .map_err(|err| {
             format!(
-                "failed to invoke clang while compiling {}: {}",
+                "failed to invoke clang while compiling {}: {}. \
+                 Skunk needs clang installed (macOS: `xcode-select --install`, \
+                 Linux: install the `clang` package)",
                 source_path.display(),
                 err
             )
@@ -4729,6 +4833,35 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let mut functions = Vec::<FunctionPlan>::new();
     let mut trait_vtables = HashMap::<String, String>::new();
     let mut trait_vtable_globals = Vec::<String>::new();
+    let mut extern_declares = Vec::<String>::new();
+
+    // Symbols that the backend already declares unconditionally; extern
+    // declarations may not redeclare them.
+    const RESERVED_RUNTIME_SYMBOLS: &[&str] = &[
+        "printf",
+        "malloc",
+        "memcpy",
+        "memset",
+        "skunk_system_allocator",
+        "skunk_arena_init",
+        "skunk_arena_allocator",
+        "skunk_arena_reset",
+        "skunk_arena_deinit",
+        "skunk_alloc_create",
+        "skunk_alloc_buffer",
+        "skunk_alloc_destroy",
+        "skunk_alloc_free",
+        "skunk_window_create",
+        "skunk_window_is_open",
+        "skunk_window_poll",
+        "skunk_window_clear",
+        "skunk_window_draw_rect",
+        "skunk_window_present",
+        "skunk_window_delta_time",
+        "skunk_window_close",
+        "skunk_window_deinit",
+        "skunk_keyboard_is_down",
+    ];
 
     for statement in statements {
         match statement {
@@ -4759,6 +4892,57 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                     body: body.clone(),
                     is_method: false,
                 });
+            }
+            Node::ExternFunctionDeclaration {
+                name,
+                parameters,
+                return_type,
+            } => {
+                if RESERVED_RUNTIME_SYMBOLS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "extern function `{}` redeclares a reserved runtime symbol",
+                        name
+                    ));
+                }
+                if let Some(existing) = signatures.get(name) {
+                    // Identical redeclarations (e.g. the same binding imported
+                    // through two modules) are tolerated; conflicts are not.
+                    let params = parameters
+                        .iter()
+                        .map(|(_, ty)| llvm_type(ty, &structs, &enums, &traits))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let return_ty = llvm_type(return_type, &structs, &enums, &traits)?;
+                    if existing.parameters != params || existing.return_type != return_ty {
+                        return Err(format!(
+                            "conflicting extern declarations for `{}`",
+                            name
+                        ));
+                    }
+                    continue;
+                }
+                let params = parameters
+                    .iter()
+                    .map(|(_, ty)| llvm_type(ty, &structs, &enums, &traits))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let llvm_return_type = llvm_type(return_type, &structs, &enums, &traits)?;
+                extern_declares.push(format!(
+                    "declare {} @{}({})",
+                    llvm_return_type.ir(),
+                    name,
+                    params
+                        .iter()
+                        .map(|param| param.ir())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                signatures.insert(
+                    name.clone(),
+                    FunctionSignature {
+                        symbol_name: name.clone(),
+                        return_type: llvm_return_type,
+                        parameters: params,
+                    },
+                );
             }
             Node::EOI => {}
             Node::EnumDeclaration { .. } => {}
@@ -5032,6 +5216,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let _ = writeln!(ir, "declare void @skunk_window_close(ptr)");
     let _ = writeln!(ir, "declare void @skunk_window_deinit(ptr)");
     let _ = writeln!(ir, "declare i1 @skunk_keyboard_is_down(ptr, i16)");
+    for declare in &extern_declares {
+        let _ = writeln!(ir, "{}", declare);
+    }
     let _ = writeln!(ir);
     for layout in traits.values() {
         let _ = writeln!(
@@ -6359,9 +6546,9 @@ mod tests {
         let stdout = compile_project_and_run(
             &[
                 (
-                    "std/option.skunk",
+                    "mylib/option.skunk",
                     r#"
-                    module std.option;
+                    module mylib.option;
 
                     enum Option[T] {
                         None;
@@ -6376,7 +6563,7 @@ mod tests {
                 (
                     "main.skunk",
                     r#"
-                    import std.option;
+                    import mylib.option;
 
                     function main(): void {
                         value: Option[int] = wrap(9);
@@ -7139,9 +7326,9 @@ mod tests {
         let stdout = compile_project_and_run(
             &[
                 (
-                    "std/math.skunk",
+                    "mylib/math.skunk",
                     r#"
-                    module std.math;
+                    module mylib.math;
 
                     function helper(n: int): int {
                         return n + 1;
@@ -7155,7 +7342,7 @@ mod tests {
                 (
                     "main.skunk",
                     r#"
-                    import std.math;
+                    import mylib.math;
 
                     function main(): void {
                         print(inc(41));
@@ -7175,9 +7362,9 @@ mod tests {
         let result = compile_project_and_run(
             &[
                 (
-                    "std/math.skunk",
+                    "mylib/math.skunk",
                     r#"
-                    module std.math;
+                    module mylib.math;
 
                     function helper(n: int): int {
                         return n + 1;
@@ -7191,7 +7378,7 @@ mod tests {
                 (
                     "main.skunk",
                     r#"
-                    import std.math;
+                    import mylib.math;
 
                     function main(): void {
                         print(helper(41));
@@ -7211,9 +7398,9 @@ mod tests {
         let stdout = compile_project_and_run(
             &[
                 (
-                    "std/math.skunk",
+                    "mylib/math.skunk",
                     r#"
-                    module std.math;
+                    module mylib.math;
 
                     function inc(n: int): int {
                         return n + 1;
@@ -7223,7 +7410,7 @@ mod tests {
                 (
                     "main.skunk",
                     r#"
-                    import std.math;
+                    import mylib.math;
 
                     function main(): void {
                         print(inc(41));
@@ -7243,9 +7430,9 @@ mod tests {
         let stdout = compile_project_and_run(
             &[
                 (
-                    "std/box.skunk",
+                    "mylib/box.skunk",
                     r#"
-                    module std.box;
+                    module mylib.box;
 
                     struct Box[T] {
                         value: T;
@@ -7259,7 +7446,7 @@ mod tests {
                 (
                     "main.skunk",
                     r#"
-                    import std.box;
+                    import mylib.box;
 
                     function main(): void {
                         value: Box[int] = wrap(7);
@@ -7409,5 +7596,238 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stdout, "41\n");
+    }
+
+    #[test]
+    fn extern_declaration_emits_unmangled_declare_and_call() {
+        let program = ast::parse(
+            r#"
+            extern "C" function cos(value: double): double;
+
+            function main(): void {
+                print(cos(0.0));
+            }
+            "#,
+        );
+        let program = monomorphize::prepare_program(&program).unwrap();
+        type_checker::check(&program).unwrap();
+        let ir = compile_to_llvm_ir(&program).unwrap();
+
+        assert!(
+            ir.contains("declare double @cos(double)"),
+            "missing extern declare in IR:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("call double @cos("),
+            "extern call should use the unmangled symbol:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn extern_declaration_runs_natively() {
+        let stdout = compile_and_run(
+            r#"
+            extern "C" function cos(value: double): double;
+
+            function main(): void {
+                print(cos(0.0));
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(stdout.trim(), "1.000000");
+    }
+
+    #[test]
+    fn extern_declaration_rejects_reserved_runtime_symbols() {
+        let program = ast::parse(
+            r#"
+            extern "C" function malloc(size: long): *byte;
+
+            function main(): void {
+                print(1);
+            }
+            "#,
+        );
+        let program = monomorphize::prepare_program(&program).unwrap();
+        let error = compile_to_llvm_ir(&program).unwrap_err();
+        assert!(
+            error.contains("reserved runtime symbol"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn extern_declaration_rejects_non_abi_safe_types() {
+        let program = ast::parse(
+            r#"
+            struct Point { x: int; y: int; }
+
+            extern "C" function takes_struct(point: Point): void;
+
+            function main(): void {
+                print(1);
+            }
+            "#,
+        );
+        let program = monomorphize::prepare_program(&program).unwrap();
+        let error = type_checker::check(&program).unwrap_err();
+        assert!(
+            error.contains("non C-ABI-safe"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn native_test_runner_reports_results() {
+        let program = ast::parse(
+            r#"
+            function add(a: int, b: int): int {
+                return a + b;
+            }
+
+            test "addition" {
+                Testing::expect(add(2, 2) == 4);
+                Testing::expect_eq(4, add(2, 2));
+            }
+
+            test "more addition" {
+                Testing::expect(add(1, 2) == 3);
+            }
+            "#,
+        );
+        let (test_program, count) =
+            crate::testing::build_test_program(&program, None).unwrap();
+        assert_eq!(count, 2);
+        let test_program = monomorphize::prepare_program(&test_program).unwrap();
+        type_checker::check(&test_program).unwrap();
+
+        let id = Uuid::new_v4().to_string();
+        let source_path = env::temp_dir().join(format!("skunk_test_runner_{}.skunk", id));
+        let output_path = env::temp_dir().join(format!("skunk_test_runner_{}", id));
+        fs::write(&source_path, "generated").unwrap();
+        let artifact = compile_to_executable(&test_program, &source_path, &output_path).unwrap();
+        let output = Command::new(&artifact.binary_path).output().unwrap();
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&artifact.llvm_ir_path);
+        let _ = fs::remove_file(&artifact.binary_path);
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(output.status.success(), "test runner failed: {}", stdout);
+        assert!(stdout.contains("PASS addition"), "stdout: {}", stdout);
+        assert!(stdout.contains("PASS more addition"), "stdout: {}", stdout);
+        assert!(
+            stdout.contains("2 tests, 2 passed, 0 failed"),
+            "stdout: {}",
+            stdout
+        );
+    }
+
+    #[test]
+    fn native_test_runner_fails_with_nonzero_exit() {
+        let program = ast::parse(
+            r#"
+            test "broken" {
+                Testing::expect_eq(1, 2);
+            }
+            "#,
+        );
+        let (test_program, _) = crate::testing::build_test_program(&program, None).unwrap();
+        let test_program = monomorphize::prepare_program(&test_program).unwrap();
+        type_checker::check(&test_program).unwrap();
+
+        let id = Uuid::new_v4().to_string();
+        let source_path = env::temp_dir().join(format!("skunk_test_runner_{}.skunk", id));
+        let output_path = env::temp_dir().join(format!("skunk_test_runner_{}", id));
+        fs::write(&source_path, "generated").unwrap();
+        let artifact = compile_to_executable(&test_program, &source_path, &output_path).unwrap();
+        let output = Command::new(&artifact.binary_path).output().unwrap();
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&artifact.llvm_ir_path);
+        let _ = fs::remove_file(&artifact.binary_path);
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(!output.status.success(), "runner should fail: {}", stdout);
+        assert!(stdout.contains("FAIL broken"), "stdout: {}", stdout);
+        assert!(
+            stdout.contains("expected 1, got 2"),
+            "stdout: {}",
+            stdout
+        );
+    }
+
+    #[test]
+    fn std_math_resolves_from_embedded_sdk() {
+        let stdout = compile_project_and_run(
+            &[(
+                "main.skunk",
+                r#"
+                import std.math;
+
+                function main(): void {
+                    print(sqrt(16.0));
+                    print(max(3, 9));
+                    print(abs(0 - 7));
+                }
+                "#,
+            )],
+            "main.skunk",
+        )
+        .unwrap();
+        assert_eq!(stdout, "4.000000\n9\n7\n");
+    }
+
+    #[test]
+    fn project_module_can_import_std_math() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "main.skunk",
+                    r#"
+                    import calc.ops;
+
+                    function main(): void {
+                        print(hypotenuse(3.0, 4.0));
+                    }
+                    "#,
+                ),
+                (
+                    "calc/ops.skunk",
+                    r#"
+                    module calc.ops;
+
+                    import std.math;
+
+                    export function hypotenuse(a: double, b: double): double {
+                        return sqrt(a * a + b * b);
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+        assert_eq!(stdout, "5.000000\n");
+    }
+
+    #[test]
+    fn test_declarations_are_ignored_outside_skunk_test() {
+        let stdout = compile_and_run(
+            r#"
+            function main(): void {
+                print(7);
+            }
+
+            test "not compiled in normal builds" {
+                Testing::expect(true);
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(stdout, "7\n");
     }
 }

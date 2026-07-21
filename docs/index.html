@@ -24,7 +24,11 @@
                 <a href="#overview">Overview</a>
                 <a href="#status">Status</a>
                 <a href="#compiler-notebook">Compiler Notebook</a>
+                <a href="#install">Install</a>
                 <a href="#toolchain">Toolchain</a>
+                <a href="#building-an-app">Building an App</a>
+                <a href="#standard-library">Standard Library</a>
+                <a href="#native-tests">Native Tests</a>
                 <a href="#programs-and-modules">Programs and Modules</a>
                 <a href="#types">Types</a>
                 <a href="#bindings-and-const">Bindings and Const</a>
@@ -91,6 +95,18 @@
                 </ul>
             </section>
 
+            <section id="install">
+                <h2>Install</h2>
+                <p>Skunk runs on macOS and Linux. It needs <code>clang</code> to link native executables: on macOS run <code>xcode-select --install</code>; on Linux install <code>clang</code> with your package manager.</p>
+                <p>Install the latest release with one command:</p>
+<pre><code class="language-bash">curl -fsSL https://dmgcodevil.github.io/skunk/install.sh | sh</code></pre>
+                <p>The script detects your OS and architecture, downloads the prebuilt binary from <a href="https://github.com/dmgcodevil/skunk/releases">GitHub Releases</a>, verifies its checksum, and installs it to <code>~/.skunk/bin</code>. Set <code>SKUNK_VERSION=v0.1.0</code> before the command to pin a specific version.</p>
+                <p>Alternatively, download a tarball from the releases page manually, or build from source with Rust:</p>
+<pre><code class="language-bash">cargo install --git https://github.com/dmgcodevil/skunk</code></pre>
+                <p>Verify the installation:</p>
+<pre><code class="language-bash">skunk --help</code></pre>
+            </section>
+
             <section id="toolchain">
                 <h2>Toolchain</h2>
                 <p>Build Skunk with Rust, then compile a Skunk entry file into a native executable.</p>
@@ -100,6 +116,70 @@ cargo run -- compile path/to/main.skunk ./out
                 <p>Compile and run through a temporary native executable with either command:</p>
 <pre><code class="language-bash">cargo run -- path/to/main.skunk</code></pre>
 <pre><code class="language-bash">cargo run -- run path/to/main.skunk</code></pre>
+            </section>
+
+            <section id="building-an-app">
+                <h2>Building an App</h2>
+                <p>Scaffold a project with <code>skunk new</code>. It creates a manifest, an entry file with a hello-world <code>main</code>, and a starter test:</p>
+<pre><code class="language-bash">skunk new demo
+cd demo
+skunk build      # compiles src/main.skunk into target/demo
+./target/demo</code></pre>
+                <p>The project layout:</p>
+<pre><code class="language-text">demo/
+  skunk.toml       # project manifest
+  src/main.skunk   # entry point
+  target/          # build output (gitignored)</code></pre>
+                <p><code>skunk.toml</code> configures the build. <code>libraries</code> adds <code>-l</code> linker flags and <code>frameworks</code> adds macOS frameworks, which is how programs using <code>extern "C"</code> link against native libraries:</p>
+<pre><code class="language-toml">[package]
+name = "demo"
+entry = "src/main.skunk"
+
+[build]
+optimize = true
+libraries = ["sqlite3"]
+frameworks = ["Cocoa"]</code></pre>
+                <p>Single files still work without a project: <code>skunk run file.skunk</code> and <code>skunk compile file.skunk out</code> are unchanged.</p>
+            </section>
+
+            <section id="standard-library">
+                <h2>Standard Library</h2>
+                <p>The standard library ships embedded inside the compiler binary and is materialized on first use, so an installed <code>skunk</code> needs no separate SDK download. The <code>std.</code> import prefix is reserved: it always resolves into the SDK, never into project files.</p>
+<pre><code class="language-skunk">import std.math;
+
+function main(): void {
+    print(sqrt(16.0));
+    print(pow(2.0, 10.0));
+    print(max(3, 9));
+}</code></pre>
+                <p><code>std.math</code> provides double-precision functions bound to libm through <code>extern "C"</code> (<code>sqrt</code>, <code>cbrt</code>, <code>pow</code>, <code>exp</code>, <code>log</code>, <code>log2</code>, <code>log10</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>asin</code>, <code>acos</code>, <code>atan</code>, <code>atan2</code>, <code>floor</code>, <code>ceil</code>, <code>round</code>, <code>fabs</code>, <code>fmod</code>) and integer helpers written in Skunk (<code>abs</code>, <code>min</code>, <code>max</code>, <code>clamp</code>). The SDK and compiler are one artifact and share one version. See <code>examples/calculator</code> for a project that combines a custom module with <code>std.math</code>.</p>
+            </section>
+
+            <section id="native-tests">
+                <h2>Native Tests</h2>
+                <p>Tests are declared next to the code they cover with <code>test</code> blocks. Assertions go through the <code>Testing</code> API:</p>
+<pre><code class="language-skunk">struct Point {
+    x: int;
+    y: int;
+}
+
+test "struct shorthand" {
+    x: int = 3;
+    point: Point = Point { x, y: 4 };
+
+    Testing::expect(point.x == 3);
+    Testing::expect_eq(4, point.y);
+}</code></pre>
+                <p>Run tests with the <code>test</code> command. In a project directory, <code>skunk test</code> uses the manifest entry; a file path or a name filter can be given explicitly:</p>
+<pre><code class="language-bash">skunk test
+skunk test path/to/module.skunk
+skunk test --filter shorthand</code></pre>
+                <p>The runner compiles tests natively: each <code>test</code> block becomes a function, a generated <code>main</code> drives them, and the process exits non-zero if any test fails. Output reports each test with its elapsed time:</p>
+<pre><code class="language-text">PASS addition (0.01 ms)
+FAIL struct shorthand (0.02 ms)
+
+2 tests, 1 passed, 1 failed</code></pre>
+                <p>Available assertions: <code>Testing::expect(condition)</code>, <code>Testing::expect_eq(expected, actual)</code>, and <code>Testing::fail()</code>. A failed assertion marks the test failed but keeps executing, so one run reports every failing assertion. Test blocks are ignored by <code>skunk run</code>, <code>skunk compile</code>, and <code>skunk build</code> — they only compile during <code>skunk test</code>.</p>
             </section>
 
             <section id="programs-and-modules">

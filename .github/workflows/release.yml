@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            run_tests: true
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            run_tests: false # cross-arch build; tests run on the native target
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            run_tests: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            run_tests: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.run_tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          STAGE=skunk-${{ matrix.target }}
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/skunk "$STAGE/"
+          cp README.md "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skunk-${{ matrix.target }}
+          path: skunk-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

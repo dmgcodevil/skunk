@@ -151,3 +151,86 @@ void skunk_alloc_destroy(void *allocator_ptr, void *memory) {
 void skunk_alloc_free(void *allocator_ptr, void *memory) {
     skunk_alloc_destroy(allocator_ptr, memory);
 }
+
+/* ---------------------------------------------------------------------------
+ * Native test harness.
+ *
+ * `skunk test` generates a runner main that drives these hooks:
+ *   skunk_test_begin(name) -> run test body -> skunk_test_end()
+ * and finally returns skunk_test_summary() as the process exit code.
+ * Assertion helpers (expect / expect_eq / fail) mark the current test failed
+ * but keep executing so a single run reports every failing assertion.
+ * ------------------------------------------------------------------------- */
+
+#include <stdio.h>
+#include <time.h>
+
+static int skunk_test_total = 0;
+static int skunk_test_failures = 0;
+static int skunk_test_current_failed = 0;
+static const char *skunk_test_current_name = "";
+static double skunk_test_started_ms = 0.0;
+
+static double skunk_test_now_ms(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+void skunk_test_begin(const char *name) {
+    skunk_test_total += 1;
+    skunk_test_current_failed = 0;
+    skunk_test_current_name = name == NULL ? "" : name;
+    skunk_test_started_ms = skunk_test_now_ms();
+}
+
+void skunk_test_expect(_Bool condition) {
+    if (!condition) {
+        skunk_test_current_failed = 1;
+        printf("    expect failed in test \"%s\"\n", skunk_test_current_name);
+    }
+}
+
+void skunk_test_expect_eq_int(int32_t expected, int32_t actual) {
+    if (expected != actual) {
+        skunk_test_current_failed = 1;
+        printf("    expect_eq failed in test \"%s\": expected %d, got %d\n",
+               skunk_test_current_name, expected, actual);
+    }
+}
+
+void skunk_test_expect_eq_long(int64_t expected, int64_t actual) {
+    if (expected != actual) {
+        skunk_test_current_failed = 1;
+        printf("    expect_eq failed in test \"%s\": expected %lld, got %lld\n",
+               skunk_test_current_name, (long long)expected, (long long)actual);
+    }
+}
+
+void skunk_test_fail(void) {
+    skunk_test_current_failed = 1;
+    printf("    fail() called in test \"%s\"\n", skunk_test_current_name);
+}
+
+void skunk_test_end(void) {
+    double elapsed = skunk_test_now_ms() - skunk_test_started_ms;
+    if (skunk_test_current_failed) {
+        skunk_test_failures += 1;
+        printf("FAIL %s (%.2f ms)\n", skunk_test_current_name, elapsed);
+    } else {
+        printf("PASS %s (%.2f ms)\n", skunk_test_current_name, elapsed);
+    }
+}
+
+int32_t skunk_test_summary(void) {
+    printf("\n%d test%s, %d passed, %d failed\n",
+           skunk_test_total,
+           skunk_test_total == 1 ? "" : "s",
+           skunk_test_total - skunk_test_failures,
+           skunk_test_failures);
+    return skunk_test_failures > 0 ? 1 : 0;
+}
