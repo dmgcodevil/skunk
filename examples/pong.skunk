@@ -1,0 +1,139 @@
+function clamp(value: double, min_value: double, max_value: double): double {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+function draw_score(window: Window, score: int, start_x: double): void {
+    for (i: int = 0; i < score; i = i + 1) {
+        window.draw_rect(start_x + (i * 14.0), 18.0, 8.0, 18.0, Color::white());
+    }
+}
+
+function draw_center_line(window: Window): void {
+    for (y: int = 28; y < 560; y = y + 28) {
+        window.draw_rect(394.0, y, 12.0, 16.0, Color::rgb(52, 70, 104));
+    }
+}
+
+function reset_ball(ball_x: &mut double, ball_y: &mut double, ball_vx: &mut double, ball_vy: &mut double, serve_right: boolean): void {
+    ball_x.* = 394.0;
+    ball_y.* = 294.0;
+    if (serve_right) {
+        ball_vx.* = 260.0;
+        ball_vy.* = 180.0;
+    } else {
+        ball_vx.* = -260.0;
+        ball_vy.* = -180.0;
+    }
+}
+
+function main(): void {
+    window: Window = Window::create(800, 600, "Skunk Pong");
+
+    paddle_w: double = 14.0;
+    paddle_h: double = 96.0;
+    ball_size: double = 12.0;
+    left_paddle_x: double = 32.0;
+    right_paddle_x: double = 754.0;
+    left_y: double = 252.0;
+    right_y: double = 252.0;
+    player_speed: double = 360.0;
+    ai_speed: double = 300.0;
+    left_score: int = 0;
+    right_score: int = 0;
+    max_score: int = 5;
+
+    ball_x: double = 394.0;
+    ball_y: double = 294.0;
+    ball_vx: double = 260.0;
+    ball_vy: double = 180.0;
+
+    for (; window.is_open() && (left_score < max_score) && (right_score < max_score); ) {
+        window.poll();
+        dt: double = window.delta_time();
+
+        if (Keyboard::is_down(window, 'q')) {
+            window.close();
+        }
+        if (Keyboard::is_down(window, 'w')) {
+            left_y = left_y - player_speed * dt;
+        }
+        if (Keyboard::is_down(window, 's')) {
+            left_y = left_y + player_speed * dt;
+        }
+        left_y = clamp(left_y, 18.0, 600.0 - 18.0 - paddle_h);
+
+        ball_center: double = ball_y + (ball_size / 2.0);
+        ai_center: double = right_y + (paddle_h / 2.0);
+        if (ball_center < (ai_center - 10.0)) {
+            right_y = right_y - ai_speed * dt;
+        }
+        if (ball_center > (ai_center + 10.0)) {
+            right_y = right_y + ai_speed * dt;
+        }
+        right_y = clamp(right_y, 18.0, 600.0 - 18.0 - paddle_h);
+
+        ball_x = ball_x + ball_vx * dt;
+        ball_y = ball_y + ball_vy * dt;
+
+        if (ball_y <= 18.0) {
+            ball_y = 18.0;
+            ball_vy = 0.0 - ball_vy;
+        }
+        if ((ball_y + ball_size) >= 582.0) {
+            ball_y = 582.0 - ball_size;
+            ball_vy = 0.0 - ball_vy;
+        }
+
+        left_moving_toward_paddle: boolean = ball_vx < 0.0;
+        left_hits_front: boolean = ball_x <= (left_paddle_x + paddle_w);
+        left_crosses_back: boolean = (ball_x + ball_size) >= left_paddle_x;
+        left_crosses_top: boolean = (ball_y + ball_size) >= left_y;
+        left_crosses_bottom: boolean = ball_y <= (left_y + paddle_h);
+        if (left_moving_toward_paddle && left_hits_front && left_crosses_back && left_crosses_top && left_crosses_bottom) {
+            ball_x = left_paddle_x + paddle_w;
+            ball_vx = 0.0 - ball_vx;
+            ball_vy = ((ball_y + (ball_size / 2.0)) - (left_y + (paddle_h / 2.0))) * 4.0;
+        }
+
+        right_moving_toward_paddle: boolean = ball_vx > 0.0;
+        right_crosses_front: boolean = (ball_x + ball_size) >= right_paddle_x;
+        right_hits_back: boolean = ball_x <= (right_paddle_x + paddle_w);
+        right_crosses_top: boolean = (ball_y + ball_size) >= right_y;
+        right_crosses_bottom: boolean = ball_y <= (right_y + paddle_h);
+        if (right_moving_toward_paddle && right_crosses_front && right_hits_back && right_crosses_top && right_crosses_bottom) {
+            ball_x = right_paddle_x - ball_size;
+            ball_vx = 0.0 - ball_vx;
+            ball_vy = ((ball_y + (ball_size / 2.0)) - (right_y + (paddle_h / 2.0))) * 4.0;
+        }
+
+        if ((ball_x + ball_size) < 0.0) {
+            right_score = right_score + 1;
+            reset_ball(&mut ball_x, &mut ball_y, &mut ball_vx, &mut ball_vy, true);
+        }
+        if (ball_x > 800.0) {
+            left_score = left_score + 1;
+            reset_ball(&mut ball_x, &mut ball_y, &mut ball_vx, &mut ball_vy, false);
+        }
+
+        window.clear(Color::rgb(8, 12, 24));
+        window.draw_rect(0.0, 0.0, 800.0, 12.0, Color::rgb(20, 28, 46));
+        window.draw_rect(0.0, 588.0, 800.0, 12.0, Color::rgb(20, 28, 46));
+        draw_center_line(window);
+        draw_score(window, left_score, 28.0);
+        draw_score(window, right_score, 702.0);
+        window.draw_rect(left_paddle_x, left_y, paddle_w, paddle_h, Color::white());
+        window.draw_rect(right_paddle_x, right_y, paddle_w, paddle_h, Color::white());
+        window.draw_rect(ball_x, ball_y, ball_size, ball_size, Color::rgb(255, 214, 92));
+        window.present();
+    }
+
+    print(left_score);
+    print(right_score);
+    window.deinit();
+}

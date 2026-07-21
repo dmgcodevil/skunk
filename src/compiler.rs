@@ -7116,6 +7116,9 @@ mod tests {
         assert_eq!(stdout, "123\n7\n7\n");
     }
 
+    // The window runtime is macOS-only (skunk_window_runtime.m + Cocoa), so
+    // programs calling Window/Keyboard APIs cannot link on other platforms.
+    #[cfg(target_os = "macos")]
     #[test]
     fn runs_compiled_headless_window_program() {
         let stdout = compile_and_run_with_env(
@@ -7141,6 +7144,7 @@ mod tests {
         assert_eq!(stdout, "true\nfalse\ntrue\nfalse\n");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn runs_headless_pong_example() {
         // Read at runtime (not include_str!) so a missing example file fails
