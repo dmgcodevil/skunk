@@ -2564,6 +2564,28 @@ impl Monomorphizer {
                             }
                         }
                     }
+                    Type::Custom(bounds_name) if bounds_name == "Bounds" => {
+                        if name != "check" {
+                            return Err(format!(
+                                "unsupported static call during monomorphization: `Bounds::{}`",
+                                name
+                            ));
+                        }
+                        if arguments.len() != 2 {
+                            return Err("Bounds::check expects index and length".to_string());
+                        }
+                        for argument in arguments {
+                            let (argument, _) = self.transform_expr(
+                                argument,
+                                env,
+                                Some(&Type::Int),
+                                substitutions,
+                                self_type.clone(),
+                            )?;
+                            output_args.push(argument);
+                        }
+                        Type::Void
+                    }
                     Type::Arena if name == "init" => {
                         for argument in arguments {
                             let (argument, _) = self.transform_expr(

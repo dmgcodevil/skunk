@@ -2825,6 +2825,35 @@ fn resolve_type(
                         }
                     }
                 }
+                Type::Custom(custom_name) if custom_name == "Bounds" => {
+                    if name != "check" {
+                        return Err(format!(
+                            "error {}:{}: Bounds does not support static method `{}`",
+                            metadata.span.line, metadata.span.start, name
+                        ));
+                    }
+                    if arguments.len() != 2 {
+                        return Err(format!(
+                            "error {}:{}: Bounds::check expects index and length",
+                            metadata.span.line, metadata.span.start
+                        ));
+                    }
+                    for argument in arguments {
+                        let arg_type = resolve_type(
+                            global_scope,
+                            symbol_tables,
+                            argument,
+                            Some(&Type::Int),
+                        )?;
+                        if !is_integral_type(&arg_type.sk_type) {
+                            return Err(format!(
+                                "error {}:{}: Bounds::check arguments must be integers",
+                                metadata.span.line, metadata.span.start
+                            ));
+                        }
+                    }
+                    return Ok(ResolveResult::new(Type::Void));
+                }
                 Type::Custom(custom_name) if custom_name == "System" => {
                     if name != "allocator" || !arguments.is_empty() {
                         return Err(format!(

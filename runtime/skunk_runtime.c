@@ -1,5 +1,27 @@
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+
+void skunk_panic_index_out_of_bounds(int64_t index, int64_t length) {
+    fprintf(stderr,
+            "panic: index %lld out of bounds for length %lld\n",
+            (long long)index,
+            (long long)length);
+    fflush(stderr);
+    abort();
+}
+
+void skunk_panic_slice_range_out_of_bounds(int64_t start,
+                                            int64_t end,
+                                            int64_t length) {
+    fprintf(stderr,
+            "panic: slice range [%lld:%lld] out of bounds for length %lld\n",
+            (long long)start,
+            (long long)end,
+            (long long)length);
+    fflush(stderr);
+    abort();
+}
 
 typedef struct SkunkArenaNode {
     void *memory;
@@ -162,7 +184,6 @@ void skunk_alloc_free(void *allocator_ptr, void *memory) {
  * but keep executing so a single run reports every failing assertion.
  * ------------------------------------------------------------------------- */
 
-#include <stdio.h>
 #include <time.h>
 
 static int skunk_test_total = 0;

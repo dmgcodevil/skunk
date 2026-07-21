@@ -1448,6 +1448,24 @@ impl<'a> FunctionCompiler<'a> {
             });
         }
         match sk_type {
+            Type::Custom(bounds_name) if bounds_name == "Bounds" => {
+                if name != "check" {
+                    return Err(format!(
+                        "LLVM backend does not support static function call `Bounds::{}`",
+                        name
+                    ));
+                }
+                if arguments.len() != 2 {
+                    return Err("Bounds::check expects index and length".to_string());
+                }
+                let index = self.compile_expr(&arguments[0])?;
+                let length = self.compile_expr(&arguments[1])?;
+                self.emit_index_bounds_check(&index, &length)?;
+                Ok(ExprValue {
+                    llvm_type: LlvmType::Void,
+                    value: "void".to_string(),
+                })
+            }
             Type::Custom(memory_name) if memory_name == "Memory" => {
                 if !self.unsafe_allowed() {
                     return Err(format!("Memory::{} requires an unsafe block", name));
@@ -2139,6 +2157,8 @@ impl<'a> FunctionCompiler<'a> {
             None => base_len.clone(),
         };
 
+        self.emit_slice_range_bounds_check(&start_value, &end_value, base_len)?;
+
         let start_i64 = self.coerce_expr(start_value.clone(), &LlvmType::I64, "slice start")?;
         let offset_ptr = if data_ptr == "null" {
             "null".to_string()
@@ -2232,6 +2252,97 @@ impl<'a> FunctionCompiler<'a> {
             }
             other => Err(format!("expected slice value, found `{}`", other.ir())),
         }
+    }
+
+    fn emit_index_bounds_check(
+        &mut self,
+        index: &ExprValue,
+        length: &ExprValue,
+    ) -> Result<(), String> {
+        let index = self.coerce_expr(index.clone(), &LlvmType::I64, "bounds-check index")?;
+        let length = self.coerce_expr(length.clone(), &LlvmType::I64, "bounds-check length")?;
+        let non_negative = self.next_temp();
+        self.emit_line(format!(
+            "{} = icmp sge i64 {}, 0",
+            non_negative, index.value
+        ));
+        let below_length = self.next_temp();
+        self.emit_line(format!(
+            "{} = icmp slt i64 {}, {}",
+            below_length, index.value, length.value
+        ));
+        let valid = self.next_temp();
+        self.emit_line(format!(
+            "{} = and i1 {}, {}",
+            valid, non_negative, below_length
+        ));
+
+        let ok_label = self.next_label("bounds_ok");
+        let panic_label = self.next_label("bounds_panic");
+        self.emit_line(format!(
+            "br i1 {}, label %{}, label %{}",
+            valid, ok_label, panic_label
+        ));
+        self.emit_label(&panic_label);
+        self.emit_line(format!(
+            "call void @skunk_panic_index_out_of_bounds(i64 {}, i64 {})",
+            index.value, length.value
+        ));
+        self.emit_line("unreachable".to_string());
+        self.emit_label(&ok_label);
+        Ok(())
+    }
+
+    fn emit_slice_range_bounds_check(
+        &mut self,
+        start: &ExprValue,
+        end: &ExprValue,
+        length: &ExprValue,
+    ) -> Result<(), String> {
+        let start = self.coerce_expr(start.clone(), &LlvmType::I64, "slice start")?;
+        let end = self.coerce_expr(end.clone(), &LlvmType::I64, "slice end")?;
+        let length = self.coerce_expr(length.clone(), &LlvmType::I64, "slice length")?;
+
+        let start_non_negative = self.next_temp();
+        self.emit_line(format!(
+            "{} = icmp sge i64 {}, 0",
+            start_non_negative, start.value
+        ));
+        let ordered = self.next_temp();
+        self.emit_line(format!(
+            "{} = icmp sle i64 {}, {}",
+            ordered, start.value, end.value
+        ));
+        let end_in_bounds = self.next_temp();
+        self.emit_line(format!(
+            "{} = icmp sle i64 {}, {}",
+            end_in_bounds, end.value, length.value
+        ));
+        let valid_start = self.next_temp();
+        self.emit_line(format!(
+            "{} = and i1 {}, {}",
+            valid_start, start_non_negative, ordered
+        ));
+        let valid = self.next_temp();
+        self.emit_line(format!(
+            "{} = and i1 {}, {}",
+            valid, valid_start, end_in_bounds
+        ));
+
+        let ok_label = self.next_label("slice_bounds_ok");
+        let panic_label = self.next_label("slice_bounds_panic");
+        self.emit_line(format!(
+            "br i1 {}, label %{}, label %{}",
+            valid, ok_label, panic_label
+        ));
+        self.emit_label(&panic_label);
+        self.emit_line(format!(
+            "call void @skunk_panic_slice_range_out_of_bounds(i64 {}, i64 {}, i64 {})",
+            start.value, end.value, length.value
+        ));
+        self.emit_line("unreachable".to_string());
+        self.emit_label(&ok_label);
+        Ok(())
     }
 
     /// Lowers a typed struct literal into an LLVM aggregate value.
@@ -3084,7 +3195,12 @@ impl<'a> FunctionCompiler<'a> {
                         let index = self.compile_expr(coordinate)?;
                         let index = self.coerce_expr(index, &LlvmType::I64, "array index")?;
                         match current_type.clone() {
-                            LlvmType::Array { elem_type, .. } => {
+                            LlvmType::Array { elem_type, len } => {
+                                let length = ExprValue {
+                                    llvm_type: LlvmType::I64,
+                                    value: len.to_string(),
+                                };
+                                self.emit_index_bounds_check(&index, &length)?;
                                 let temp = self.next_temp();
                                 self.emit_line(format!(
                                     "{} = getelementptr inbounds {}, ptr {}, i64 0, i64 {}",
@@ -3098,6 +3214,8 @@ impl<'a> FunctionCompiler<'a> {
                             }
                             LlvmType::Slice { elem_type } => {
                                 let slice_value = self.load_from_ptr(&ptr, &current_type)?;
+                                let length = self.extract_slice_len(&slice_value)?;
+                                self.emit_index_bounds_check(&index, &length)?;
                                 let data_ptr = self.extract_slice_data(&slice_value)?;
                                 let temp = self.next_temp();
                                 self.emit_line(format!(
@@ -4914,6 +5032,8 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         "skunk_alloc_buffer",
         "skunk_alloc_destroy",
         "skunk_alloc_free",
+        "skunk_panic_index_out_of_bounds",
+        "skunk_panic_slice_range_out_of_bounds",
         "skunk_window_create",
         "skunk_window_is_open",
         "skunk_window_poll",
@@ -5279,6 +5399,8 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let _ = writeln!(ir, "declare ptr @skunk_alloc_buffer(ptr, i64, i32)");
     let _ = writeln!(ir, "declare void @skunk_alloc_destroy(ptr, ptr)");
     let _ = writeln!(ir, "declare void @skunk_alloc_free(ptr, ptr)");
+    let _ = writeln!(ir, "declare void @skunk_panic_index_out_of_bounds(i64, i64)");
+    let _ = writeln!(ir, "declare void @skunk_panic_slice_range_out_of_bounds(i64, i64, i64)");
     let _ = writeln!(ir, "declare ptr @skunk_window_create(i32, i32, ptr)");
     let _ = writeln!(ir, "declare i1 @skunk_window_is_open(ptr)");
     let _ = writeln!(ir, "declare void @skunk_window_poll(ptr)");
@@ -5414,9 +5536,11 @@ mod tests {
         let _ = fs::remove_file(&artifact.binary_path);
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
-                "compiled program exited with status {}",
-                output.status
+                "compiled program exited with status {}: {}",
+                output.status,
+                stderr.trim()
             ));
         }
 
@@ -5448,9 +5572,11 @@ mod tests {
         let _ = fs::remove_file(&artifact.binary_path);
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
-                "compiled program exited with status {}",
-                output.status
+                "compiled program exited with status {}: {}",
+                output.status,
+                stderr.trim()
             ));
         }
 
@@ -5618,6 +5744,7 @@ mod tests {
         assert!(ir.contains("[3 x i32]"));
         assert!(ir.contains("getelementptr inbounds [3 x i32]"));
         assert!(ir.contains("insertvalue [3 x i32]"));
+        assert!(ir.contains("call void @skunk_panic_index_out_of_bounds"));
     }
 
     #[test]
@@ -5637,6 +5764,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "0\n8\n3\n");
+    }
+
+    #[test]
+    fn fixed_array_index_out_of_bounds_panics() {
+        let error = compile_and_run(
+            r#"
+            function main(): void {
+                values: [3]int = [10, 20, 30];
+                index: int = 3;
+                print(values[index]);
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("panic: index 3 out of bounds for length 3"));
+    }
+
+    #[test]
+    fn negative_array_index_panics() {
+        let error = compile_and_run(
+            r#"
+            function main(): void {
+                values: [2]int = [10, 20];
+                index: int = -1;
+                values[index] = 99;
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("panic: index -1 out of bounds for length 2"));
     }
 
     #[test]
@@ -6073,6 +6232,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, "3\n20\n30\n50\n");
+    }
+
+    #[test]
+    fn slice_index_out_of_bounds_panics() {
+        let error = compile_and_run(
+            r#"
+            function main(): void {
+                values: []int = [10, 20];
+                index: int = values.len;
+                print(values[index]);
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("panic: index 2 out of bounds for length 2"));
+    }
+
+    #[test]
+    fn invalid_slice_range_panics() {
+        let error = compile_and_run(
+            r#"
+            function main(): void {
+                values: [4]int = [10, 20, 30, 40];
+                start: int = 3;
+                end: int = 2;
+                invalid: []int = values[start:end];
+                print(invalid.len);
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains(
+            "panic: slice range [3:2] out of bounds for length 4"
+        ));
+    }
+
+    #[test]
+    fn explicit_bounds_check_uses_logical_length() {
+        let error = compile_and_run(
+            r#"
+            function main(): void {
+                backing_capacity: int = 8;
+                logical_length: int = 2;
+                index: int = 3;
+                Bounds::check(index, logical_length);
+                print(backing_capacity);
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("panic: index 3 out of bounds for length 2"));
     }
 
     #[test]

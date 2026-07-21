@@ -410,6 +410,9 @@ print(mid[0]);</code></pre>
                     <li><code>[N]T</code> without an initializer is zero-initialized.</li>
                     <li><code>[N]T::fill(value)</code> fills every element with the given value.</li>
                     <li>Slices support indexing, <code>.len</code>, and range slicing with omitted bounds.</li>
+                    <li>Fixed-array and slice indexing is checked at runtime. A negative index or an index greater than or equal to <code>.len</code> stops the program with a panic such as <code>panic: index 4 out of bounds for length 4</code>.</li>
+                    <li>Slice ranges require <code>0 &lt;= start &lt;= end &lt;= len</code>; invalid ranges also panic.</li>
+                    <li>Collection implementations whose logical length differs from their backing slice can use <code>Bounds::check(index, length)</code> before accessing storage.</li>
                     <li>Fixed arrays can be passed and returned by value.</li>
                 </ul>
             </section>
@@ -531,6 +534,7 @@ function main(): void {
                     <li><code>*T::cast(ptr)</code> reinterprets one pointer type as another pointer type.</li>
                     <li><code>*byte::offset(ptr, n)</code> performs byte-wise pointer offsetting.</li>
                     <li><code>Memory::copy(dst, src, count)</code> and <code>Memory::set(dst, value, count)</code> operate on raw bytes.</li>
+                    <li>Raw pointer dereferences and offsets remain unchecked; runtime bounds checks apply to fixed arrays and slices.</li>
                 </ul>
             </section>
 
