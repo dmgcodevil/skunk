@@ -36,6 +36,9 @@ struct EnumTemplate {
 #[derive(Clone)]
 struct TraitTemplate {
     name: String,
+    generic_params: Vec<String>,
+    generic_bounds: HashMap<String, Vec<String>>,
+    subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     supertraits: Vec<String>,
     methods: Vec<ast::TraitMethodSignature>,
 }
@@ -51,7 +54,7 @@ struct ImplTemplate {
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
     subtype_bounds: HashMap<String, ast::SubtypeBounds>,
-    trait_names: Vec<String>,
+    trait_types: Vec<Type>,
     target_type: Type,
 }
 
@@ -168,9 +171,12 @@ struct Monomorphizer {
     generated_struct_order: Vec<String>,
     generated_enums: HashMap<String, Node>,
     generated_enum_order: Vec<String>,
+    generated_traits: HashMap<String, Node>,
+    generated_trait_order: Vec<String>,
     function_stack: HashSet<String>,
     struct_stack: HashSet<String>,
     enum_stack: HashSet<String>,
+    trait_stack: HashSet<String>,
     root_statements: Vec<Node>,
 }
 
@@ -318,6 +324,9 @@ impl Monomorphizer {
                 }
                 Node::TraitDeclaration {
                     name,
+                    generic_params,
+                    generic_bounds,
+                    subtype_bounds,
                     supertraits,
                     methods,
                 } => {
@@ -325,11 +334,16 @@ impl Monomorphizer {
                         name.clone(),
                         TraitTemplate {
                             name: name.clone(),
+                            generic_params: generic_params.clone(),
+                            generic_bounds: generic_bounds.clone(),
+                            subtype_bounds: subtype_bounds.clone(),
                             supertraits: supertraits.clone(),
                             methods: methods.clone(),
                         },
                     );
-                    root_traits.push(statement.clone());
+                    if generic_params.is_empty() {
+                        root_traits.push(statement.clone());
+                    }
                 }
                 Node::ShapeDeclaration { name, methods } => {
                     shapes.insert(
@@ -365,17 +379,21 @@ impl Monomorphizer {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
-                    trait_names,
+                    trait_types,
                     target_type,
                 } => {
                     impls.push(ImplTemplate {
                         generic_params: generic_params.clone(),
                         generic_bounds: generic_bounds.clone(),
                         subtype_bounds: subtype_bounds.clone(),
-                        trait_names: trait_names.clone(),
+                        trait_types: trait_types.clone(),
                         target_type: target_type.clone(),
                     });
-                    if generic_params.is_empty() {
+                    if generic_params.is_empty()
+                        && trait_types
+                            .iter()
+                            .all(|trait_type| matches!(trait_type, Type::Custom(_)))
+                    {
                         root_concrete_impls.push(statement.clone());
                     }
                 }
@@ -446,9 +464,12 @@ impl Monomorphizer {
             generated_struct_order: Vec::new(),
             generated_enums: HashMap::new(),
             generated_enum_order: Vec::new(),
+            generated_traits: HashMap::new(),
+            generated_trait_order: Vec::new(),
             function_stack: HashSet::new(),
             struct_stack: HashSet::new(),
             enum_stack: HashSet::new(),
+            trait_stack: HashSet::new(),
             root_statements,
         })
     }
@@ -548,6 +569,11 @@ impl Monomorphizer {
         }
         for name in self.generated_enum_order.clone() {
             if let Some(node) = self.generated_enums.get(&name) {
+                output.push(node.clone());
+            }
+        }
+        for name in self.generated_trait_order.clone() {
+            if let Some(node) = self.generated_traits.get(&name) {
                 output.push(node.clone());
             }
         }
@@ -831,28 +857,40 @@ impl Monomorphizer {
         for impl_block in impls {
             self.validate_impl_target_type(&impl_block.target_type, &impl_block.generic_params)?;
             let target_key = ast::type_to_string(&impl_block.target_type);
-            for trait_name in impl_block.trait_names {
-                let trait_template = self
-                    .traits
-                    .get(&trait_name)
-                    .cloned()
-                    .ok_or_else(|| format!("unknown trait `{}`", trait_name))?;
-                self.validate_trait_implementation(&trait_template, &impl_block.target_type)?;
+            for trait_type in impl_block.trait_types {
+                let (trait_template, trait_substitutions) =
+                    self.resolve_trait_reference(&trait_type)?;
+                self.validate_trait_implementation(
+                    &trait_template,
+                    &trait_substitutions,
+                    &trait_type,
+                    &impl_block.target_type,
+                )?;
                 if impl_block.generic_params.is_empty() {
+                    let concrete_trait_name = self.ensure_trait_for_type(&trait_type)?;
                     let implied_traits =
-                        self.collect_trait_ancestors(&trait_name, &mut Vec::new())?;
+                        self.collect_trait_ancestors(&concrete_trait_name, &mut Vec::new())?;
                     let implemented = self
                         .implemented_traits
                         .entry(target_key.clone())
                         .or_default();
-                    if !implemented.insert(trait_name.clone()) {
+                    if !implemented.insert(concrete_trait_name.clone()) {
                         return Err(format!(
                             "duplicate impl of trait `{}` for `{}`",
-                            trait_name, target_key
+                            concrete_trait_name, target_key
                         ));
                     }
-                    self.generated_impl_keys
-                        .insert(format!("{}=>{}", trait_name, target_key));
+                    let primary_key = format!("{}=>{}", concrete_trait_name, target_key);
+                    self.generated_impl_keys.insert(primary_key);
+                    if !matches!(&trait_type, Type::Custom(name) if name == &concrete_trait_name) {
+                        self.generated_impls.push(Node::ImplDeclaration {
+                            generic_params: Vec::new(),
+                            generic_bounds: HashMap::new(),
+                            subtype_bounds: HashMap::new(),
+                            trait_types: vec![Type::Custom(concrete_trait_name.clone())],
+                            target_type: impl_block.target_type.clone(),
+                        });
+                    }
                     for implied_trait in implied_traits {
                         implemented.insert(implied_trait.clone());
                         let implied_key = format!("{}=>{}", implied_trait, target_key);
@@ -861,15 +899,55 @@ impl Monomorphizer {
                                     generic_params: Vec::new(),
                                     generic_bounds: HashMap::new(),
                                     subtype_bounds: HashMap::new(),
-                                trait_names: vec![implied_trait],
-                                target_type: impl_block.target_type.clone(),
-                            });
+                                    trait_types: vec![Type::Custom(implied_trait)],
+                                    target_type: impl_block.target_type.clone(),
+                                });
                         }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    fn resolve_trait_reference(
+        &self,
+        trait_type: &Type,
+    ) -> Result<(TraitTemplate, HashMap<String, Type>), String> {
+        let (name, arguments) = match trait_type {
+            Type::Custom(name) => (name, &[][..]),
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => (base, type_arguments.as_slice()),
+            other => {
+                return Err(format!(
+                    "impl requires a trait type, found `{}`",
+                    ast::type_to_string(other)
+                ))
+            }
+        };
+        let template = self
+            .traits
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown trait `{}`", name))?;
+        if template.generic_params.len() != arguments.len() {
+            return Err(format!(
+                "trait `{}` expects {} type argument{}, got {}",
+                name,
+                template.generic_params.len(),
+                if template.generic_params.len() == 1 { "" } else { "s" },
+                arguments.len()
+            ));
+        }
+        let substitutions = template
+            .generic_params
+            .iter()
+            .cloned()
+            .zip(arguments.iter().cloned())
+            .collect();
+        Ok((template, substitutions))
     }
 
     fn validate_impl_target_type(
@@ -950,19 +1028,31 @@ impl Monomorphizer {
     fn validate_trait_implementation(
         &mut self,
         trait_template: &TraitTemplate,
+        trait_substitutions: &HashMap<String, Type>,
+        trait_type: &Type,
         target_type: &Type,
     ) -> Result<(), String> {
-        for method in self.collect_trait_methods(&trait_template.name, &mut Vec::new())? {
+        let trait_display = ast::type_to_string(trait_type);
+        for mut method in self.collect_trait_methods(&trait_template.name, &mut Vec::new())? {
+            method.parameters = method
+                .parameters
+                .into_iter()
+                .map(|(name, sk_type)| {
+                    (name, self.apply_substitutions(&sk_type, trait_substitutions))
+                })
+                .collect();
+            method.return_type =
+                self.apply_substitutions(&method.return_type, trait_substitutions);
             let Some((_, expected_receiver_type)) = method.parameters.first() else {
                 return Err(format!(
                     "trait `{}` method `{}` must declare `self` as its first parameter",
-                    trait_template.name, method.name
+                    trait_display, method.name
                 ));
             };
             if !ast::is_self_type(expected_receiver_type) {
                 return Err(format!(
                     "trait `{}` method `{}` must declare `self` as its first parameter",
-                    trait_template.name, method.name
+                    trait_display, method.name
                 ));
             }
             let (actual_receiver_type, actual_parameters, actual_return_type) =
@@ -970,6 +1060,12 @@ impl Monomorphizer {
                     Ok(signature) => signature,
                     Err(_) => {
                         if method.default_body.is_some() {
+                            if !trait_template.generic_params.is_empty() {
+                                return Err(format!(
+                                    "generic trait `{}` default methods are not supported yet; implement `{}` explicitly",
+                                    trait_template.name, method.name
+                                ));
+                            }
                             self.synthesize_trait_default_method(
                                 trait_template,
                                 target_type,
@@ -980,7 +1076,7 @@ impl Monomorphizer {
                                     format!(
                                         "type `{}` does not implement required trait method `{}.{}`",
                                         ast::type_to_string(target_type),
-                                        trait_template.name,
+                                        trait_display,
                                         method.name
                                     )
                                 },
@@ -989,7 +1085,7 @@ impl Monomorphizer {
                             return Err(format!(
                                 "type `{}` does not implement required trait method `{}.{}`",
                                 ast::type_to_string(target_type),
-                                trait_template.name,
+                                trait_display,
                                 method.name
                             ));
                         }
@@ -1008,7 +1104,7 @@ impl Monomorphizer {
             {
                 return Err(format!(
                     "trait method `{}.{}` expects `({}) -> {}`, but `{}` provides `({}) -> {}`",
-                    trait_template.name,
+                    trait_display,
                     method.name,
                     expected_parameters
                         .iter()
@@ -1248,6 +1344,12 @@ impl Monomorphizer {
             {
                 self.trait_extends(child, parent)
             }
+            (
+                subtype,
+                supertype @ Type::GenericInstance { base, .. },
+            ) if self.traits.contains_key(base) => {
+                self.type_implements_trait_reference(subtype, supertype)
+            }
             (subtype, Type::Custom(trait_name)) if self.traits.contains_key(trait_name) => {
                 self.type_implements_trait(subtype, trait_name)
             }
@@ -1298,9 +1400,17 @@ impl Monomorphizer {
         let mut matched = false;
         for impl_block in self.impls.clone() {
             if !impl_block
-                .trait_names
+                .trait_types
                 .iter()
-                .any(|name| self.trait_extends(name, trait_name).unwrap_or(false))
+                .any(|trait_type| match trait_type {
+                    Type::Custom(name) => {
+                        self.trait_extends(name, trait_name).unwrap_or(false)
+                    }
+                    Type::GenericInstance { base, .. } => {
+                        self.trait_extends(base, trait_name).unwrap_or(false)
+                    }
+                    _ => false,
+                })
             {
                 continue;
             }
@@ -1338,6 +1448,64 @@ impl Monomorphizer {
             matched = true;
         }
 
+        Ok(matched)
+    }
+
+    fn type_implements_trait_reference(
+        &mut self,
+        actual_type: &Type,
+        required_trait_type: &Type,
+    ) -> Result<bool, String> {
+        let required = self.expand_type(required_trait_type)?;
+        let mut matched = false;
+        for impl_block in self.impls.clone() {
+            let mut substitutions = HashMap::new();
+            if impl_block.generic_params.is_empty() {
+                if impl_block.target_type != *actual_type {
+                    continue;
+                }
+            } else if self
+                .unify_generic_type(
+                    &impl_block.target_type,
+                    actual_type,
+                    &impl_block.generic_params,
+                    &mut substitutions,
+                )
+                .is_err()
+            {
+                continue;
+            } else {
+                self.check_generic_bounds(
+                    &impl_block.generic_bounds,
+                    &impl_block.subtype_bounds,
+                    &substitutions,
+                    &format!(
+                        "generic impl target `{}`",
+                        ast::type_to_string(&impl_block.target_type)
+                    ),
+                )?;
+            }
+
+            let mut implements_required = false;
+            for trait_type in &impl_block.trait_types {
+                let instantiated = self.apply_substitutions(trait_type, &substitutions);
+                if self.expand_type(&instantiated)? == required {
+                    implements_required = true;
+                    break;
+                }
+            }
+            if !implements_required {
+                continue;
+            }
+            if matched {
+                return Err(format!(
+                    "multiple impls of trait `{}` match `{}`",
+                    ast::type_to_string(&required),
+                    ast::type_to_string(actual_type)
+                ));
+            }
+            matched = true;
+        }
         Ok(matched)
     }
 
@@ -1448,7 +1616,9 @@ impl Monomorphizer {
                 )?;
             }
 
-            for trait_name in impl_block.trait_names {
+            for trait_type in impl_block.trait_types {
+                let trait_type = self.apply_substitutions(&trait_type, &substitutions);
+                let trait_name = self.ensure_trait_for_type(&trait_type)?;
                 for implied_trait in self.implied_trait_names(&trait_name)? {
                     let key = format!("{}=>{}", implied_trait, concrete_key);
                     if !self.generated_impl_keys.insert(key) {
@@ -1458,7 +1628,7 @@ impl Monomorphizer {
                         generic_params: Vec::new(),
                         generic_bounds: HashMap::new(),
                         subtype_bounds: HashMap::new(),
-                        trait_names: vec![implied_trait],
+                        trait_types: vec![Type::Custom(implied_trait)],
                         target_type: concrete_type.clone(),
                     });
                 }
@@ -4022,6 +4192,135 @@ impl Monomorphizer {
         }
     }
 
+    fn ensure_trait_for_type(&mut self, sk_type: &Type) -> Result<String, String> {
+        match sk_type {
+            Type::Custom(name) => {
+                let template = self
+                    .traits
+                    .get(name)
+                    .ok_or_else(|| format!("unknown trait `{}`", name))?;
+                if !template.generic_params.is_empty() {
+                    return Err(format!(
+                        "generic trait `{}` expects {} type argument{}",
+                        name,
+                        template.generic_params.len(),
+                        if template.generic_params.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                Ok(name.clone())
+            }
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => {
+                let template = self
+                    .traits
+                    .get(base)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown generic trait `{}`", base))?;
+                if template.generic_params.len() != type_arguments.len() {
+                    return Err(format!(
+                        "generic trait `{}` expects {} type arguments, got {}",
+                        base,
+                        template.generic_params.len(),
+                        type_arguments.len()
+                    ));
+                }
+                let concrete_arguments = type_arguments
+                    .iter()
+                    .map(|argument| self.concretize_type(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let symbol_name = specialized_struct_name(base, &concrete_arguments);
+                if self.generated_traits.contains_key(&symbol_name) {
+                    return Ok(symbol_name);
+                }
+                if !self.trait_stack.insert(symbol_name.clone()) {
+                    return Ok(symbol_name);
+                }
+                let substitutions = template
+                    .generic_params
+                    .iter()
+                    .cloned()
+                    .zip(concrete_arguments)
+                    .collect::<HashMap<_, _>>();
+                self.check_generic_bounds(
+                    &template.generic_bounds,
+                    &template.subtype_bounds,
+                    &substitutions,
+                    &format!("generic trait `{}`", base),
+                )?;
+                for supertrait in &template.supertraits {
+                    let supertrait_template = self
+                        .traits
+                        .get(supertrait)
+                        .ok_or_else(|| format!("unknown trait `{}`", supertrait))?;
+                    if !supertrait_template.generic_params.is_empty() {
+                        return Err(format!(
+                            "generic trait `{}` must provide type arguments for generic supertrait `{}`",
+                            base, supertrait
+                        ));
+                    }
+                }
+                let methods = template
+                    .methods
+                    .iter()
+                    .map(|method| {
+                        Ok(ast::TraitMethodSignature {
+                            name: method.name.clone(),
+                            parameters: method
+                                .parameters
+                                .iter()
+                                .map(|(name, sk_type)| {
+                                    let substituted =
+                                        self.apply_substitutions(sk_type, &substitutions);
+                                    self.concretize_type(&substituted)
+                                        .map(|sk_type| (name.clone(), sk_type))
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                            return_type: self.concretize_type(
+                                &self.apply_substitutions(
+                                    &method.return_type,
+                                    &substitutions,
+                                ),
+                            )?,
+                            // Implementations receive synthesized/default methods
+                            // before specialization. The runtime trait only needs
+                            // its concrete dispatch signature.
+                            default_body: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let node = Node::TraitDeclaration {
+                    name: symbol_name.clone(),
+                    generic_params: Vec::new(),
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
+                    supertraits: template.supertraits.clone(),
+                    methods: methods.clone(),
+                };
+                self.traits.insert(
+                    symbol_name.clone(),
+                    TraitTemplate {
+                        name: symbol_name.clone(),
+                        generic_params: Vec::new(),
+                        generic_bounds: HashMap::new(),
+                        subtype_bounds: HashMap::new(),
+                        supertraits: template.supertraits,
+                        methods,
+                    },
+                );
+                self.generated_traits.insert(symbol_name.clone(), node);
+                self.generated_trait_order.push(symbol_name.clone());
+                self.trait_stack.remove(&symbol_name);
+                Ok(symbol_name)
+            }
+            other => Err(format!(
+                "expected a trait type, found `{}`",
+                ast::type_to_string(other)
+            )),
+        }
+    }
+
     fn ensure_nominal_type(&mut self, sk_type: &Type) -> Result<String, String> {
         match sk_type {
             Type::Custom(name) => Ok(name.clone()),
@@ -4030,6 +4329,9 @@ impl Monomorphizer {
             }
             Type::GenericInstance { base, .. } if self.generic_enums.contains_key(base) => {
                 self.ensure_enum_for_type(sk_type)
+            }
+            Type::GenericInstance { base, .. } if self.traits.contains_key(base) => {
+                self.ensure_trait_for_type(sk_type)
             }
             Type::GenericInstance { base, .. } => {
                 Err(format!("unknown generic nominal type `{}`", base))
@@ -4174,6 +4476,48 @@ impl Monomorphizer {
                 base,
                 type_arguments,
             } => {
+                if let Some(template) = self.traits.get(base).cloned() {
+                    if template.generic_params.len() != type_arguments.len() {
+                        return Err(format!(
+                            "generic trait `{}` expects {} type arguments, got {}",
+                            base,
+                            template.generic_params.len(),
+                            type_arguments.len()
+                        ));
+                    }
+                    let substitutions = template
+                        .generic_params
+                        .iter()
+                        .cloned()
+                        .zip(type_arguments.iter().cloned())
+                        .collect::<HashMap<_, _>>();
+                    let method = self
+                        .collect_trait_methods(base, &mut Vec::new())?
+                        .into_iter()
+                        .find(|method| method.name == method_name)
+                        .ok_or_else(|| {
+                            format!("unknown method `{}` on trait `{}`", method_name, base)
+                        })?;
+                    let receiver = method
+                        .parameters
+                        .first()
+                        .map(|(_, sk_type)| self.apply_substitutions(sk_type, &substitutions))
+                        .ok_or_else(|| {
+                            format!("method `{}` on trait `{}` is missing self", method_name, base)
+                        })?;
+                    return Ok((
+                        receiver,
+                        method
+                            .parameters
+                            .iter()
+                            .skip(1)
+                            .map(|(_, sk_type)| {
+                                self.apply_substitutions(sk_type, &substitutions)
+                            })
+                            .collect(),
+                        self.apply_substitutions(&method.return_type, &substitutions),
+                    ));
+                }
                 let (generic_params, functions) = if let Some(template) =
                     self.generic_structs.get(base)
                 {

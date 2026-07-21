@@ -568,7 +568,7 @@ function main(): void {
 
             <section id="generics">
                 <h2>Generics</h2>
-                <p>Skunk supports generic structs, functions, enums, and type aliases through monomorphization. Type parameters may have capability constraints, upper subtype bounds, lower subtype bounds, or a combination.</p>
+                <p>Skunk supports generic structs, functions, enums, traits, and type aliases through monomorphization. Type parameters may have capability constraints, upper subtype bounds, lower subtype bounds, or a combination.</p>
 <pre><code class="language-skunk">struct Box[T] {
     value: T;
 }
@@ -713,12 +713,38 @@ function use_writer_like[T: WriterLike](writer: *T): int {
     writer: Writer = Counter { value: 1 };
     print(writer.write_twice(4));
 }</code></pre>
+<pre><code class="language-skunk">trait Cell[T] {
+    function get(self): T;
+    function set(mut self, value: T): void;
+}
+
+struct Box[T] {
+    value: T;
+}
+
+conform Cell[T] for Box[T] {
+    function get(self): T {
+        return self.value;
+    }
+
+    function set(mut self, value: T): void {
+        self.value = value;
+    }
+}
+
+function main(): void {
+    cell: Cell[int] = Box[int] { value: 7 };
+    cell.set(42);
+    print(cell.get());
+}</code></pre>
                 <ul>
                     <li>Trait conformance is explicit through <code>conform Trait for Type { ... }</code>.</li>
+                    <li>Traits may declare type parameters and bounds, for example <code>trait Cell[T]</code> or <code>trait Cell[T: Serializable]</code>. Each concrete use such as <code>Cell[int]</code> receives a specialized runtime trait layout and vtable.</li>
                     <li>Traits may extend other traits with <code>trait Writer: Readable { ... }</code>; implementing the child trait also satisfies the parent traits.</li>
-                    <li>Traits may provide default method bodies, and <code>conform</code> blocks only need to implement the required methods they want to customize.</li>
+                    <li>Non-generic traits may provide default method bodies, and <code>conform</code> blocks only need to implement the required methods they want to customize. Generic trait default methods are not supported yet.</li>
                     <li>Shapes provide structural bounds, for example <code>T: WriterLike</code>, without introducing a runtime trait value.</li>
-                    <li>Conform targets may be concrete or generic, for example <code>conform[T] SizedThing for Box[T] { ... }</code>.</li>
+                    <li>Conform targets may be concrete or generic. In <code>conform Cell[T] for Box[T] { ... }</code>, the conformance binder <code>T</code> is inferred from <code>Box[T]</code>. The older explicit form <code>conform[T] Cell[T] for Box[T]</code> remains accepted.</li>
+                    <li>Receiver mutability is part of the trait contract: a method declared with <code>mut self</code> may mutate through the receiver, so its conformance method must also declare <code>mut self</code>.</li>
                     <li>Generic bounds can stay inline with <code>function save[T: Writer](...)</code> or move into a <code>where</code> clause for longer signatures.</li>
                     <li>Bounds intersect with <code>&amp;</code>, for example <code>where T: Writer &amp; Resettable</code>.</li>
                     <li>Capability bounds use <code>:</code>; subtype bounds use <code>&lt;:</code> and <code>&gt;:</code>. They may be combined, with a <code>where</code> clause usually giving the clearest result.</li>

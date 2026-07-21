@@ -48,6 +48,9 @@ pub enum Node {
     },
     TraitDeclaration {
         name: String,
+        generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
         supertraits: Vec<String>,
         methods: Vec<TraitMethodSignature>,
     },
@@ -66,7 +69,7 @@ pub enum Node {
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
         subtype_bounds: HashMap<String, SubtypeBounds>,
-        trait_name: String,
+        trait_type: Type,
         target_type: Type,
         functions: Vec<Node>,
     },
@@ -74,7 +77,7 @@ pub enum Node {
         generic_params: Vec<String>,
         generic_bounds: HashMap<String, Vec<String>>,
         subtype_bounds: HashMap<String, SubtypeBounds>,
-        trait_names: Vec<String>,
+        trait_types: Vec<Type>,
         target_type: Type,
     },
     EnumDeclaration {
@@ -1411,6 +1414,14 @@ impl PestImpl {
         assert_eq!(pair.as_rule(), Rule::trait_decl);
         let mut inner_pairs = pair.into_inner().peekable();
         let name = inner_pairs.next().unwrap().as_str().to_string();
+        let (generic_params, mut generic_bounds, mut subtype_bounds) = if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::generic_params)
+        {
+            self.create_generic_params(inner_pairs.next().unwrap())
+        } else {
+            (Vec::new(), HashMap::new(), HashMap::new())
+        };
         let supertraits = if inner_pairs
             .peek()
             .is_some_and(|pair| pair.as_rule() == Rule::supertrait_bounds)
@@ -1424,11 +1435,25 @@ impl PestImpl {
         } else {
             Vec::new()
         };
+        if inner_pairs
+            .peek()
+            .is_some_and(|pair| pair.as_rule() == Rule::where_clause)
+        {
+            let (additional_generic_bounds, additional_subtype_bounds) =
+                self.create_where_clause(inner_pairs.next().unwrap());
+            generic_bounds =
+                self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+            subtype_bounds =
+                self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
+        }
         let methods = inner_pairs
             .map(|p| self.create_trait_method_decl(p))
             .collect::<Vec<_>>();
         Node::TraitDeclaration {
             name,
+            generic_params,
+            generic_bounds,
+            subtype_bounds,
             supertraits,
             methods,
         }
@@ -1542,7 +1567,7 @@ impl PestImpl {
         } else {
             (Vec::new(), HashMap::new(), HashMap::new())
         };
-        let trait_name = inner_pairs.next().unwrap().as_str().to_string();
+        let trait_type = self.create_type(inner_pairs.next().unwrap());
         let target_type = self.create_type(inner_pairs.next().unwrap());
         if inner_pairs
             .peek()
@@ -1560,21 +1585,45 @@ impl PestImpl {
             generic_params,
             generic_bounds,
             subtype_bounds,
-            trait_name,
+            trait_type,
             target_type,
             functions,
         }
     }
 
     fn desugar_program(&self, node: Node) -> Result<Node, String> {
-        let Node::Program { statements } = node else {
+        let Node::Program { mut statements } = node else {
             return Ok(node);
         };
+
+        // Type declarations need to participate in attach/conform desugaring
+        // even when they are exported. Temporarily unwrap them, then restore
+        // the export marker after their merged methods have been produced.
+        let mut exported_type_names = HashSet::<String>::new();
+        for statement in &mut statements {
+            let Node::Export { declaration } = statement else {
+                continue;
+            };
+            let exported_name = match declaration.as_ref() {
+                Node::StructDeclaration { name, .. }
+                | Node::GenericStructDeclaration { name, .. }
+                | Node::EnumDeclaration { name, .. }
+                | Node::GenericEnumDeclaration { name, .. }
+                | Node::TraitDeclaration { name, .. }
+                | Node::TypeAliasDeclaration { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(name) = exported_name {
+                exported_type_names.insert(name);
+                *statement = declaration.as_ref().clone();
+            }
+        }
 
         // The boolean records whether the nominal declaration is a struct.
         // `attach` accepts both structs and enums, while `conform` remains
         // struct-only until enum trait conformance is implemented end to end.
         let mut declared_nominals = HashMap::<String, (Vec<String>, bool)>::new();
+        let mut declared_traits = HashMap::<String, Vec<String>>::new();
         let mut enum_variant_names = HashMap::<String, HashSet<String>>::new();
         for statement in &statements {
             match statement {
@@ -1607,7 +1656,59 @@ impl PestImpl {
                         variants.iter().map(|variant| variant.name.clone()).collect(),
                     );
                 }
+                Node::TraitDeclaration {
+                    name,
+                    generic_params,
+                    ..
+                } => {
+                    declared_traits.insert(name.clone(), generic_params.clone());
+                }
                 _ => {}
+            }
+        }
+
+        // A conformance over an entire generic nominal family already contains
+        // an unambiguous binder in its target: `ArrayList[T]`. Reuse those
+        // declaration parameters so callers can write the natural
+        // `conform List[T] for ArrayList[T]` spelling. The explicit
+        // `conform[T]` form remains valid for source compatibility.
+        for statement in &mut statements {
+            let Node::ConformDeclaration {
+                generic_params,
+                target_type,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            if !generic_params.is_empty() {
+                continue;
+            }
+            let Type::GenericInstance {
+                base,
+                type_arguments,
+            } = target_type
+            else {
+                continue;
+            };
+            let Some((declared_params, _)) = declared_nominals.get(base) else {
+                continue;
+            };
+            let direct_arguments = type_arguments
+                .iter()
+                .map(|argument| match argument {
+                    Type::Custom(name) => Some(name),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if direct_arguments.is_some_and(|arguments| {
+                arguments.len() == declared_params.len()
+                    && arguments
+                        .iter()
+                        .zip(declared_params)
+                        .all(|(argument, declared)| *argument == declared)
+            }) {
+                *generic_params = declared_params.clone();
             }
         }
 
@@ -1667,18 +1768,22 @@ impl PestImpl {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
-                    trait_name,
+                    trait_type,
                     target_type,
                     functions,
                 } => {
                     self.validate_declared_generic_bounds(
-                        &format!("conform `{}`", trait_name),
+                        &format!("conform `{}`", type_to_string(trait_type)),
                         generic_params,
                         generic_bounds,
                         subtype_bounds,
                     )?;
+                    self.validate_conformance_trait(
+                        trait_type,
+                        &declared_traits,
+                    )?;
                     let target_name = self.validate_behavior_target(
-                        &format!("conform `{}`", trait_name),
+                        &format!("conform `{}`", type_to_string(trait_type)),
                         generic_params,
                         generic_bounds,
                         subtype_bounds,
@@ -1686,7 +1791,7 @@ impl PestImpl {
                         &declared_nominals,
                     )?;
                     self.merge_behavior_functions(
-                        &format!("conform `{}`", trait_name),
+                        &format!("conform `{}`", type_to_string(trait_type)),
                         &target_name,
                         functions,
                         &mut merged_functions,
@@ -1735,12 +1840,12 @@ impl PestImpl {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
-                    trait_name,
+                    trait_type,
                     target_type,
                     ..
                 } => {
                     self.validate_declared_generic_bounds(
-                        &format!("conform `{}`", trait_name),
+                        &format!("conform `{}`", type_to_string(&trait_type)),
                         &generic_params,
                         &generic_bounds,
                         &subtype_bounds,
@@ -1749,8 +1854,31 @@ impl PestImpl {
                         generic_params,
                         generic_bounds,
                         subtype_bounds,
-                        trait_names: vec![trait_name],
+                        trait_types: vec![trait_type],
                         target_type,
+                    });
+                }
+                Node::TraitDeclaration {
+                    name,
+                    generic_params,
+                    generic_bounds,
+                    subtype_bounds,
+                    supertraits,
+                    methods,
+                } => {
+                    self.validate_declared_generic_bounds(
+                        &format!("trait `{}`", name),
+                        &generic_params,
+                        &generic_bounds,
+                        &subtype_bounds,
+                    )?;
+                    output.push(Node::TraitDeclaration {
+                        name,
+                        generic_params,
+                        generic_bounds,
+                        subtype_bounds,
+                        supertraits,
+                        methods,
                     });
                 }
                 Node::GenericEnumDeclaration {
@@ -1814,7 +1942,60 @@ impl PestImpl {
             }
         }
 
+        for statement in &mut output {
+            let name = match statement {
+                Node::StructDeclaration { name, .. }
+                | Node::GenericStructDeclaration { name, .. }
+                | Node::EnumDeclaration { name, .. }
+                | Node::GenericEnumDeclaration { name, .. }
+                | Node::TraitDeclaration { name, .. }
+                | Node::TypeAliasDeclaration { name, .. } => Some(name),
+                _ => None,
+            };
+            if name.is_some_and(|name| exported_type_names.contains(name)) {
+                *statement = Node::Export {
+                    declaration: Box::new(statement.clone()),
+                };
+            }
+        }
+
         Ok(Node::Program { statements: output })
+    }
+
+    fn validate_conformance_trait(
+        &self,
+        trait_type: &Type,
+        declared_traits: &HashMap<String, Vec<String>>,
+    ) -> Result<(), String> {
+        let (name, arguments) = match trait_type {
+            Type::Custom(name) => (name, &[][..]),
+            Type::GenericInstance {
+                base,
+                type_arguments,
+            } => (base, type_arguments.as_slice()),
+            other => {
+                return Err(format!(
+                    "conformance requires a trait type, found `{}`",
+                    type_to_string(other)
+                ))
+            }
+        };
+        // An imported trait is not present until source loading merges modules,
+        // so defer existence and arity checks for non-local names to the
+        // monomorphization pass over the complete program.
+        let Some(declared_params) = declared_traits.get(name) else {
+            return Ok(());
+        };
+        if declared_params.len() != arguments.len() {
+            return Err(format!(
+                "trait `{}` expects {} type argument{}, got {}",
+                name,
+                declared_params.len(),
+                if declared_params.len() == 1 { "" } else { "s" },
+                arguments.len()
+            ));
+        }
+        Ok(())
     }
 
     fn validate_behavior_target(
@@ -4500,6 +4681,9 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     supertraits: vec![],
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),
@@ -4520,7 +4704,7 @@ mod tests {
                     generic_params: vec![],
                     generic_bounds: HashMap::new(),
                     subtype_bounds: HashMap::new(),
-                    trait_names: vec!["Writer".to_string()],
+                    trait_types: vec![Type::Custom("Writer".to_string())],
                     target_type: Type::Custom("TextWriter".to_string()),
                 },
                 Node::EOI,
@@ -4533,6 +4717,10 @@ mod tests {
     #[test]
     fn test_generic_impl_declaration() {
         let source_code = r#"
+            trait Writer {
+                function write(self): void;
+            }
+
             struct Box[T] {
                 value: T;
             }
@@ -4542,6 +4730,19 @@ mod tests {
 
         let expected_ast = Node::Program {
             statements: vec![
+                Node::TraitDeclaration {
+                    name: "Writer".to_string(),
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
+                    supertraits: vec![],
+                    methods: vec![TraitMethodSignature {
+                        name: "write".to_string(),
+                        parameters: vec![("self".to_string(), Type::SkSelf)],
+                        return_type: Type::Void,
+                        default_body: None,
+                    }],
+                },
                 Node::GenericStructDeclaration {
                     name: "Box".to_string(),
                     generic_params: vec!["T".to_string()],
@@ -4554,7 +4755,7 @@ mod tests {
                     generic_params: vec!["T".to_string()],
                     generic_bounds: HashMap::new(),
                     subtype_bounds: HashMap::new(),
-                    trait_names: vec!["Writer".to_string()],
+                    trait_types: vec![Type::Custom("Writer".to_string())],
                     target_type: Type::GenericInstance {
                         base: "Box".to_string(),
                         type_arguments: vec![Type::Custom("T".to_string())],
@@ -4565,6 +4766,79 @@ mod tests {
         };
 
         assert_eq!(expected_ast, parse(source_code));
+    }
+
+    #[test]
+    fn test_generic_trait_and_implicit_conformance_binder() {
+        let Node::Program { statements } = parse(
+            r#"
+            trait List[T] {
+                function set(mut self, index: int, element: T): void;
+            }
+
+            struct ArrayList[T] {
+                data: []T;
+            }
+
+            conform List[T] for ArrayList[T] {
+                function set(mut self, index: int, element: T): void {
+                    self.data[index] = element;
+                }
+            }
+            "#,
+        ) else {
+            panic!("expected program");
+        };
+
+        assert!(matches!(
+            &statements[0],
+            Node::TraitDeclaration {
+                name,
+                generic_params,
+                methods,
+                ..
+            } if name == "List"
+                && generic_params == &["T".to_string()]
+                && methods[0].parameters[0].1 == Type::MutSelf
+                && methods[0].parameters[2].1 == Type::Custom("T".to_string())
+        ));
+        assert!(matches!(
+            &statements[2],
+            Node::ImplDeclaration {
+                generic_params,
+                trait_types,
+                target_type,
+                ..
+            } if generic_params == &["T".to_string()]
+                && trait_types == &[Type::GenericInstance {
+                    base: "List".to_string(),
+                    type_arguments: vec![Type::Custom("T".to_string())],
+                }]
+                && target_type == &Type::GenericInstance {
+                    base: "ArrayList".to_string(),
+                    type_arguments: vec![Type::Custom("T".to_string())],
+                }
+        ));
+    }
+
+    #[test]
+    fn test_generic_trait_conformance_rejects_wrong_arity() {
+        let error = try_parse(
+            r#"
+            trait Pair[A, B] {
+                function first(self): A;
+            }
+
+            struct Box[T] { value: T; }
+
+            conform Pair[T] for Box[T] {
+                function first(self): T { return self.value; }
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("trait `Pair` expects 2 type arguments, got 1"));
     }
 
     #[test]
@@ -4579,6 +4853,9 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     supertraits: vec![],
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),
@@ -4612,6 +4889,9 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     supertraits: vec![],
                     methods: vec![
                         TraitMethodSignature {
@@ -4688,6 +4968,9 @@ mod tests {
             statements: vec![
                 Node::TraitDeclaration {
                     name: "Resettable".to_string(),
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     supertraits: vec![],
                     methods: vec![TraitMethodSignature {
                         name: "reset".to_string(),
@@ -4698,6 +4981,9 @@ mod tests {
                 },
                 Node::TraitDeclaration {
                     name: "Writer".to_string(),
+                    generic_params: vec![],
+                    generic_bounds: HashMap::new(),
+                    subtype_bounds: HashMap::new(),
                     supertraits: vec!["Resettable".to_string(), "Flushable".to_string()],
                     methods: vec![TraitMethodSignature {
                         name: "write".to_string(),

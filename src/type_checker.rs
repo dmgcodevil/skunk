@@ -332,6 +332,7 @@ impl GlobalScope {
                 name,
                 supertraits,
                 methods,
+                ..
             } => {
                 self.traits.insert(
                     name.clone(),
@@ -365,7 +366,7 @@ impl GlobalScope {
                 generic_params,
                 generic_bounds: _,
                 subtype_bounds: _,
-                trait_names,
+                trait_types,
                 target_type,
             } => {
                 if generic_params.is_empty() {
@@ -373,8 +374,10 @@ impl GlobalScope {
                         .implemented_traits
                         .entry(type_to_string(target_type))
                         .or_default();
-                    for trait_name in trait_names {
-                        entry.insert(trait_name.clone());
+                    for trait_type in trait_types {
+                        if let Type::Custom(trait_name) = trait_type {
+                            entry.insert(trait_name.clone());
+                        }
                     }
                 }
             }
@@ -2216,6 +2219,7 @@ fn resolve_type(
             name,
             supertraits,
             methods,
+            ..
         } => {
             for supertrait in supertraits {
                 if !global_scope.traits.contains_key(supertrait) {

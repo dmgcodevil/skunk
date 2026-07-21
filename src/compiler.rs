@@ -423,6 +423,7 @@ fn collect_trait_layouts(
                 name,
                 supertraits,
                 methods,
+                ..
             } => Some((name.clone(), (supertraits.clone(), methods.clone()))),
             _ => None,
         })
@@ -5086,7 +5087,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     for statement in statements {
         let Node::ImplDeclaration {
             generic_params,
-            trait_names,
+            trait_types,
             target_type,
             ..
         } = statement
@@ -5105,7 +5106,13 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                 ))
             }
         };
-        for trait_name in trait_names {
+        for trait_type in trait_types {
+            let Type::Custom(trait_name) = trait_type else {
+                return Err(format!(
+                    "LLVM backend requires a concrete trait implementation, found `{}`",
+                    ast::type_to_string(trait_type)
+                ));
+            };
             let trait_layout = traits
                 .get(trait_name)
                 .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
@@ -7536,6 +7543,104 @@ mod tests {
     }
 
     #[test]
+    fn runs_compiled_generic_trait_with_implicit_conformance_binder() {
+        let stdout = compile_and_run(
+            r#"
+            trait Cell[T] {
+                function get(self): T;
+                function set(mut self, value: T): void;
+            }
+
+            struct Box[T] {
+                value: T;
+            }
+
+            conform Cell[T] for Box[T] {
+                function get(self): T {
+                    return self.value;
+                }
+
+                function set(mut self, value: T): void {
+                    self.value = value;
+                }
+            }
+
+            function main(): void {
+                number: Cell[int] = Box[int] { value: 7 };
+                print(number.get());
+                number.set(42);
+                print(number.get());
+
+                word: Cell[string] = Box[string] { value: "old" };
+                print(word.get());
+                word.set("new");
+                print(word.get());
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "7\n42\nold\nnew\n");
+    }
+
+    #[test]
+    fn rejects_generic_trait_receiver_mutability_mismatch() {
+        let result = compile_and_run(
+            r#"
+            trait Cell[T] {
+                function set(mut self, value: T): void;
+            }
+
+            struct Box[T] { value: T; }
+
+            conform Cell[T] for Box[T] {
+                function set(self, value: T): void {}
+            }
+
+            function main(): void {}
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("trait method `Cell[T].set` expects"));
+    }
+
+    #[test]
+    fn enforces_generic_trait_bounds_when_specialized() {
+        let result = compile_and_run(
+            r#"
+            trait Printable {
+                function print_value(self): void;
+            }
+
+            trait PrintableCell[T: Printable] {
+                function get(self): T;
+            }
+
+            struct Plain { value: int; }
+            struct Box[T] { value: T; }
+
+            conform PrintableCell[T] for Box[T] {
+                function get(self): T { return self.value; }
+            }
+
+            function main(): void {
+                cell: PrintableCell[Plain] = Box[Plain] {
+                    value: Plain { value: 1 }
+                };
+            }
+            "#,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains(
+            "generic trait `PrintableCell` requires `T` to implement trait `Printable`"
+        ));
+    }
+
+    #[test]
     fn runs_compiled_explicit_generic_function_call_program() {
         let stdout = compile_and_run(
             r#"
@@ -7644,6 +7749,47 @@ mod tests {
 
                     function main(): void {
                         print(inc(41));
+                    }
+                    "#,
+                ),
+            ],
+            "main.skunk",
+        )
+        .unwrap();
+
+        assert_eq!(stdout, "42\n");
+    }
+
+    #[test]
+    fn runs_compiled_imported_generic_trait_program() {
+        let stdout = compile_project_and_run(
+            &[
+                (
+                    "containers/cell.skunk",
+                    r#"
+                    module containers.cell;
+
+                    export trait Cell[T] {
+                        function get(self): T;
+                    }
+                    "#,
+                ),
+                (
+                    "main.skunk",
+                    r#"
+                    import containers.cell;
+
+                    struct Box[T] {
+                        value: T;
+                    }
+
+                    conform Cell[T] for Box[T] {
+                        function get(self): T { return self.value; }
+                    }
+
+                    function main(): void {
+                        cell: Cell[int] = Box[int] { value: 42 };
+                        print(cell.get());
                     }
                     "#,
                 ),

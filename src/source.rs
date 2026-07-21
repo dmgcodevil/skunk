@@ -55,7 +55,9 @@ impl ProgramLoader {
 
         let contents = fs::read_to_string(&file_path)
             .map_err(|err| format!("failed to read `{}`: {}", file_path.display(), err))?;
-        let program = ast::parse(&contents);
+        let program = ast::try_parse(&contents).map_err(|err| {
+            format!("failed to parse `{}`: {}", file_path.display(), err)
+        })?;
         let Node::Program { statements } = program else {
             unreachable!("parse always returns a program node")
         };
@@ -437,6 +439,9 @@ impl ModuleNormalizer {
             }
             Node::TraitDeclaration {
                 name,
+                generic_params,
+                generic_bounds,
+                subtype_bounds,
                 supertraits,
                 methods,
             } => {
@@ -448,6 +453,14 @@ impl ModuleNormalizer {
                 } else {
                     name.clone()
                 };
+                let type_scope = generic_params.iter().cloned().collect::<HashSet<_>>();
+                type_scopes.push(type_scope);
+                let generic_bounds = self.rename_generic_bounds(generic_bounds, type_scopes)?;
+                let subtype_bounds = self.rename_subtype_bounds(
+                    subtype_bounds,
+                    value_scopes,
+                    type_scopes,
+                )?;
                 let supertraits = supertraits
                     .into_iter()
                     .map(|name| self.rename_type_name(&name, type_scopes))
@@ -486,8 +499,12 @@ impl ModuleNormalizer {
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
+                type_scopes.pop();
                 Node::TraitDeclaration {
                     name: renamed_name,
+                    generic_params,
+                    generic_bounds,
+                    subtype_bounds,
                     supertraits,
                     methods,
                 }
@@ -532,7 +549,7 @@ impl ModuleNormalizer {
                 generic_params,
                 generic_bounds,
                 subtype_bounds,
-                trait_names,
+                trait_types,
                 target_type,
             } => {
                 let mut type_scope = HashSet::new();
@@ -546,17 +563,17 @@ impl ModuleNormalizer {
                     value_scopes,
                     type_scopes,
                 )?;
-                let trait_names = trait_names
+                let trait_types = trait_types
                     .into_iter()
-                    .map(|name| self.rename_type_name(&name, type_scopes))
-                    .collect();
+                    .map(|trait_type| self.rename_type(trait_type, value_scopes, type_scopes))
+                    .collect::<Result<Vec<_>, String>>()?;
                 let target_type = self.rename_type(target_type, value_scopes, type_scopes)?;
                 type_scopes.pop();
                 Node::ImplDeclaration {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
-                    trait_names,
+                    trait_types,
                     target_type,
                 }
             }
@@ -1393,6 +1410,26 @@ mod tests {
 
         let err = load_program(&entry).unwrap_err();
         assert!(err.contains("module declaration mismatch"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reports_source_parse_errors_without_panicking() {
+        let root = env::temp_dir().join(format!("skunk_parse_error_{}", Uuid::new_v4()));
+        let entry = root.join("main.skunk");
+        write_file(
+            &entry,
+            r#"
+            trait List[T] {
+                function set(index: int, element: T): void;
+            }
+            "#,
+        );
+
+        let error = load_program(&entry).unwrap_err();
+        assert!(error.contains("failed to parse"));
+        assert!(error.contains("expected _self"));
 
         let _ = fs::remove_dir_all(root);
     }
