@@ -1,0 +1,61 @@
+// Skunk standard library: math.
+//
+// This module ships embedded inside the compiler binary and is materialized
+// into $SKUNK_HOME/lib/<version>/std/math.skunk on first use. `import
+// std.math;` always resolves here; the `std.` prefix is reserved and never
+// resolves to project files.
+//
+// The double-precision functions bind directly to libm via extern "C".
+
+module std.math;
+
+export extern "C" function sqrt(value: double): double;
+export extern "C" function cbrt(value: double): double;
+export extern "C" function pow(base: double, exponent: double): double;
+export extern "C" function exp(value: double): double;
+export extern "C" function log(value: double): double;
+export extern "C" function log2(value: double): double;
+export extern "C" function log10(value: double): double;
+export extern "C" function sin(value: double): double;
+export extern "C" function cos(value: double): double;
+export extern "C" function tan(value: double): double;
+export extern "C" function asin(value: double): double;
+export extern "C" function acos(value: double): double;
+export extern "C" function atan(value: double): double;
+export extern "C" function atan2(y: double, x: double): double;
+export extern "C" function floor(value: double): double;
+export extern "C" function ceil(value: double): double;
+export extern "C" function round(value: double): double;
+export extern "C" function fabs(value: double): double;
+export extern "C" function fmod(numerator: double, denominator: double): double;
+
+export function abs(value: int): int {
+    if (value < 0) {
+        return 0 - value;
+    }
+    return value;
+}
+
+export function min(a: int, b: int): int {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+export function max(a: int, b: int): int {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+export function clamp(value: int, low: int, high: int): int {
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
+}
