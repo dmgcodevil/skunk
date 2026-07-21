@@ -7143,8 +7143,14 @@ mod tests {
 
     #[test]
     fn runs_headless_pong_example() {
+        // Read at runtime (not include_str!) so a missing example file fails
+        // this test with a clear message instead of breaking the whole build.
+        let pong_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/pong.skunk");
+        let pong_source = fs::read_to_string(&pong_path).unwrap_or_else(|err| {
+            panic!("failed to read `{}`: {}", pong_path.display(), err)
+        });
         let stdout = compile_and_run_with_env(
-            include_str!("../examples/pong.skunk"),
+            &pong_source,
             &[("SKUNK_WINDOW_HEADLESS", "1")],
         )
         .unwrap();
