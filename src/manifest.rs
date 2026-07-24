@@ -214,10 +214,9 @@ mod tests {
 
     #[test]
     fn preserves_comments_and_warns_for_unknown_keys() {
-        let manifest = parse_manifest(
-            "[package]\nname = \"x\" # inline comment\nfuture_key = \"whatever\"\n",
-        )
-        .unwrap();
+        let manifest =
+            parse_manifest("[package]\nname = \"x\" # inline comment\nfuture_key = \"whatever\"\n")
+                .unwrap();
 
         assert_eq!(manifest.name, "x");
         assert_eq!(

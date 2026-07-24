@@ -1,13 +1,5 @@
-mod ast;
-mod compiler;
-mod manifest;
-mod monomorphize;
-mod parser;
-mod sdk;
-mod source;
-mod testing;
-mod type_checker;
 use colored::*;
+use skunk::{ast, compiler, manifest, pipeline, source, testing};
 use std::env;
 use std::fs;
 use std::io;
@@ -150,31 +142,28 @@ fn temporary_run_output_path() -> PathBuf {
 }
 
 /// Loads, monomorphizes, and type-checks a program from disk.
-fn load_and_check(file_path: &Path) -> Result<ast::Node, String> {
+fn load_and_check(file_path: &Path) -> Result<pipeline::CheckedProgram, String> {
     let node = source::load_program(file_path)?;
     prepare_and_check(&node)
 }
 
 /// Monomorphizes and type-checks an already-loaded program.
-fn prepare_and_check(node: &ast::Node) -> Result<ast::Node, String> {
-    let node = monomorphize::prepare_program(node)?;
-    type_checker::check(&node)?;
-    Ok(node)
+fn prepare_and_check(node: &ast::Node) -> Result<pipeline::CheckedProgram, String> {
+    pipeline::check(node)
 }
 
 /// Compiles and executes a program natively, then removes its temporary build artifacts.
-fn run_native(program: &ast::Node, source_path: &Path) -> Result<ExitStatus, String> {
-    run_native_with_options(
-        program,
-        source_path,
-        &compiler::BuildOptions::default(),
-    )
+fn run_native(
+    program: &pipeline::CheckedProgram,
+    source_path: &Path,
+) -> Result<ExitStatus, String> {
+    run_native_with_options(program, source_path, &compiler::BuildOptions::default())
 }
 
 /// Compiles and executes a program with explicit linker and optimization
 /// options, then removes its temporary build artifacts.
 fn run_native_with_options(
-    program: &ast::Node,
+    program: &pipeline::CheckedProgram,
     source_path: &Path,
     options: &compiler::BuildOptions,
 ) -> Result<ExitStatus, String> {
@@ -228,10 +217,7 @@ fn resolve_test_configuration(
     source: Option<String>,
 ) -> Result<(PathBuf, compiler::BuildOptions), String> {
     if let Some(source) = source {
-        return Ok((
-            PathBuf::from(source),
-            compiler::BuildOptions::default(),
-        ));
+        return Ok((PathBuf::from(source), compiler::BuildOptions::default()));
     }
     let manifest_path = PathBuf::from(manifest::MANIFEST_FILE);
     if manifest_path.exists() {
@@ -253,8 +239,7 @@ fn resolve_test_configuration(
 fn run_tests(source: Option<String>, filter: Option<String>) -> Result<ExitStatus, String> {
     let (source_path, options) = resolve_test_configuration(source)?;
     let program = source::load_program(&source_path)?;
-    let (test_program, test_count) =
-        testing::build_test_program(&program, filter.as_deref())?;
+    let (test_program, test_count) = testing::build_test_program(&program, filter.as_deref())?;
     let test_program = prepare_and_check(&test_program)?;
     println!(
         "running {} test{} from {}\n",

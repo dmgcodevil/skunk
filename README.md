@@ -39,6 +39,32 @@ Skunk currently requires Rust and `clang`.
 cargo build
 ```
 
+## Compiler Architecture
+
+The compiler is available as a Rust library (`src/lib.rs`) with a thin CLI in
+`src/main.rs`. The production compilation path is:
+
+```text
+Pest parse tree
+  -> syntax AST (source-oriented nodes and spans)
+  -> lexical resolution (DefId, LocalId, FieldId, VariantId)
+  -> semantic type interning (TypeId)
+  -> typed HIR
+  -> HIR invariant validation and specialization seal
+  -> LLVM layouts/signatures/vtables
+  -> native LLVM/Clang build
+```
+
+AST and HIR are separate representations: syntax nodes never contain semantic
+types, while HIR never contains unresolved identifiers or Pest values. Compiler
+clients can start with `pipeline::check_source`; the returned `CheckedProgram`
+owns HIR, semantic tables, specialization metadata, and its source map.
+
+The generic expander and function-body LLVM emitter still use a compatibility
+tree internally. That boundary is private to `pipeline`/`compiler`; new phases
+must consume syntax AST, semantic types, or HIR instead of adding dependencies
+on the legacy all-purpose `ast::Node`.
+
 ## Use
 
 Compile a program to a native executable:

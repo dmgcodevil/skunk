@@ -140,8 +140,12 @@ pub fn build_test_program(program: &Node, filter: Option<&str>) -> Result<(Node,
     }
     main_source.push_str("    return skunk_test_summary();\n}\n");
 
-    let runner = ast::try_parse(&main_source)
-        .map_err(|err| format!("internal error: generated test runner failed to parse: {}", err))?;
+    let runner = ast::try_parse(&main_source).map_err(|err| {
+        format!(
+            "internal error: generated test runner failed to parse: {}",
+            err
+        )
+    })?;
     let Node::Program {
         statements: runner_statements,
     } = runner

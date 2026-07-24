@@ -28,7 +28,6 @@ struct FunctionTemplate {
 
 #[derive(Clone)]
 struct StructTemplate {
-    name: String,
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
     subtype_bounds: HashMap<String, ast::SubtypeBounds>,
@@ -38,7 +37,6 @@ struct StructTemplate {
 
 #[derive(Clone)]
 struct EnumTemplate {
-    name: String,
     generic_params: Vec<String>,
     generic_bounds: HashMap<String, Vec<String>>,
     subtype_bounds: HashMap<String, ast::SubtypeBounds>,
@@ -69,12 +67,6 @@ struct ImplTemplate {
     subtype_bounds: HashMap<String, ast::SubtypeBounds>,
     trait_types: Vec<Type>,
     target_type: Type,
-}
-
-#[derive(Clone)]
-struct FunctionSignature {
-    parameters: Vec<Type>,
-    return_type: Type,
 }
 
 #[derive(Clone)]
@@ -344,7 +336,6 @@ impl Monomorphizer {
                     generic_structs.insert(
                         name.clone(),
                         StructTemplate {
-                            name: name.clone(),
                             generic_params: generic_params.clone(),
                             generic_bounds: generic_bounds.clone(),
                             subtype_bounds: subtype_bounds.clone(),
@@ -361,7 +352,6 @@ impl Monomorphizer {
                     concrete_structs.insert(
                         name.clone(),
                         StructTemplate {
-                            name: name.clone(),
                             generic_params: Vec::new(),
                             generic_bounds: HashMap::new(),
                             subtype_bounds: HashMap::new(),
@@ -382,7 +372,6 @@ impl Monomorphizer {
                     generic_enums.insert(
                         name.clone(),
                         EnumTemplate {
-                            name: name.clone(),
                             generic_params: generic_params.clone(),
                             generic_bounds: generic_bounds.clone(),
                             subtype_bounds: subtype_bounds.clone(),
@@ -399,7 +388,6 @@ impl Monomorphizer {
                     concrete_enums.insert(
                         name.clone(),
                         EnumTemplate {
-                            name: name.clone(),
                             generic_params: Vec::new(),
                             generic_bounds: HashMap::new(),
                             subtype_bounds: HashMap::new(),
@@ -798,18 +786,6 @@ fn resolve_binary_result_type(
     }
 }
 
-fn apply_call_groups_to_type(
-    start_type: &Type,
-    argument_groups: &[Vec<Node>],
-    monomorphizer: &Monomorphizer,
-) -> Result<Type, String> {
-    let mut current = start_type.clone();
-    for args in argument_groups {
-        current = apply_single_call_to_type(&current, args.len())?;
-    }
-    Ok(current)
-}
-
 fn apply_call_groups_to_function_signature(
     signature_type: &Type,
     argument_groups: &[Vec<Type>],
@@ -842,28 +818,6 @@ fn apply_call_groups_to_function_signature(
         };
     }
     Ok(current)
-}
-
-fn apply_single_call_to_type(signature_type: &Type, arg_len: usize) -> Result<Type, String> {
-    match signature_type {
-        Type::Function {
-            parameters,
-            return_type,
-        } => {
-            if parameters.len() != arg_len {
-                return Err(format!(
-                    "incorrect number of args; expected {}, actual {}",
-                    parameters.len(),
-                    arg_len
-                ));
-            }
-            Ok(return_type.as_ref().clone())
-        }
-        other => Err(format!(
-            "cannot call value of type `{}`",
-            ast::type_to_string(other)
-        )),
-    }
 }
 
 fn validate_type_alias_cycles(aliases: &HashMap<String, TypeAliasTemplate>) -> Result<(), String> {

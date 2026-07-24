@@ -1007,18 +1007,21 @@ impl<'a> FunctionCompiler<'a> {
             _ => unreachable!(),
         };
 
+        let dependencies = FunctionCompilerDependencies {
+            signatures: self.signatures,
+            structs: self.structs,
+            enums: self.enums,
+            traits: self.traits,
+            trait_vtables: self.trait_vtables,
+            globals: self.globals,
+            extra_type_decls: self.extra_type_decls,
+            extra_function_irs: self.extra_function_irs,
+            lambda_counter: self.lambda_counter,
+        };
         let nested_compiler = FunctionCompiler::new(
             &symbol_name,
             lambda_return_type.clone(),
-            self.signatures,
-            self.structs,
-            self.enums,
-            self.traits,
-            self.trait_vtables,
-            self.globals,
-            self.extra_type_decls,
-            self.extra_function_irs,
-            self.lambda_counter,
+            dependencies,
             Some(env.clone()),
         );
         let body_lines = nested_compiler.compile(parameters, body)?;

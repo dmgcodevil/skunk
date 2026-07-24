@@ -8,9 +8,7 @@ use std::process::Command;
 use uuid::Uuid;
 
 fn compile_and_run(source: &str) -> Result<String, String> {
-    let program = ast::parse(source);
-    let program = monomorphize::prepare_program(&program)?;
-    type_checker::check(&program)?;
+    let program = crate::pipeline::check_source("compiler-test.skunk", source)?;
 
     let id = Uuid::new_v4().to_string();
     let source_path = env::temp_dir().join(format!("skunk_compiler_test_{}.skunk", id));
@@ -39,10 +37,43 @@ fn compile_and_run(source: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+#[test]
+fn nested_block_return_is_recognized_and_runs() {
+    let output = compile_and_run(
+        r#"
+            function value(): int {
+                {
+                    return 42;
+                }
+            }
+
+            function main(): void {
+                print(value());
+            }
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(output, "42\n");
+}
+
+#[test]
+fn nested_block_local_does_not_escape_during_compilation() {
+    let error = compile_and_run(
+        r#"
+            function main(): void {
+                { hidden: int = 1; }
+                print(hidden);
+            }
+        "#,
+    )
+    .unwrap_err();
+
+    assert!(error.contains("unknown value `hidden`"));
+}
+
 fn compile_and_run_with_env(source: &str, env_vars: &[(&str, &str)]) -> Result<String, String> {
-    let program = ast::parse(source);
-    let program = monomorphize::prepare_program(&program)?;
-    type_checker::check(&program)?;
+    let program = crate::pipeline::check_source("compiler-test.skunk", source)?;
 
     let id = Uuid::new_v4().to_string();
     let source_path = env::temp_dir().join(format!("skunk_compiler_test_{}.skunk", id));
@@ -92,8 +123,7 @@ fn compile_project_and_run(files: &[(&str, &str)], entry: &str) -> Result<String
 
     let entry_path = root.join(entry);
     let program = source::load_program(&entry_path)?;
-    let program = monomorphize::prepare_program(&program)?;
-    type_checker::check(&program)?;
+    let program = crate::pipeline::check(&program)?;
 
     let output_path = root.join("app_out");
     let artifact = compile_to_executable(&program, Path::new(&entry_path), &output_path)?;

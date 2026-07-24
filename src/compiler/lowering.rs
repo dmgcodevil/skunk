@@ -8,17 +8,20 @@ impl<'a> FunctionCompiler<'a> {
     pub(super) fn new(
         function_name: &'a str,
         return_type: LlvmType,
-        signatures: &'a HashMap<String, FunctionSignature>,
-        structs: &'a HashMap<String, StructLayout>,
-        enums: &'a HashMap<String, EnumLayout>,
-        traits: &'a HashMap<String, TraitLayout>,
-        trait_vtables: &'a HashMap<String, String>,
-        globals: &'a mut Vec<GlobalString>,
-        extra_type_decls: &'a mut Vec<String>,
-        extra_function_irs: &'a mut Vec<String>,
-        lambda_counter: &'a mut usize,
+        dependencies: FunctionCompilerDependencies<'a>,
         closure_env: Option<ClosureEnv>,
     ) -> Self {
+        let FunctionCompilerDependencies {
+            signatures,
+            structs,
+            enums,
+            traits,
+            trait_vtables,
+            globals,
+            extra_type_decls,
+            extra_function_irs,
+            lambda_counter,
+        } = dependencies;
         Self {
             function_name,
             return_type,
@@ -793,11 +796,7 @@ impl<'a> FunctionCompiler<'a> {
                         "sub"
                     };
                     let zero = if matches!(target, LlvmType::F32 | LlvmType::F64) {
-                        if target == LlvmType::F32 {
-                            "0.0"
-                        } else {
-                            "0.0"
-                        }
+                        "0.0"
                     } else {
                         "0"
                     };
@@ -941,10 +940,10 @@ impl<'a> FunctionCompiler<'a> {
                             "call ptr @memcpy(ptr {}, ptr {}, i64 {})",
                             dst.value, src.value, count.value
                         ));
-                        return Ok(ExprValue {
+                        Ok(ExprValue {
                             llvm_type: LlvmType::Void,
                             value: "void".to_string(),
-                        });
+                        })
                     }
                     "set" => {
                         if arguments.len() != 3 {
@@ -969,17 +968,15 @@ impl<'a> FunctionCompiler<'a> {
                             "call ptr @memset(ptr {}, i32 {}, i64 {})",
                             dst.value, value.value, count.value
                         ));
-                        return Ok(ExprValue {
+                        Ok(ExprValue {
                             llvm_type: LlvmType::Void,
                             value: "void".to_string(),
-                        });
+                        })
                     }
-                    _ => {
-                        return Err(format!(
-                            "LLVM backend does not support static function call `Memory::{}` yet",
-                            name
-                        ))
-                    }
+                    _ => Err(format!(
+                        "LLVM backend does not support static function call `Memory::{}` yet",
+                        name
+                    )),
                 }
             }
             Type::Custom(color_name) if color_name == "Color" => match name {

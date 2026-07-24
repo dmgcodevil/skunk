@@ -1,16 +1,21 @@
-use crate::ast::Node::{ArrayInit, Identifier, MemberAccess, StructInitialization, EMPTY};
+use crate::ast::Node::{ArrayInit, Identifier, MemberAccess, StructInitialization};
 use crate::parser::{Rule, SkunkParser};
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::Parser;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct SubtypeBounds {
     pub lower: Option<Type>,
     pub upper: Option<Type>,
 }
+
+type GenericParts = (
+    Vec<String>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, SubtypeBounds>,
+);
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Node {
@@ -186,7 +191,7 @@ pub enum Node {
         operand: Box<Node>,
     },
     FunctionCall {
-        name: String,              // The function name
+        name: String, // The function name
         type_arguments: Vec<Type>,
         arguments: Vec<Vec<Node>>, // The arguments are a list of expression nodes
         metadata: Metadata,
@@ -353,7 +358,7 @@ enum TypePrefix {
     Pointer,
     Reference(bool),
     Slice,
-    Array(Node),
+    Array(Box<Node>),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -416,9 +421,63 @@ impl PestImpl {
     /// This is the main parser entry point used by the public [`parse`] helper.
     pub fn parse(&self, code: &str) -> Result<Node, String> {
         match SkunkParser::parse(Rule::program, code) {
-            Ok(pairs) => self.desugar_program(self.create_ast(pairs.clone().next().unwrap())),
+            Ok(mut pairs) => {
+                let program = pairs
+                    .next()
+                    .ok_or_else(|| "parser produced no program node".to_string())?;
+                self.validate_literals(program.clone())?;
+                self.desugar_program(self.create_ast(program))
+            }
             Err(e) => Err(format!("parser failed: {}", e)),
         }
+    }
+
+    /// Validates conversions that Pest's lexical grammar intentionally leaves
+    /// unbounded. AST construction can then treat these token conversions as a
+    /// parser invariant without allowing user input to trigger a panic.
+    fn validate_literals(&self, pair: Pair<Rule>) -> Result<(), String> {
+        let text = pair.as_str();
+        match pair.as_rule() {
+            Rule::INTEGER => {
+                text.parse::<i64>().map_err(|_| {
+                    format!("integer literal `{text}` is outside the supported 64-bit range")
+                })?;
+            }
+            Rule::LONG_LITERAL => {
+                text[..text.len() - 1].parse::<i64>().map_err(|_| {
+                    format!("long literal `{text}` is outside the supported 64-bit range")
+                })?;
+            }
+            Rule::FLOAT_LITERAL => {
+                let value = text[..text.len() - 1]
+                    .parse::<f32>()
+                    .map_err(|_| format!("invalid float literal `{text}`"))?;
+                if !value.is_finite() {
+                    return Err(format!(
+                        "float literal `{text}` is outside the supported range"
+                    ));
+                }
+            }
+            Rule::DOUBLE_LITERAL => {
+                let value = text
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid double literal `{text}`"))?;
+                if !value.is_finite() {
+                    return Err(format!(
+                        "double literal `{text}` is outside the supported range"
+                    ));
+                }
+            }
+            Rule::CHAR_LITERAL => {
+                parse_char_literal(text)?;
+            }
+            _ => {}
+        }
+
+        for child in pair.into_inner() {
+            self.validate_literals(child)?;
+        }
+        Ok(())
     }
 
     /// Dispatches a Pest parse node into the matching AST constructor.
@@ -512,12 +571,8 @@ impl PestImpl {
 
     fn create_block(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(pair.as_rule(), Rule::block);
-        let span = pair.as_span();
         let statements = pair.into_inner().map(|p| self.create_ast(p)).collect();
-        Node::Block {
-            statements,
-            //    metadata: Metadata{ span: Span { start: span.start(), end: span.end() }}
-        }
+        Node::Block { statements }
     }
 
     fn create_unsafe_block(&self, pair: Pair<Rule>) -> Node {
@@ -632,9 +687,8 @@ impl PestImpl {
 
     fn create_array_access(&self, pair: Pair<Rule>) -> Node {
         assert_eq!(Rule::array_access, pair.as_rule());
-        let mut pairs = pair.into_inner();
         let mut coordinates: Vec<Node> = Vec::new();
-        while let Some(dim_expr) = pairs.next() {
+        for dim_expr in pair.into_inner() {
             coordinates.push(self.create_ast(dim_expr));
         }
         Node::ArrayAccess { coordinates }
@@ -655,7 +709,7 @@ impl PestImpl {
     }
 
     fn create_inline_array_init(&self, pair: Pair<Rule>) -> Node {
-        let mut inner_pairs = pair.into_inner();
+        let inner_pairs = pair.into_inner();
         let elements = inner_pairs.map(|p| self.create_ast(p)).collect();
         ArrayInit { elements }
     }
@@ -687,8 +741,7 @@ impl PestImpl {
 
     fn create_chained_access(&self, pair: Pair<Rule>) -> Vec<Node> {
         let mut nodes: Vec<Node> = Vec::new();
-        let mut inner_pairs = pair.into_inner();
-        while let Some(inner_pair) = inner_pairs.next() {
+        for inner_pair in pair.into_inner() {
             let mut step_pair = inner_pair;
             if step_pair.as_rule() == Rule::access_step {
                 step_pair = step_pair.into_inner().next().unwrap();
@@ -713,8 +766,7 @@ impl PestImpl {
     /// dispatch.
     fn create_access(&self, pair: Pair<Rule>) -> Node {
         let mut nodes: Vec<Node> = Vec::new();
-        let mut inner_pairs = pair.into_inner();
-        while let Some(inner_pair) = inner_pairs.next() {
+        for inner_pair in pair.into_inner() {
             match inner_pair.as_rule() {
                 Rule::chained_access => nodes.extend(self.create_chained_access(inner_pair)),
                 Rule::IDENTIFIER => nodes.push(self.create_identifier(inner_pair)),
@@ -726,9 +778,8 @@ impl PestImpl {
 
     fn create_arg_list(&self, pair: Pair<Rule>) -> Vec<Node> {
         assert_eq!(pair.as_rule(), Rule::arg_list);
-        let mut pairs = pair.into_inner();
         let mut args: Vec<Node> = Vec::new();
-        while let Some(inner_pair) = pairs.next() {
+        for inner_pair in pair.into_inner() {
             args.push(self.create_ast(inner_pair));
         }
         args
@@ -752,7 +803,7 @@ impl PestImpl {
             Vec::new()
         };
         let mut arguments = Vec::new();
-        while let Some(arg_list) = inner_pairs.next() {
+        for arg_list in inner_pairs {
             arguments.push(self.create_arg_list(arg_list));
         }
         Node::FunctionCall {
@@ -769,7 +820,7 @@ impl PestImpl {
         let _type = self.create_type(inner_pairs.next().unwrap());
         let name = inner_pairs.next().unwrap().as_str().to_string();
         let mut arguments = Vec::new();
-        while let Some(arg_pair) = inner_pairs.next() {
+        for arg_pair in inner_pairs {
             arguments.push(self.create_ast(arg_pair));
         }
 
@@ -788,8 +839,8 @@ impl PestImpl {
         let mut inner_pairs = pair.into_inner();
         let struct_type = self.create_type(inner_pairs.next().unwrap());
         let mut fields: Vec<(String, Node)> = Vec::new();
-        if let Some(mut init_field_list) = inner_pairs.next().map(|p| p.into_inner()) {
-            while let Some(p) = init_field_list.next() {
+        if let Some(init_field_list) = inner_pairs.next().map(|p| p.into_inner()) {
+            for p in init_field_list {
                 match p.as_rule() {
                     Rule::init_field => {
                         let mut init_field_pairs = p.into_inner();
@@ -892,14 +943,11 @@ impl PestImpl {
             }
         }
         let mut body: Vec<Node> = Vec::new();
-        while let Some(statement) = inner_pairs.next() {
+        for statement in inner_pairs {
             body.push(self.create_ast(statement))
         }
         if let Identifier(s) = name {
-            if generic_params.is_empty()
-                && generic_bounds.is_empty()
-                && subtype_bounds.is_empty()
-            {
+            if generic_params.is_empty() && generic_bounds.is_empty() && subtype_bounds.is_empty() {
                 Node::FunctionDeclaration {
                     name: s,
                     parameters,
@@ -973,7 +1021,7 @@ impl PestImpl {
                 Rule::reference_prefix => {
                     TypePrefix::Reference(inner.into_inner().next().is_some())
                 }
-                Rule::expression => TypePrefix::Array(self.create_ast(inner)),
+                Rule::expression => TypePrefix::Array(Box::new(self.create_ast(inner))),
                 _ => TypePrefix::Slice,
             }
         } else {
@@ -990,7 +1038,7 @@ impl PestImpl {
                         elem_type,
                         mut dimensions,
                     } => {
-                        dimensions.insert(0, dimension);
+                        dimensions.insert(0, *dimension);
                         current = Type::Array {
                             elem_type,
                             dimensions,
@@ -999,7 +1047,7 @@ impl PestImpl {
                     other => {
                         current = Type::Array {
                             elem_type: Box::new(other),
-                            dimensions: vec![dimension],
+                            dimensions: vec![*dimension],
                         };
                     }
                 },
@@ -1032,17 +1080,14 @@ impl PestImpl {
             Rule::function_type => {
                 let mut params: Vec<Type> = Vec::new();
                 let mut inner_pairs = pair.into_inner();
-                match inner_pairs.peek().unwrap().as_rule() {
-                    Rule::param_type_list => {
-                        let param_type_list = inner_pairs.next().unwrap();
-                        params.extend(
-                            param_type_list
-                                .into_inner()
-                                .map(|p| self.create_type(p))
-                                .collect::<Vec<_>>(),
-                        )
-                    }
-                    _ => (),
+                if inner_pairs.peek().unwrap().as_rule() == Rule::param_type_list {
+                    let param_type_list = inner_pairs.next().unwrap();
+                    params.extend(
+                        param_type_list
+                            .into_inner()
+                            .map(|p| self.create_type(p))
+                            .collect::<Vec<_>>(),
+                    )
                 }
                 if let Some(r) = inner_pairs.next() {
                     assert_eq!(r.as_rule(), Rule::_type);
@@ -1088,7 +1133,7 @@ impl PestImpl {
                         .unwrap_or_else(|| panic!("array type is missing")),
                 );
                 let mut dimensions: Vec<Node> = Vec::new();
-                while let Some(dim_pair) = inner_pairs.next() {
+                for dim_pair in inner_pairs {
                     let dim = self.create_ast(dim_pair.into_inner().next().unwrap());
                     dimensions.push(dim);
                 }
@@ -1145,11 +1190,9 @@ impl PestImpl {
         }
 
         // Parse optional `else` block
-        let else_block = if let Some(else_pair) = inner_pairs.next() {
-            Some(self.create_body(&mut else_pair.into_inner()))
-        } else {
-            None
-        };
+        let else_block = inner_pairs
+            .next()
+            .map(|else_pair| self.create_body(&mut else_pair.into_inner()));
 
         Node::If {
             condition: Box::new(condition),
@@ -1202,7 +1245,9 @@ impl PestImpl {
             None
         };
         let variant = inner_pairs.next().unwrap().as_str().to_string();
-        let bindings = inner_pairs.map(|p| p.as_str().to_string()).collect::<Vec<_>>();
+        let bindings = inner_pairs
+            .map(|p| p.as_str().to_string())
+            .collect::<Vec<_>>();
         MatchPattern::EnumVariant {
             enum_type,
             variant,
@@ -1320,7 +1365,7 @@ impl PestImpl {
             }
         }
         let mut fields: Vec<(String, Type)> = Vec::new();
-        while let Some(p) = inner_pairs.next() {
+        for p in inner_pairs {
             match p.as_rule() {
                 Rule::struct_field_decl => fields.push(self.create_struct_field_dec(p)),
                 _ => panic!("unsupported rule {}", p),
@@ -1441,10 +1486,8 @@ impl PestImpl {
         {
             let (additional_generic_bounds, additional_subtype_bounds) =
                 self.create_where_clause(inner_pairs.next().unwrap());
-            generic_bounds =
-                self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
-            subtype_bounds =
-                self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
+            generic_bounds = self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+            subtype_bounds = self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
         }
         let methods = inner_pairs
             .map(|p| self.create_trait_method_decl(p))
@@ -1541,12 +1584,12 @@ impl PestImpl {
         {
             let (additional_generic_bounds, additional_subtype_bounds) =
                 self.create_where_clause(inner_pairs.next().unwrap());
-            generic_bounds =
-                self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
-            subtype_bounds =
-                self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
+            generic_bounds = self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+            subtype_bounds = self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
         }
-        let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
+        let functions = inner_pairs
+            .map(|pair| self.create_func_decl(pair))
+            .collect();
         Node::AttachDeclaration {
             generic_params,
             generic_bounds,
@@ -1575,12 +1618,12 @@ impl PestImpl {
         {
             let (additional_generic_bounds, additional_subtype_bounds) =
                 self.create_where_clause(inner_pairs.next().unwrap());
-            generic_bounds =
-                self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
-            subtype_bounds =
-                self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
+            generic_bounds = self.merge_generic_bounds(generic_bounds, additional_generic_bounds);
+            subtype_bounds = self.merge_subtype_bounds(subtype_bounds, additional_subtype_bounds);
         }
-        let functions = inner_pairs.map(|pair| self.create_func_decl(pair)).collect();
+        let functions = inner_pairs
+            .map(|pair| self.create_func_decl(pair))
+            .collect();
         Node::ConformDeclaration {
             generic_params,
             generic_bounds,
@@ -1641,7 +1684,10 @@ impl PestImpl {
                     declared_nominals.insert(name.clone(), (Vec::new(), false));
                     enum_variant_names.insert(
                         name.clone(),
-                        variants.iter().map(|variant| variant.name.clone()).collect(),
+                        variants
+                            .iter()
+                            .map(|variant| variant.name.clone())
+                            .collect(),
                     );
                 }
                 Node::GenericEnumDeclaration {
@@ -1653,7 +1699,10 @@ impl PestImpl {
                     declared_nominals.insert(name.clone(), (generic_params.clone(), false));
                     enum_variant_names.insert(
                         name.clone(),
-                        variants.iter().map(|variant| variant.name.clone()).collect(),
+                        variants
+                            .iter()
+                            .map(|variant| variant.name.clone())
+                            .collect(),
                     );
                 }
                 Node::TraitDeclaration {
@@ -1778,10 +1827,7 @@ impl PestImpl {
                         generic_bounds,
                         subtype_bounds,
                     )?;
-                    self.validate_conformance_trait(
-                        trait_type,
-                        &declared_traits,
-                    )?;
+                    self.validate_conformance_trait(trait_type, &declared_traits)?;
                     let target_name = self.validate_behavior_target(
                         &format!("conform `{}`", type_to_string(trait_type)),
                         generic_params,
@@ -2007,7 +2053,11 @@ impl PestImpl {
         target_type: &Type,
         declared_nominals: &HashMap<String, (Vec<String>, bool)>,
     ) -> Result<String, String> {
-        let target_kind = if kind == "attach" { "nominal" } else { "struct" };
+        let target_kind = if kind == "attach" {
+            "nominal"
+        } else {
+            "struct"
+        };
         let (target_name, declared_generic_params, target_is_struct) = match target_type {
             Type::Custom(name) => {
                 let (declared, is_struct) = declared_nominals.get(name).ok_or_else(|| {
@@ -2097,7 +2147,9 @@ impl PestImpl {
         merged_functions: &mut HashMap<String, Vec<Node>>,
         seen_method_names: &mut HashMap<String, HashSet<String>>,
     ) -> Result<(), String> {
-        let seen = seen_method_names.entry(target_name.to_string()).or_default();
+        let seen = seen_method_names
+            .entry(target_name.to_string())
+            .or_default();
         let output = merged_functions.entry(target_name.to_string()).or_default();
         for function in functions {
             match function {
@@ -2199,11 +2251,9 @@ impl PestImpl {
             };
         }
 
-        let body = if let Some(body_pair) = inner_pairs.next() {
-            Some(Box::new(self.create_ast(body_pair)))
-        } else {
-            None
-        };
+        let body = inner_pairs
+            .next()
+            .map(|body_pair| Box::new(self.create_ast(body_pair)));
 
         Node::VariableDeclaration {
             var_type,
@@ -2268,7 +2318,7 @@ impl PestImpl {
                 res
             }
             Rule::static_func_params => {
-                let mut inner_pairs = pair.into_inner();
+                let inner_pairs = pair.into_inner();
                 for p in inner_pairs {
                     res.extend(self._create_param_list(p));
                 }
@@ -2309,14 +2359,7 @@ impl PestImpl {
             .parse(pair.into_inner())
     }
 
-    fn create_generic_params(
-        &self,
-        pair: Pair<Rule>,
-    ) -> (
-        Vec<String>,
-        HashMap<String, Vec<String>>,
-        HashMap<String, SubtypeBounds>,
-    ) {
+    fn create_generic_params(&self, pair: Pair<Rule>) -> GenericParts {
         assert_eq!(pair.as_rule(), Rule::generic_params);
         let mut params = Vec::new();
         let mut bounds = HashMap::new();
@@ -2336,8 +2379,7 @@ impl PestImpl {
                         );
                     }
                     Rule::subtype_bounds => {
-                        subtype_bounds
-                            .insert(name.clone(), self.create_subtype_bounds(bound));
+                        subtype_bounds.insert(name.clone(), self.create_subtype_bounds(bound));
                     }
                     other => panic!("unexpected generic bound rule {:?}", other),
                 }
@@ -2350,10 +2392,7 @@ impl PestImpl {
     fn create_where_clause(
         &self,
         pair: Pair<Rule>,
-    ) -> (
-        HashMap<String, Vec<String>>,
-        HashMap<String, SubtypeBounds>,
-    ) {
+    ) -> (HashMap<String, Vec<String>>, HashMap<String, SubtypeBounds>) {
         assert_eq!(pair.as_rule(), Rule::where_clause);
         let mut bounds = HashMap::new();
         let mut subtype_bounds = HashMap::new();
@@ -2375,10 +2414,7 @@ impl PestImpl {
                     }
                 }
                 Rule::subtype_bounds => {
-                    let additional = HashMap::from([(
-                        name,
-                        self.create_subtype_bounds(bound),
-                    )]);
+                    let additional = HashMap::from([(name, self.create_subtype_bounds(bound))]);
                     subtype_bounds = self.merge_subtype_bounds(subtype_bounds, additional);
                 }
                 other => panic!("unexpected where-bound rule {:?}", other),
@@ -2595,18 +2631,6 @@ fn type_expr_to_string(node: &Node) -> String {
         Node::Literal(Literal::Char(value)) => format!("{:?}", value),
         Node::Identifier(name) => name.clone(),
         other => format!("{:?}", other),
-    }
-}
-
-pub fn extract_struct_field(field: &Node) -> (String, Type) {
-    match field {
-        Node::VariableDeclaration {
-            name,
-            var_type,
-            value,
-            metadata,
-        } => ((*name).clone(), (*var_type).clone()),
-        _ => panic!("expected VariableDeclaration node but: {:?}", field),
     }
 }
 
@@ -2884,11 +2908,6 @@ mod tests {
         }
     }
 
-    fn print_int(i: i64) -> Node {
-        Node::Print(Box::new(Access {
-            nodes: [Node::Literal(Literal::Integer(i))].to_vec(),
-        }))
-    }
     fn print_var(name: &str) -> Node {
         Node::Print(Box::new(access_var(name)))
     }
@@ -3038,27 +3057,6 @@ mod tests {
                             arguments: [[].to_vec()].to_vec(),
                             metadata: Metadata::EMPTY
                         })),
-                        metadata: Metadata::EMPTY
-                    },
-                    Node::EOI
-                ])
-            },
-            parse(source_code)
-        )
-    }
-
-    //#[test] todo should fail
-    fn test_var_dec() {
-        let source_code = r#"
-        a:int;
-        "#;
-        assert_eq!(
-            Node::Program {
-                statements: Vec::from([
-                    Node::VariableDeclaration {
-                        name: "a".to_string(),
-                        var_type: Type::Int,
-                        value: None,
                         metadata: Metadata::EMPTY
                     },
                     Node::EOI
@@ -4018,9 +4016,7 @@ mod tests {
 
     #[test]
     fn test_struct_init_rejects_explicit_field_without_expression() {
-        assert!(PestImpl::new()
-            .parse("p: Point = Point { x: };")
-            .is_err());
+        assert!(PestImpl::new().parse("p: Point = Point { x: };").is_err());
     }
 
     #[test]
@@ -5222,10 +5218,7 @@ mod tests {
                 Node::GenericStructDeclaration {
                     name: "Box".to_string(),
                     generic_params: vec!["T".to_string()],
-                    generic_bounds: HashMap::from([(
-                        "T".to_string(),
-                        vec!["Writer".to_string()],
-                    )]),
+                    generic_bounds: HashMap::from([("T".to_string(), vec!["Writer".to_string()])]),
                     subtype_bounds: HashMap::new(),
                     fields: vec![("value".to_string(), Type::Custom("T".to_string()))],
                     functions: vec![],
@@ -5245,12 +5238,10 @@ mod tests {
             }
         "#;
 
-        assert!(
-            PestImpl::new()
-                .parse(source_code)
-                .unwrap_err()
-                .contains("does not declare generic parameters")
-        );
+        assert!(PestImpl::new()
+            .parse(source_code)
+            .unwrap_err()
+            .contains("does not declare generic parameters"));
     }
 
     #[test]

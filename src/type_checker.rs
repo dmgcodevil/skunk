@@ -6,7 +6,6 @@ use crate::ast::{
     Literal, Metadata, Node, Operator, Type, UnaryOperator,
 };
 use std::collections::HashMap;
-use std::fmt::format;
 use std::ops::Deref;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -88,7 +87,7 @@ impl SymbolTables {
     }
 
     fn get(&self) -> &SymbolTable {
-        &self.tables.last().unwrap()
+        self.tables.last().unwrap()
     }
     fn get_mut(&mut self) -> &mut SymbolTable {
         self.tables.last_mut().unwrap()
@@ -127,16 +126,6 @@ impl SymbolTables {
     fn is_unsafe(&self) -> bool {
         self.unsafe_depth > 0
     }
-}
-
-fn create_symbols(declarations: &Vec<(String, Type)>) -> Vec<Symbol> {
-    declarations
-        .iter()
-        .map(|d| Symbol {
-            name: d.0.clone(),
-            sk_type: d.1.clone(),
-        })
-        .collect()
 }
 
 fn func_decl_node_to_symbol(node: &Node) -> Symbol {
@@ -384,8 +373,8 @@ impl GlobalScope {
             Node::VariableDeclaration {
                 var_type,
                 name,
-                value,
-                metadata,
+                value: _,
+                metadata: _,
             } => {
                 self.variables.insert(
                     name.clone(),
@@ -657,16 +646,6 @@ fn struct_symbol_for_type<'a>(
 ) -> Option<&'a StructSymbol> {
     match unwrap_binding_const(unwrap_const_view(sk_type)) {
         Type::Custom(name) => global_scope.structs.get(name),
-        _ => None,
-    }
-}
-
-fn trait_symbol_for_type<'a>(
-    global_scope: &'a GlobalScope,
-    sk_type: &Type,
-) -> Option<&'a TraitSymbol> {
-    match unwrap_binding_const(unwrap_const_view(sk_type)) {
-        Type::Custom(name) => global_scope.traits.get(name),
         _ => None,
     }
 }
@@ -1027,31 +1006,29 @@ fn resolve_access(
             };
             resolve_access(global_scope, symbol_tables, next_type, i + 1, access_nodes)
         }
-        Node::Dereference { .. } => {
-            match curr {
-                Type::Reference { target_type, .. } => resolve_access(
+        Node::Dereference { .. } => match curr {
+            Type::Reference { target_type, .. } => resolve_access(
+                global_scope,
+                symbol_tables,
+                target_type.deref().clone(),
+                i + 1,
+                access_nodes,
+            ),
+            Type::Pointer { target_type } => {
+                require_unsafe(symbol_tables, "pointer dereference")?;
+                resolve_access(
                     global_scope,
                     symbol_tables,
                     target_type.deref().clone(),
                     i + 1,
                     access_nodes,
-                ),
-                Type::Pointer { target_type } => {
-                    require_unsafe(symbol_tables, "pointer dereference")?;
-                    resolve_access(
-                        global_scope,
-                        symbol_tables,
-                        target_type.deref().clone(),
-                        i + 1,
-                        access_nodes,
-                    )
-                }
-                other => Err(format!(
-                    "cannot dereference non-pointer type `{}`",
-                    type_to_string(&other)
-                )),
+                )
             }
-        }
+            other => Err(format!(
+                "cannot dereference non-pointer type `{}`",
+                type_to_string(&other)
+            )),
+        },
 
         Node::MemberAccess { member, metadata } => match curr {
             Type::Array { .. } | Type::Slice { .. } => match member.deref() {
@@ -1141,8 +1118,7 @@ fn resolve_access(
                     type_to_string(&Type::Intersection(members))
                 )),
                 Node::FunctionCall { name, .. } => {
-                    let method_symbol =
-                        intersection_method_symbol(global_scope, &members, name)?;
+                    let method_symbol = intersection_method_symbol(global_scope, &members, name)?;
                     if let Type::Function { parameters, .. } = &method_symbol.sk_type {
                         if parameters.first().is_some_and(is_mut_self_type) {
                             assert_mutating_receiver_allowed(
@@ -1300,7 +1276,7 @@ fn resolve_access(
                         Node::FunctionCall {
                             name,
                             type_arguments: _,
-                            arguments,
+                            arguments: _,
                             metadata,
                         } => {
                             let methods =
@@ -1308,10 +1284,7 @@ fn resolve_access(
                             let method_symbol = methods.get(name).ok_or_else(|| {
                                 format!(
                                     "error {}:{}: no method named `{}` found for trait `{}`",
-                                    metadata.span.line,
-                                    metadata.span.start,
-                                    name,
-                                    type_name,
+                                    metadata.span.line, metadata.span.start, name, type_name,
                                 )
                             })?;
                             if let Type::Function { parameters, .. } = &method_symbol.sk_type {
@@ -1340,14 +1313,19 @@ fn resolve_access(
                         _ => panic!("expected member access node"),
                     }
                 } else {
-                    let (fields, functions, kind) =
-                        if let Some(struct_symbol) = global_scope.structs.get(&type_name) {
-                            (Some(&struct_symbol.fields), &struct_symbol.functions, "struct")
-                        } else if let Some(enum_symbol) = global_scope.enums.get(&type_name) {
-                            (None, &enum_symbol.functions, "enum")
-                        } else {
-                            return Err(format!("error: nominal type `{}` doesn't exist", type_name));
-                        };
+                    let (fields, functions, kind) = if let Some(struct_symbol) =
+                        global_scope.structs.get(&type_name)
+                    {
+                        (
+                            Some(&struct_symbol.fields),
+                            &struct_symbol.functions,
+                            "struct",
+                        )
+                    } else if let Some(enum_symbol) = global_scope.enums.get(&type_name) {
+                        (None, &enum_symbol.functions, "enum")
+                    } else {
+                        return Err(format!("error: nominal type `{}` doesn't exist", type_name));
+                    };
                     match member.deref() {
                         Node::Identifier(field_name) => {
                             let field_symbol = fields
@@ -1369,9 +1347,7 @@ fn resolve_access(
                                 access_nodes,
                             )
                         }
-                        Node::FunctionCall {
-                            name, metadata, ..
-                        } => {
+                        Node::FunctionCall { name, metadata, .. } => {
                             let method_symbol = functions.get(name).ok_or_else(|| {
                                 format!(
                                     "error {}:{}: no method named `{}` found for {} `{}` in the current scope",
@@ -1409,7 +1385,7 @@ fn resolve_access(
                     }
                 }
             }
-            _ => Err(format!("access to member access to not instance structs")),
+            _ => Err("access to member access to not instance structs".to_string()),
         },
         _ => unreachable!("unexpected access node"),
     }
@@ -1429,10 +1405,7 @@ fn require_unsafe(symbol_tables: &SymbolTables, operation: &str) -> Result<(), S
     if symbol_tables.is_unsafe() {
         Ok(())
     } else {
-        Err(format!(
-            "`{}` requires an unsafe block",
-            operation
-        ))
+        Err(format!("`{}` requires an unsafe block", operation))
     }
 }
 
@@ -1565,12 +1538,7 @@ fn resolve_addressable_access_type(
                     index
                 ));
             }
-            other => {
-                return Err(format!(
-                    "unsupported address-of target step `{:?}`",
-                    other
-                ))
-            }
+            other => return Err(format!("unsupported address-of target step `{:?}`", other)),
         }
     }
 
@@ -2019,12 +1987,8 @@ fn resolve_static_attached_call(
         ));
     }
     for (argument, parameter_type) in arguments.iter().zip(parameters.iter()) {
-        let argument_type = resolve_type(
-            global_scope,
-            symbol_tables,
-            argument,
-            Some(parameter_type),
-        )?;
+        let argument_type =
+            resolve_type(global_scope, symbol_tables, argument, Some(parameter_type))?;
         if !is_assignable(global_scope, parameter_type, &argument_type.sk_type) {
             return Err(format!(
                 "error {}:{}: static function `{}` expected `{}` but got `{}`",
@@ -2148,9 +2112,8 @@ fn resolve_type(
         Node::Program { statements } => {
             for statement in statements {
                 let res = resolve_type(global_scope, symbol_tables, statement, None);
-                match &res {
-                    Err(e) => return Err(e.to_string()),
-                    _ => (),
+                if let Err(e) = &res {
+                    return Err(e.to_string());
                 }
             }
             Ok(ResolveResult::new(Type::Void))
@@ -2248,11 +2211,11 @@ fn resolve_type(
             resolve_type(global_scope, symbol_tables, declaration, expected_type_opt)
         }
         Node::FunctionDeclaration {
-            name,
+            name: _,
             parameters,
             return_type,
             body,
-            lambda,
+            lambda: _,
         } => {
             resolve_function_body(
                 global_scope,
@@ -2301,7 +2264,7 @@ fn resolve_type(
                 let value_type = resolve_type(
                     global_scope,
                     symbol_tables,
-                    &body.deref(),
+                    body.deref(),
                     Some(unwrap_binding_const(var_type)),
                 )?
                 .sk_type;
@@ -2387,15 +2350,15 @@ fn resolve_type(
             Ok(ResolveResult::new(Type::Void))
         }
         Node::FunctionCall {
-            name, arguments, ..
+            name, arguments: _, ..
         } => {
             let func_symbol = symbol_tables
                 .get_fun(name)
                 .or_else(|| global_scope.functions.get(name).cloned())
-                .expect(format!("function '{}' not found", name).as_ref());
+                .ok_or_else(|| format!("function '{}' not found", name))?;
 
             resolve_function_call(global_scope, symbol_tables, &func_symbol, node)
-                .map(|t| ResolveResult::new(t))
+                .map(ResolveResult::new)
         }
         Node::BinaryOp {
             left,
@@ -2412,35 +2375,27 @@ fn resolve_type(
             )?
             .sk_type;
             match operator {
-                Operator::Add => {
-                    resolve_add(&left_type, &right_type).map(|t| ResolveResult::new(t))
-                }
+                Operator::Add => resolve_add(&left_type, &right_type).map(ResolveResult::new),
                 Operator::Subtract => {
-                    resolve_subtract(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                    resolve_subtract(&left_type, &right_type).map(ResolveResult::new)
                 }
                 Operator::Multiply => {
-                    resolve_multiply(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                    resolve_multiply(&left_type, &right_type).map(ResolveResult::new)
                 }
-                Operator::Divide => {
-                    resolve_divide(&left_type, &right_type).map(|t| ResolveResult::new(t))
-                }
-                Operator::Mod => {
-                    resolve_mod(&left_type, &right_type).map(|t| ResolveResult::new(t))
-                }
+                Operator::Divide => resolve_divide(&left_type, &right_type).map(ResolveResult::new),
+                Operator::Mod => resolve_mod(&left_type, &right_type).map(ResolveResult::new),
                 Operator::And | Operator::Or => {
-                    resolve_logical(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                    resolve_logical(&left_type, &right_type).map(ResolveResult::new)
                 }
                 Operator::LessThan
                 | Operator::GreaterThan
                 | Operator::GreaterThanOrEqual
                 | Operator::LessThanOrEqual => {
-                    resolve_cmp(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                    resolve_cmp(&left_type, &right_type).map(ResolveResult::new)
                 }
-                Operator::Equals => {
-                    resolve_eq(&left_type, &right_type).map(|t| ResolveResult::new(t))
-                }
+                Operator::Equals => resolve_eq(&left_type, &right_type).map(ResolveResult::new),
                 Operator::NotEquals => {
-                    resolve_not_eq(&left_type, &right_type).map(|t| ResolveResult::new(t))
+                    resolve_not_eq(&left_type, &right_type).map(ResolveResult::new)
                 }
                 _ => unreachable!("todo {:?}", operator),
             }
@@ -2463,7 +2418,7 @@ fn resolve_type(
             }
         }
         Node::ArrayInit { elements } => {
-            assert!(elements.len() > 0, "array init cannot be empty");
+            assert!(!elements.is_empty(), "array init cannot be empty");
             if let Some(expected_len) = expected_type_opt.and_then(expected_fixed_array_length) {
                 if expected_len != elements.len() as i64 {
                     return Err(format!(
@@ -2484,14 +2439,9 @@ fn resolve_type(
                 expected_elem_type_opt,
             )?
             .sk_type;
-            for i in 1..elements.len() {
-                let t = resolve_type(
-                    global_scope,
-                    symbol_tables,
-                    &elements[i],
-                    expected_elem_type_opt,
-                )?
-                .sk_type;
+            for element in elements.iter().skip(1) {
+                let t = resolve_type(global_scope, symbol_tables, element, expected_elem_type_opt)?
+                    .sk_type;
                 if t != curr {
                     if let Some(promoted) = promoted_numeric_type(&curr, &t) {
                         curr = promoted;
@@ -2510,7 +2460,7 @@ fn resolve_type(
             }
         }
         Node::Literal(literal) => {
-            resolve_literal_type(literal, expected_type_opt).map(|t| ResolveResult::new(t))
+            resolve_literal_type(literal, expected_type_opt).map(ResolveResult::new)
         }
         Node::EOI => Ok(ResolveResult::new(Type::Void)),
         Node::Identifier(name) => {
@@ -2529,12 +2479,11 @@ fn resolve_type(
             let start = resolve_type(
                 global_scope,
                 symbol_tables,
-                nodes.get(0).unwrap(),
+                nodes.first().unwrap(),
                 expected_type_opt,
             )?
             .sk_type;
-            resolve_access(global_scope, symbol_tables, start, 1, nodes)
-                .map(|t| ResolveResult::new(t))
+            resolve_access(global_scope, symbol_tables, start, 1, nodes).map(ResolveResult::new)
         }
         Node::StaticFunctionCall {
             _type,
@@ -2609,7 +2558,7 @@ fn resolve_type(
                     let arg_type = resolve_type(
                         global_scope,
                         symbol_tables,
-                        arguments.get(0).unwrap(),
+                        arguments.first().unwrap(),
                         Some(elem_type.deref()),
                     )?;
                     if !is_assignable(global_scope, elem_type.deref(), &arg_type.sk_type) {
@@ -2639,7 +2588,7 @@ fn resolve_type(
                     let allocator_type = resolve_type(
                         global_scope,
                         symbol_tables,
-                        arguments.get(0).unwrap(),
+                        arguments.first().unwrap(),
                         Some(&Type::Allocator),
                     )?;
                     if allocator_type.sk_type != Type::Allocator {
@@ -2692,10 +2641,7 @@ fn resolve_type(
                 }
                 Type::Pointer { target_type } if name == "offset" => {
                     require_unsafe(symbol_tables, "pointer offset")?;
-                    if !matches!(
-                        unwrap_const_view(target_type.deref()),
-                        Type::Byte
-                    ) {
+                    if !matches!(unwrap_const_view(target_type.deref()), Type::Byte) {
                         return Err(format!(
                             "error {}:{}: pointer offset currently requires a byte pointer target",
                             metadata.span.line, metadata.span.start
@@ -2718,12 +2664,8 @@ fn resolve_type(
                             metadata.span.line, metadata.span.start
                         ));
                     }
-                    let offset_type = resolve_type(
-                        global_scope,
-                        symbol_tables,
-                        &arguments[1],
-                        Some(&Type::Int),
-                    )?;
+                    let offset_type =
+                        resolve_type(global_scope, symbol_tables, &arguments[1], Some(&Type::Int))?;
                     if !is_integral_type(&offset_type.sk_type) {
                         return Err(format!(
                             "error {}:{}: pointer offset requires an integer offset",
@@ -2839,12 +2781,8 @@ fn resolve_type(
                         ));
                     }
                     for argument in arguments {
-                        let arg_type = resolve_type(
-                            global_scope,
-                            symbol_tables,
-                            argument,
-                            Some(&Type::Int),
-                        )?;
+                        let arg_type =
+                            resolve_type(global_scope, symbol_tables, argument, Some(&Type::Int))?;
                         if !is_integral_type(&arg_type.sk_type) {
                             return Err(format!(
                                 "error {}:{}: Bounds::check arguments must be integers",
@@ -2876,24 +2814,16 @@ fn resolve_type(
                             metadata.span.line, metadata.span.start
                         ));
                     }
-                    let width = resolve_type(
-                        global_scope,
-                        symbol_tables,
-                        &arguments[0],
-                        Some(&Type::Int),
-                    )?;
+                    let width =
+                        resolve_type(global_scope, symbol_tables, &arguments[0], Some(&Type::Int))?;
                     if !is_integral_type(&width.sk_type) {
                         return Err(format!(
                             "error {}:{}: Window::create width must be an integer",
                             metadata.span.line, metadata.span.start
                         ));
                     }
-                    let height = resolve_type(
-                        global_scope,
-                        symbol_tables,
-                        &arguments[1],
-                        Some(&Type::Int),
-                    )?;
+                    let height =
+                        resolve_type(global_scope, symbol_tables, &arguments[1], Some(&Type::Int))?;
                     if !is_integral_type(&height.sk_type) {
                         return Err(format!(
                             "error {}:{}: Window::create height must be an integer",
@@ -3107,37 +3037,42 @@ fn resolve_type(
         Node::Block { statements } => {
             let var_table = symbol_tables.get().clone();
             symbol_tables.add(var_table);
-            let mut result = Type::Void;
+            let mut returned_type: Option<Type> = None;
             for statement in statements {
                 let res = resolve_type(global_scope, symbol_tables, statement, expected_type_opt)?;
                 if res.returned {
-                    result = assert_type(result, Type::Void)?;
+                    returned_type = Some(match returned_type {
+                        Some(previous) => assert_type(previous, res.sk_type)?,
+                        None => res.sk_type,
+                    });
                 }
             }
-            if result != Type::Void {
-                Ok(ResolveResult::returned(result))
-            } else {
-                Ok(ResolveResult::new(Type::Void))
-            }
+            symbol_tables.pop();
+            Ok(match returned_type {
+                Some(result) => ResolveResult::returned(result),
+                None => ResolveResult::new(Type::Void),
+            })
         }
         Node::UnsafeBlock { statements } => {
             let var_table = symbol_tables.get().clone();
             symbol_tables.add(var_table);
             symbol_tables.enter_unsafe();
-            let mut result = Type::Void;
+            let mut returned_type: Option<Type> = None;
             for statement in statements {
                 let res = resolve_type(global_scope, symbol_tables, statement, expected_type_opt)?;
                 if res.returned {
-                    result = assert_type(result, Type::Void)?;
+                    returned_type = Some(match returned_type {
+                        Some(previous) => assert_type(previous, res.sk_type)?,
+                        None => res.sk_type,
+                    });
                 }
             }
             symbol_tables.exit_unsafe();
             symbol_tables.pop();
-            if result != Type::Void {
-                Ok(ResolveResult::returned(result))
-            } else {
-                Ok(ResolveResult::new(Type::Void))
-            }
+            Ok(match returned_type {
+                Some(result) => ResolveResult::returned(result),
+                None => ResolveResult::new(Type::Void),
+            })
         }
         Node::If {
             condition,
@@ -3370,7 +3305,9 @@ fn resolve_type(
                 }
                 UnaryOperator::AddressOf | UnaryOperator::AddressOfMut => {
                     let Node::Access { nodes } = operand.deref() else {
-                        return Err("address-of requires an addressable access expression".to_string());
+                        return Err(
+                            "address-of requires an addressable access expression".to_string()
+                        );
                     };
                     let target_type =
                         resolve_addressable_access_type(global_scope, symbol_tables, nodes)?;
@@ -3423,12 +3360,13 @@ pub fn check(node: &Node) -> Result<(), String> {
         }
         _ => panic!("expected program node"),
     }
-    match resolve_type(&mut global_scope, &mut var_tables, node, None) {
+    match resolve_type(&global_scope, &mut var_tables, node, None) {
         Err(e) => Err(e.to_string()),
         Ok(_) => Ok(()),
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast;
@@ -3972,21 +3910,6 @@ mod tests {
         "#;
         let program = ast::parse(source_code);
         check(&program).unwrap();
-    }
-
-    // #[test] todo
-    fn test_unreachable_code_after_for_loop() {
-        let source_code = r#"
-        function f(): int {
-            for (i: int = 0; i < 10; i = i + 1) {
-                return i;
-            }
-            // This code should be unreachable
-            return -1;
-        }
-        "#;
-        let program = ast::parse(source_code);
-        assert!(check(&program).is_err());
     }
 
     #[test]

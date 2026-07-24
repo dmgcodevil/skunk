@@ -5,6 +5,11 @@
 //! into core lowering, access/call lowering, and coercion/runtime operations.
 
 use crate::ast::{self, Literal, Node, Operator, Type, UnaryOperator};
+use crate::ids::{DefId, TypeId};
+use crate::intrinsics::IntrinsicType;
+use crate::resolver::DefinitionKind;
+use crate::semantic_types::TypeKind as SemanticTypeKind;
+use crate::semantics::SemanticModel;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
@@ -77,8 +82,7 @@ impl LlvmType {
             LlvmType::TraitObject(name) => format!("%trait.{}", sanitize_name(name)),
             LlvmType::TraitIntersection(traits) => format!(
                 "{{ {} }}",
-                std::iter::repeat("ptr")
-                    .take(traits.len() + 1)
+                std::iter::repeat_n("ptr", traits.len() + 1)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -109,11 +113,17 @@ struct FunctionSignature {
     parameters: Vec<LlvmType>,
 }
 
+type BackendLayouts = (
+    HashMap<String, StructLayout>,
+    HashMap<String, EnumLayout>,
+    HashMap<String, TraitLayout>,
+);
+
 #[derive(Clone, Debug)]
 struct FunctionPlan {
+    signature_key: String,
     symbol_name: String,
     parameters: Vec<(String, Type)>,
-    return_type: Type,
     body: Vec<Node>,
     is_method: bool,
 }
@@ -141,7 +151,6 @@ struct EnumLayout {
 #[derive(Clone, Debug)]
 struct TraitMethodLayout {
     name: String,
-    receiver_is_mut: bool,
     return_type: LlvmType,
     parameters: Vec<LlvmType>,
 }
@@ -484,10 +493,9 @@ fn collect_trait_layouts(
             }
         }
         for method in methods {
-            let receiver_type = method
+            method
                 .parameters
                 .first()
-                .map(|(_, ty)| ty.clone())
                 .ok_or_else(|| format!("trait method `{}` is missing self", method.name))?;
             if !seen.insert(method.name.clone()) {
                 return Err(format!(
@@ -497,7 +505,6 @@ fn collect_trait_layouts(
             }
             method_layouts.push(TraitMethodLayout {
                 name: method.name.clone(),
-                receiver_is_mut: matches!(receiver_type, Type::MutSelf),
                 return_type: llvm_type(&method.return_type, structs, enums, layouts)?,
                 parameters: method
                     .parameters
@@ -528,6 +535,479 @@ fn collect_trait_layouts(
         )?;
     }
     Ok(layouts)
+}
+
+/// Builds native layouts from validated HIR. This is the production layout
+/// path; the legacy collectors above remain for focused backend unit tests.
+fn collect_typed_layouts(
+    module: &crate::hir::Module,
+    model: &SemanticModel,
+) -> Result<BackendLayouts, String> {
+    let nominal_kinds = typed_nominal_kinds(module);
+
+    let mut structs = HashMap::new();
+    let mut enums = HashMap::new();
+    for item in &module.items {
+        let Some(definition) = item.definition else {
+            continue;
+        };
+        let name = definition_name(model, definition)?.to_string();
+        match &item.kind {
+            crate::hir::ItemKind::Struct(declaration) => {
+                let fields = declaration
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        Ok((
+                            field.name.clone(),
+                            llvm_type_id(field.ty, model, &nominal_kinds)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                structs.insert(name.clone(), StructLayout { name, fields });
+            }
+            crate::hir::ItemKind::Enum(declaration) => {
+                let mut next_field_index = 1usize;
+                let variants = declaration
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .map(|(tag, variant)| {
+                        let payload_types = variant
+                            .payload
+                            .iter()
+                            .map(|ty| llvm_type_id(*ty, model, &nominal_kinds))
+                            .collect::<Result<Vec<_>, String>>()?;
+                        let field_indices = (0..payload_types.len())
+                            .map(|_| {
+                                let index = next_field_index;
+                                next_field_index += 1;
+                                index
+                            })
+                            .collect();
+                        Ok(EnumVariantLayout {
+                            name: variant.name.clone(),
+                            tag,
+                            payload_types,
+                            field_indices,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                enums.insert(name.clone(), EnumLayout { name, variants });
+            }
+            _ => {}
+        }
+    }
+
+    let trait_declarations = module
+        .items
+        .iter()
+        .filter_map(|item| match (&item.kind, item.definition) {
+            (crate::hir::ItemKind::Trait(declaration), Some(definition)) => {
+                Some((definition, declaration))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut traits = HashMap::new();
+    for definition in trait_declarations.keys() {
+        build_typed_trait_layout(
+            *definition,
+            &trait_declarations,
+            model,
+            &nominal_kinds,
+            &mut traits,
+            &mut Vec::new(),
+        )?;
+    }
+    Ok((structs, enums, traits))
+}
+
+fn collect_typed_signatures(
+    module: &crate::hir::Module,
+    model: &SemanticModel,
+) -> Result<HashMap<String, FunctionSignature>, String> {
+    let nominal_kinds = typed_nominal_kinds(module);
+    let mut signatures = HashMap::new();
+    for item in &module.items {
+        match (&item.kind, item.definition) {
+            (crate::hir::ItemKind::Function(function), Some(definition)) => {
+                let name = definition_name(model, definition)?.to_string();
+                signatures.insert(
+                    name.clone(),
+                    typed_function_signature(
+                        format!("skunk_{name}"),
+                        function,
+                        model,
+                        &nominal_kinds,
+                        false,
+                    )?,
+                );
+            }
+            (crate::hir::ItemKind::ExternFunction(signature), Some(definition)) => {
+                let name = definition_name(model, definition)?.to_string();
+                signatures.insert(
+                    name.clone(),
+                    FunctionSignature {
+                        symbol_name: name,
+                        return_type: llvm_type_id(signature.result, model, &nominal_kinds)?,
+                        parameters: signature
+                            .parameters
+                            .iter()
+                            .map(|ty| llvm_type_id(*ty, model, &nominal_kinds))
+                            .collect::<Result<Vec<_>, String>>()?,
+                    },
+                );
+            }
+            (crate::hir::ItemKind::Struct(declaration), Some(owner)) => {
+                collect_typed_method_signatures(
+                    owner,
+                    &declaration.methods,
+                    model,
+                    &nominal_kinds,
+                    &mut signatures,
+                )?;
+            }
+            (crate::hir::ItemKind::Enum(declaration), Some(owner)) => {
+                collect_typed_method_signatures(
+                    owner,
+                    &declaration.methods,
+                    model,
+                    &nominal_kinds,
+                    &mut signatures,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(signatures)
+}
+
+fn collect_typed_implementations(
+    module: &crate::hir::Module,
+    model: &SemanticModel,
+) -> Result<Vec<(String, String)>, String> {
+    let mut implementations = Vec::new();
+    for item in &module.items {
+        let crate::hir::ItemKind::Implementation { traits, target } = &item.kind else {
+            continue;
+        };
+        let target = nominal_type_name(*target, model)?.to_string();
+        for trait_type in traits {
+            implementations.push((
+                nominal_type_name(*trait_type, model)?.to_string(),
+                target.clone(),
+            ));
+        }
+    }
+    Ok(implementations)
+}
+
+fn nominal_type_name(ty: TypeId, model: &SemanticModel) -> Result<&str, String> {
+    match model.types.kind(ty) {
+        SemanticTypeKind::Nominal { definition, .. } => definition_name(model, *definition),
+        SemanticTypeKind::Const(inner) => nominal_type_name(*inner, model),
+        other => Err(format!(
+            "runtime implementation requires a concrete nominal type, found {other:?}"
+        )),
+    }
+}
+
+fn add_trait_vtable(
+    trait_name: &str,
+    target_name: &str,
+    traits: &HashMap<String, TraitLayout>,
+    signatures: &HashMap<String, FunctionSignature>,
+    trait_vtables: &mut HashMap<String, String>,
+    globals: &mut Vec<String>,
+) -> Result<(), String> {
+    let trait_layout = traits
+        .get(trait_name)
+        .ok_or_else(|| format!("unknown trait `{trait_name}` in LLVM backend"))?;
+    let vtable_symbol = format!(
+        "skunk_vtable_{}_{}",
+        sanitize_name(trait_name),
+        sanitize_name(target_name)
+    );
+    trait_vtables.insert(
+        format!("{trait_name}=>{target_name}"),
+        vtable_symbol.clone(),
+    );
+    let entries = trait_layout
+        .methods
+        .iter()
+        .map(|method| {
+            let signature_key = format!("{target_name}::{}", method.name);
+            let signature = signatures.get(&signature_key).ok_or_else(|| {
+                format!(
+                    "missing concrete method `{}` for trait `{trait_name}` implementation on `{target_name}`",
+                    method.name
+                )
+            })?;
+            Ok(format!("ptr @{}", signature.symbol_name))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    globals.push(format!(
+        "@{} = private unnamed_addr constant %vtable.{} {{ {} }}",
+        vtable_symbol,
+        sanitize_name(trait_name),
+        entries.join(", ")
+    ));
+    Ok(())
+}
+
+fn collect_typed_method_signatures(
+    owner: DefId,
+    methods: &[crate::hir::Function],
+    model: &SemanticModel,
+    nominal_kinds: &HashMap<DefId, DefinitionKind>,
+    signatures: &mut HashMap<String, FunctionSignature>,
+) -> Result<(), String> {
+    let owner_name = definition_name(model, owner)?;
+    for method in methods {
+        let definition = method
+            .definition
+            .ok_or_else(|| format!("method on `{owner_name}` has no definition id"))?;
+        let method_name = definition_name(model, definition)?;
+        let key = format!("{owner_name}::{method_name}");
+        let symbol = format!(
+            "skunk_{}_{}",
+            sanitize_name(owner_name),
+            sanitize_name(method_name)
+        );
+        let has_receiver = method
+            .parameters
+            .first()
+            .and_then(|parameter| model.resolutions.locals.get(parameter.local.index()))
+            .is_some_and(|local| local.name == "self");
+        signatures.insert(
+            key,
+            typed_function_signature(symbol, method, model, nominal_kinds, has_receiver)?,
+        );
+    }
+    Ok(())
+}
+
+fn typed_function_signature(
+    symbol_name: String,
+    function: &crate::hir::Function,
+    model: &SemanticModel,
+    nominal_kinds: &HashMap<DefId, DefinitionKind>,
+    skip_receiver: bool,
+) -> Result<FunctionSignature, String> {
+    Ok(FunctionSignature {
+        symbol_name,
+        return_type: llvm_type_id(function.result, model, nominal_kinds)?,
+        parameters: function
+            .parameters
+            .iter()
+            .skip(usize::from(skip_receiver))
+            .map(|parameter| llvm_type_id(parameter.ty, model, nominal_kinds))
+            .collect::<Result<Vec<_>, String>>()?,
+    })
+}
+
+fn typed_nominal_kinds(module: &crate::hir::Module) -> HashMap<DefId, DefinitionKind> {
+    module
+        .items
+        .iter()
+        .filter_map(|item| {
+            let definition = item.definition?;
+            let kind = match item.kind {
+                crate::hir::ItemKind::Struct(_) => DefinitionKind::Struct,
+                crate::hir::ItemKind::Enum(_) => DefinitionKind::Enum,
+                crate::hir::ItemKind::Trait(_) => DefinitionKind::Trait,
+                crate::hir::ItemKind::Shape(_) => DefinitionKind::Shape,
+                _ => return None,
+            };
+            Some((definition, kind))
+        })
+        .collect()
+}
+
+fn build_typed_trait_layout(
+    definition: DefId,
+    declarations: &HashMap<DefId, &crate::hir::Trait>,
+    model: &SemanticModel,
+    nominal_kinds: &HashMap<DefId, DefinitionKind>,
+    layouts: &mut HashMap<String, TraitLayout>,
+    visiting: &mut Vec<DefId>,
+) -> Result<TraitLayout, String> {
+    let name = definition_name(model, definition)?.to_string();
+    if let Some(layout) = layouts.get(&name) {
+        return Ok(layout.clone());
+    }
+    if let Some(index) = visiting
+        .iter()
+        .position(|candidate| *candidate == definition)
+    {
+        let mut cycle = visiting[index..]
+            .iter()
+            .map(|definition| definition_name(model, *definition).unwrap_or("<invalid>"))
+            .collect::<Vec<_>>();
+        cycle.push(&name);
+        return Err(format!(
+            "cyclic supertrait relationship detected: {}",
+            cycle.join(" -> ")
+        ));
+    }
+    let declaration = declarations
+        .get(&definition)
+        .ok_or_else(|| format!("missing HIR declaration for trait `{name}`"))?;
+    visiting.push(definition);
+    let mut methods = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for supertrait in &declaration.supertraits {
+        let inherited = build_typed_trait_layout(
+            *supertrait,
+            declarations,
+            model,
+            nominal_kinds,
+            layouts,
+            visiting,
+        )?;
+        for method in inherited.methods {
+            if seen.insert(method.name.clone()) {
+                methods.push(method);
+            }
+        }
+    }
+    for method in &declaration.methods {
+        if !seen.insert(method.name.clone()) {
+            return Err(format!(
+                "trait `{name}` declares duplicate inherited method `{}`",
+                method.name
+            ));
+        }
+        methods.push(TraitMethodLayout {
+            name: method.name.clone(),
+            return_type: llvm_type_id(method.result, model, nominal_kinds)?,
+            parameters: method
+                .parameters
+                .iter()
+                .map(|ty| llvm_type_id(*ty, model, nominal_kinds))
+                .collect::<Result<Vec<_>, String>>()?,
+        });
+    }
+    visiting.pop();
+    let layout = TraitLayout { name, methods };
+    layouts.insert(layout.name.clone(), layout.clone());
+    Ok(layout)
+}
+
+fn llvm_type_id(
+    ty: TypeId,
+    model: &SemanticModel,
+    nominal_kinds: &HashMap<DefId, DefinitionKind>,
+) -> Result<LlvmType, String> {
+    match model.types.kind(ty) {
+        SemanticTypeKind::Builtin(builtin) => match builtin {
+            crate::syntax::ast::BuiltinType::Void => Ok(LlvmType::Void),
+            crate::syntax::ast::BuiltinType::Byte => Ok(LlvmType::I8),
+            crate::syntax::ast::BuiltinType::Short => Ok(LlvmType::I16),
+            crate::syntax::ast::BuiltinType::Int => Ok(LlvmType::I32),
+            crate::syntax::ast::BuiltinType::Long => Ok(LlvmType::I64),
+            crate::syntax::ast::BuiltinType::Float => Ok(LlvmType::F32),
+            crate::syntax::ast::BuiltinType::Double => Ok(LlvmType::F64),
+            crate::syntax::ast::BuiltinType::String => Ok(LlvmType::PtrI8),
+            crate::syntax::ast::BuiltinType::Boolean => Ok(LlvmType::I1),
+            crate::syntax::ast::BuiltinType::Char => Ok(LlvmType::Char16),
+            crate::syntax::ast::BuiltinType::Allocator => Ok(LlvmType::Allocator),
+            crate::syntax::ast::BuiltinType::Arena => Ok(LlvmType::Arena),
+        },
+        SemanticTypeKind::Intrinsic(intrinsic) => match intrinsic {
+            IntrinsicType::Color => Ok(LlvmType::I32),
+            IntrinsicType::Window => Ok(LlvmType::Window),
+            other => Err(format!(
+                "intrinsic type `{}` has no runtime value layout",
+                other.name()
+            )),
+        },
+        SemanticTypeKind::Nominal { definition, .. } => {
+            let name = definition_name(model, *definition)?.to_string();
+            match nominal_kinds.get(definition).copied().or_else(|| {
+                model
+                    .resolutions
+                    .definitions
+                    .get(definition.index())
+                    .map(|definition| definition.kind)
+            }) {
+                Some(DefinitionKind::Struct) => Ok(LlvmType::Struct(name)),
+                Some(DefinitionKind::Enum) => Ok(LlvmType::Enum(name)),
+                Some(DefinitionKind::Trait) => Ok(LlvmType::TraitObject(name)),
+                Some(kind) => Err(format!(
+                    "definition `{name}` of kind {kind:?} has no runtime nominal layout"
+                )),
+                None => Err(format!("unknown nominal definition `{name}`")),
+            }
+        }
+        SemanticTypeKind::Const(inner) => llvm_type_id(*inner, model, nominal_kinds),
+        SemanticTypeKind::Array {
+            element,
+            dimensions,
+        } => {
+            let mut element = llvm_type_id(*element, model, nominal_kinds)?;
+            for dimension in dimensions.iter().rev() {
+                element = LlvmType::Array {
+                    elem_type: Box::new(element),
+                    len: usize::try_from(*dimension)
+                        .map_err(|_| format!("array dimension `{dimension}` is too large"))?,
+                };
+            }
+            Ok(element)
+        }
+        SemanticTypeKind::Reference { target, mutable } => Ok(LlvmType::Reference {
+            target_type: Box::new(llvm_type_id(*target, model, nominal_kinds)?),
+            mutable: *mutable,
+        }),
+        SemanticTypeKind::Pointer(target) => Ok(LlvmType::Pointer {
+            target_type: Box::new(llvm_type_id(*target, model, nominal_kinds)?),
+        }),
+        SemanticTypeKind::Slice(element) => Ok(LlvmType::Slice {
+            elem_type: Box::new(llvm_type_id(*element, model, nominal_kinds)?),
+        }),
+        SemanticTypeKind::Union(members) => Ok(LlvmType::Union(
+            members
+                .iter()
+                .map(|member| llvm_type_id(*member, model, nominal_kinds))
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
+        SemanticTypeKind::Intersection(members) => Ok(LlvmType::TraitIntersection(
+            members
+                .iter()
+                .map(|member| match model.types.kind(*member) {
+                    SemanticTypeKind::Nominal { definition, .. }
+                        if nominal_kinds.get(definition) == Some(&DefinitionKind::Trait) =>
+                    {
+                        Ok(definition_name(model, *definition)?.to_string())
+                    }
+                    _ => Err("LLVM trait intersections require trait members".to_string()),
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
+        SemanticTypeKind::Function { parameters, result } => Ok(LlvmType::Function {
+            parameters: parameters
+                .iter()
+                .map(|parameter| llvm_type_id(*parameter, model, nominal_kinds))
+                .collect::<Result<Vec<_>, String>>()?,
+            return_type: Box::new(llvm_type_id(*result, model, nominal_kinds)?),
+        }),
+        SemanticTypeKind::Error => Err("error type reached LLVM layout lowering".to_string()),
+        SemanticTypeKind::Never => Err("never type has no LLVM value layout yet".to_string()),
+        SemanticTypeKind::GenericParameter(definition) => Err(format!(
+            "unspecialized generic `{}` reached LLVM layout lowering",
+            definition_name(model, *definition)?
+        )),
+    }
+}
+
+fn definition_name(model: &SemanticModel, definition: DefId) -> Result<&str, String> {
+    model
+        .resolutions
+        .definitions
+        .get(definition.index())
+        .map(|definition| definition.name.as_str())
+        .ok_or_else(|| format!("unknown definition id {}", definition.index()))
 }
 
 fn layouts_with_raw<'a>(
@@ -571,6 +1051,18 @@ fn promoted_numeric_llvm_type(left: &LlvmType, right: &LlvmType) -> Option<LlvmT
         | (LlvmType::I32, LlvmType::I32) => Some(LlvmType::I32),
         _ => None,
     }
+}
+
+struct FunctionCompilerDependencies<'a> {
+    signatures: &'a HashMap<String, FunctionSignature>,
+    structs: &'a HashMap<String, StructLayout>,
+    enums: &'a HashMap<String, EnumLayout>,
+    traits: &'a HashMap<String, TraitLayout>,
+    trait_vtables: &'a HashMap<String, String>,
+    globals: &'a mut Vec<GlobalString>,
+    extra_type_decls: &'a mut Vec<String>,
+    extra_function_irs: &'a mut Vec<String>,
+    lambda_counter: &'a mut usize,
 }
 
 struct FunctionCompiler<'a> {
@@ -617,6 +1109,34 @@ fn sanitize_name(name: &str) -> String {
 pub struct CompiledArtifact {
     pub llvm_ir_path: PathBuf,
     pub binary_path: PathBuf,
+}
+
+/// Input accepted by LLVM code generation.
+///
+/// `CheckedProgram` is the production path. The `Node` implementation keeps
+/// focused backend unit tests useful during the HIR-to-LLVM migration.
+pub trait CodegenInput {
+    fn legacy_codegen_program(&self) -> &Node;
+
+    fn checked_hir(&self) -> Option<(&crate::hir::Module, &crate::semantics::SemanticModel)> {
+        None
+    }
+}
+
+impl CodegenInput for Node {
+    fn legacy_codegen_program(&self) -> &Node {
+        self
+    }
+}
+
+impl CodegenInput for crate::pipeline::CheckedProgram {
+    fn legacy_codegen_program(&self) -> &Node {
+        self.legacy_codegen()
+    }
+
+    fn checked_hir(&self) -> Option<(&crate::hir::Module, &crate::semantics::SemanticModel)> {
+        Some((&self.hir, &self.semantics))
+    }
 }
 
 /// Linker and optimization options for a native build, typically sourced from
@@ -734,7 +1254,7 @@ fn materialize_runtime_sources() -> Result<(PathBuf, Option<PathBuf>), String> {
 /// Compiles a checked Skunk program into LLVM IR and a native executable
 /// using default build options.
 pub fn compile_to_executable(
-    program: &Node,
+    program: &impl CodegenInput,
     source_path: &Path,
     output_path: &Path,
 ) -> Result<CompiledArtifact, String> {
@@ -743,7 +1263,7 @@ pub fn compile_to_executable(
 
 /// Compiles a checked Skunk program into LLVM IR and a native executable.
 pub fn compile_to_executable_with_options(
-    program: &Node,
+    program: &impl CodegenInput,
     source_path: &Path,
     output_path: &Path,
     options: &BuildOptions,
@@ -813,7 +1333,24 @@ pub fn compile_to_executable_with_options(
 
 /// Lowers a checked Skunk program into textual LLVM IR without invoking the
 /// system linker.
-pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
+pub fn compile_to_llvm_ir(program: &impl CodegenInput) -> Result<String, String> {
+    let typed_backend = if let Some((hir, semantics)) = program.checked_hir() {
+        crate::hir_validation::validate(hir, semantics).map_err(|diagnostics| {
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        Some((
+            collect_typed_layouts(hir, semantics)?,
+            collect_typed_signatures(hir, semantics)?,
+            collect_typed_implementations(hir, semantics)?,
+        ))
+    } else {
+        None
+    };
+    let program = program.legacy_codegen_program();
     let statements = match program {
         Node::Program { statements } => statements,
         other => {
@@ -824,9 +1361,20 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         }
     };
 
-    let structs = collect_struct_layouts(statements)?;
-    let enums = collect_enum_layouts(statements, &structs)?;
-    let traits = collect_trait_layouts(statements, &structs, &enums)?;
+    let (typed_layouts, typed_signatures, typed_implementations) = match typed_backend {
+        Some((layouts, signatures, implementations)) => {
+            (Some(layouts), Some(signatures), Some(implementations))
+        }
+        None => (None, None, None),
+    };
+    let (structs, enums, traits) = if let Some(layouts) = typed_layouts {
+        layouts
+    } else {
+        let structs = collect_struct_layouts(statements)?;
+        let enums = collect_enum_layouts(statements, &structs)?;
+        let traits = collect_trait_layouts(statements, &structs, &enums)?;
+        (structs, enums, traits)
+    };
     let mut signatures = HashMap::<String, FunctionSignature>::new();
     let mut functions = Vec::<FunctionPlan>::new();
     let mut trait_vtables = HashMap::<String, String>::new();
@@ -886,9 +1434,9 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                     },
                 );
                 functions.push(FunctionPlan {
+                    signature_key: name.clone(),
                     symbol_name: format!("skunk_{}", name),
                     parameters: parameters.clone(),
-                    return_type: return_type.clone(),
                     body: body.clone(),
                     is_method: false,
                 });
@@ -984,7 +1532,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                         let symbol_name =
                             format!("skunk_{}_{}", sanitize_name(name), sanitize_name(method_name));
                         signatures.insert(
-                            key,
+                            key.clone(),
                             FunctionSignature {
                                 symbol_name: symbol_name.clone(),
                                 return_type: llvm_return_type.clone(),
@@ -992,6 +1540,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                             },
                         );
                         functions.push(FunctionPlan {
+                            signature_key: key,
                             symbol_name,
                             parameters: if has_receiver {
                                 let mut method_params =
@@ -1001,7 +1550,6 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
                             } else {
                                 compile_params
                             },
-                            return_type: return_type.clone(),
                             body: body.clone(),
                             is_method: has_receiver,
                         });
@@ -1017,72 +1565,58 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         }
     }
 
+    if let Some(typed_signatures) = typed_signatures {
+        signatures = typed_signatures;
+    }
+
     if !signatures.contains_key("main") {
         return Err("LLVM backend currently requires `function main(): ... {}`".to_string());
     }
 
-    for statement in statements {
-        let Node::ImplDeclaration {
-            generic_params,
-            trait_types,
-            target_type,
-            ..
-        } = statement
-        else {
-            continue;
-        };
-        if !generic_params.is_empty() {
-            continue;
-        }
-        let target_name = match target_type {
-            Type::Custom(name) => name.clone(),
-            other => {
-                return Err(format!(
-                "runtime trait values currently require concrete nominal impl targets, found `{}`",
-                ast::type_to_string(other)
-            ))
+    let implementations = if let Some(implementations) = typed_implementations {
+        implementations
+    } else {
+        let mut implementations = Vec::new();
+        for statement in statements {
+            let Node::ImplDeclaration {
+                generic_params,
+                trait_types,
+                target_type,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            if !generic_params.is_empty() {
+                continue;
             }
-        };
-        for trait_type in trait_types {
-            let Type::Custom(trait_name) = trait_type else {
+            let Type::Custom(target_name) = target_type else {
                 return Err(format!(
-                    "LLVM backend requires a concrete trait implementation, found `{}`",
-                    ast::type_to_string(trait_type)
+                    "runtime trait values currently require concrete nominal impl targets, found `{}`",
+                    ast::type_to_string(target_type)
                 ));
             };
-            let trait_layout = traits
-                .get(trait_name)
-                .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
-            let vtable_symbol = format!(
-                "skunk_vtable_{}_{}",
-                sanitize_name(trait_name),
-                sanitize_name(&target_name)
-            );
-            trait_vtables.insert(
-                format!("{}=>{}", trait_name, target_name),
-                vtable_symbol.clone(),
-            );
-            let entries = trait_layout
-                .methods
-                .iter()
-                .map(|method| {
-                    let signature_key = format!("{}::{}", target_name, method.name);
-                    let signature = signatures.get(&signature_key).ok_or_else(|| {
-                        format!(
-                            "missing concrete method `{}` for trait `{}` implementation on `{}`",
-                            method.name, trait_name, target_name
-                        )
-                    })?;
-                    Ok(format!("ptr @{}", signature.symbol_name))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            trait_vtable_globals.push(format!(
-                "@{} = private unnamed_addr constant %vtable.{} {{ {} }}",
-                vtable_symbol,
-                sanitize_name(trait_name),
-                entries.join(", ")
-            ));
+            for trait_type in trait_types {
+                let Type::Custom(trait_name) = trait_type else {
+                    return Err(format!(
+                        "LLVM backend requires a concrete trait implementation, found `{}`",
+                        ast::type_to_string(trait_type)
+                    ));
+                };
+                implementations.push((trait_name.clone(), target_name.clone()));
+            }
         }
+        implementations
+    };
+    for (trait_name, target_name) in implementations {
+        add_trait_vtable(
+            &trait_name,
+            &target_name,
+            &traits,
+            &signatures,
+            &mut trait_vtables,
+            &mut trait_vtable_globals,
+        )?;
     }
 
     let mut globals = Vec::<GlobalString>::new();
@@ -1092,43 +1626,42 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
     let mut lambda_counter = 0usize;
 
     for function in &functions {
-        let llvm_return_type = llvm_type(&function.return_type, &structs, &enums, &traits)?;
+        let signature = signatures.get(&function.signature_key).ok_or_else(|| {
+            format!(
+                "missing typed signature for function `{}`",
+                function.signature_key
+            )
+        })?;
+        let llvm_return_type = signature.return_type.clone();
         let param_defs = if function.is_method {
             let mut defs = vec![format!("ptr %arg0")];
-            for (index, (_, ty)) in function.parameters.iter().skip(1).enumerate() {
-                defs.push(format!(
-                    "{} %arg{}",
-                    llvm_type(ty, &structs, &enums, &traits)?.ir(),
-                    index + 1
-                ));
+            for (index, ty) in signature.parameters.iter().enumerate() {
+                defs.push(format!("{} %arg{}", ty.ir(), index + 1));
             }
             defs
         } else {
-            function
+            signature
                 .parameters
                 .iter()
                 .enumerate()
-                .map(|(index, (_, ty))| {
-                    Ok(format!(
-                        "{} %arg{}",
-                        llvm_type(ty, &structs, &enums, &traits)?.ir(),
-                        index
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?
+                .map(|(index, ty)| format!("{} %arg{}", ty.ir(), index))
+                .collect()
+        };
+        let dependencies = FunctionCompilerDependencies {
+            signatures: &signatures,
+            structs: &structs,
+            enums: &enums,
+            traits: &traits,
+            trait_vtables: &trait_vtables,
+            globals: &mut globals,
+            extra_type_decls: &mut extra_type_decls,
+            extra_function_irs: &mut extra_function_irs,
+            lambda_counter: &mut lambda_counter,
         };
         let compiler = FunctionCompiler::new(
             &function.symbol_name,
             llvm_return_type.clone(),
-            &signatures,
-            &structs,
-            &enums,
-            &traits,
-            &trait_vtables,
-            &mut globals,
-            &mut extra_type_decls,
-            &mut extra_function_irs,
-            &mut lambda_counter,
+            dependencies,
             None,
         );
         let body_lines = compiler.compile(&function.parameters, &function.body)?;
@@ -1250,8 +1783,7 @@ pub fn compile_to_llvm_ir(program: &Node) -> Result<String, String> {
         let vtable_fields = if layout.methods.is_empty() {
             String::new()
         } else {
-            std::iter::repeat("ptr")
-                .take(layout.methods.len())
+            std::iter::repeat_n("ptr", layout.methods.len())
                 .collect::<Vec<_>>()
                 .join(", ")
         };

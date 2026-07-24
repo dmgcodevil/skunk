@@ -2,6 +2,12 @@
 
 use super::*;
 
+struct ExpressionTransformContext<'a> {
+    expected_type: Option<&'a Type>,
+    substitutions: &'a HashMap<String, Type>,
+    self_type: Option<Type>,
+}
+
 impl Monomorphizer {
     /// Transforms one function template into a concrete declaration, seeding
     /// its local type environment with substituted parameters and receiver.
@@ -566,8 +572,11 @@ impl Monomorphizer {
                     return_type,
                     body,
                     env,
-                    substitutions,
-                    self_type,
+                    ExpressionTransformContext {
+                        expected_type: None,
+                        substitutions,
+                        self_type,
+                    },
                 )?;
                 Ok((node, Some(sk_type)))
             }
@@ -603,16 +612,20 @@ impl Monomorphizer {
         }
     }
 
-    pub(super) fn transform_lambda(
+    fn transform_lambda(
         &mut self,
         name: &str,
         parameters: &[(String, Type)],
         return_type: &Type,
         body: &[Node],
         parent_env: &Env,
-        substitutions: &HashMap<String, Type>,
-        self_type: Option<Type>,
+        context: ExpressionTransformContext<'_>,
     ) -> Result<(Node, Type), String> {
+        let ExpressionTransformContext {
+            substitutions,
+            self_type,
+            ..
+        } = context;
         let mut env = parent_env.clone();
         env.push();
         let mut output_parameters = Vec::new();
@@ -1126,9 +1139,11 @@ impl Monomorphizer {
                 arguments,
                 metadata,
                 env,
-                expected_type,
-                substitutions,
-                self_type,
+                ExpressionTransformContext {
+                    expected_type,
+                    substitutions,
+                    self_type,
+                },
             ),
             Node::Access { nodes } => {
                 let mut output_nodes = Vec::new();
@@ -1473,11 +1488,8 @@ impl Monomorphizer {
                                     continue;
                                 }
 
-                                let (_, parameter_types, return_type) = match &current_type {
-                                    _ => {
-                                        self.lookup_method_signature(&current_type, method_name)?
-                                    }
-                                };
+                                let (_, parameter_types, return_type) =
+                                    self.lookup_method_signature(&current_type, method_name)?;
                                 let mut output_args = Vec::<Vec<Node>>::new();
                                 let mut group_types = Vec::<Vec<Type>>::new();
                                 for (group_index, args) in arguments.iter().enumerate() {
@@ -1617,8 +1629,11 @@ impl Monomorphizer {
                 return_type,
                 body,
                 env,
-                substitutions,
-                self_type,
+                ExpressionTransformContext {
+                    expected_type,
+                    substitutions,
+                    self_type,
+                },
             ),
             Node::Block { .. }
             | Node::UnsafeBlock { .. }
@@ -1956,17 +1971,20 @@ impl Monomorphizer {
 
     /// Resolves a call, infers generic arguments when omitted, and rewrites the
     /// callee to the concrete symbol selected for code generation.
-    pub(super) fn transform_function_call(
+    fn transform_function_call(
         &mut self,
         name: &str,
         explicit_type_arguments: &[Type],
         arguments: &[Vec<Node>],
         metadata: &Metadata,
         env: &mut Env,
-        expected_type: Option<&Type>,
-        substitutions: &HashMap<String, Type>,
-        self_type: Option<Type>,
+        context: ExpressionTransformContext<'_>,
     ) -> Result<(Node, Type), String> {
+        let ExpressionTransformContext {
+            expected_type,
+            substitutions,
+            self_type,
+        } = context;
         if let Some(template) = self.generic_functions.get(name).cloned() {
             let mut output_args = Vec::new();
             let mut argument_types = Vec::new();
