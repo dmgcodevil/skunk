@@ -29,6 +29,7 @@ impl<'a> FunctionLowerer<'a> {
             function,
             expression.source,
             expression.span,
+            None,
             self.model,
             bindings,
         )

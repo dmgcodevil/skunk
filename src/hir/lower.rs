@@ -863,10 +863,17 @@ impl<'a> Lowerer<'a> {
             }
             syntax::ExprKind::Array(elements) => {
                 let expected_element =
-                    expected.and_then(|expected| match self.model.types.kind(expected) {
-                        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
-                            Some(*element)
+                    expected.and_then(|expected| match self.model.types.kind(expected).clone() {
+                        TypeKind::Array {
+                            element,
+                            dimensions,
+                        } if dimensions.len() > 1 => {
+                            Some(self.model.types.intern(TypeKind::Array {
+                                element,
+                                dimensions: dimensions[1..].to_vec(),
+                            }))
                         }
+                        TypeKind::Array { element, .. } | TypeKind::Slice(element) => Some(element),
                         _ => None,
                     });
                 let elements = elements

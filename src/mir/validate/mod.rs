@@ -5,6 +5,8 @@
 //! aggregates and calls match their semantic shapes, conditions are boolean,
 //! and return values match their function signature.
 
+mod coercion;
+mod declaration;
 mod value;
 
 use super::*;
@@ -35,6 +37,7 @@ pub fn validate(module: &Module, model: &SemanticModel) -> Result<(), Vec<Diagno
             (
                 function.source,
                 FunctionShape {
+                    origin: function.origin,
                     captures: capture_types,
                     parameters: parameter_types,
                     result: function.result,
@@ -42,11 +45,53 @@ pub fn validate(module: &Module, model: &SemanticModel) -> Result<(), Vec<Diagno
             )
         })
         .collect();
+    let function_definitions = module
+        .functions
+        .iter()
+        .filter_map(|function| {
+            function
+                .definition()
+                .map(|definition| (definition, function.owner()))
+        })
+        .collect();
+    let mut implementations = HashSet::new();
+    let mut supertraits = HashMap::new();
+    for declaration in &module.declarations {
+        match &declaration.kind {
+            DeclarationKind::Implementation { traits, target } => {
+                let Some(target) = semantic_nominal_definition(model, *target) else {
+                    continue;
+                };
+                for trait_type in traits {
+                    if let Some(trait_definition) = semantic_nominal_definition(model, *trait_type)
+                    {
+                        implementations.insert((trait_definition, target));
+                    }
+                }
+            }
+            DeclarationKind::Trait {
+                definition,
+                supertraits: inherited,
+                ..
+            } => {
+                supertraits.insert(*definition, inherited.clone());
+            }
+            _ => {}
+        }
+    }
     let mut validator = Validator {
         model,
         functions,
+        function_definitions,
+        implementations,
+        supertraits,
+        seen_function_sources: HashSet::new(),
+        seen_function_definitions: HashSet::new(),
         diagnostics: Vec::new(),
     };
+    for declaration in &module.declarations {
+        validator.declaration(declaration);
+    }
     for function in &module.functions {
         validator.function(function);
     }
@@ -59,6 +104,7 @@ pub fn validate(module: &Module, model: &SemanticModel) -> Result<(), Vec<Diagno
 
 #[derive(Clone)]
 struct FunctionShape {
+    origin: FunctionOrigin,
     captures: Vec<Option<TypeId>>,
     parameters: Vec<Option<TypeId>>,
     result: TypeId,
@@ -67,17 +113,97 @@ struct FunctionShape {
 struct Validator<'a> {
     model: &'a SemanticModel,
     functions: HashMap<NodeId, FunctionShape>,
+    function_definitions: HashMap<crate::ids::DefId, Option<crate::ids::DefId>>,
+    implementations: HashSet<(crate::ids::DefId, crate::ids::DefId)>,
+    supertraits: HashMap<crate::ids::DefId, Vec<crate::ids::DefId>>,
+    seen_function_sources: HashSet<NodeId>,
+    seen_function_definitions: HashSet<crate::ids::DefId>,
     diagnostics: Vec<Diagnostic>,
+}
+
+fn semantic_nominal_definition(model: &SemanticModel, ty: TypeId) -> Option<crate::ids::DefId> {
+    match model.types.kind(ty) {
+        TypeKind::Nominal { definition, .. } => Some(*definition),
+        TypeKind::Const(inner) => semantic_nominal_definition(model, *inner),
+        _ => None,
+    }
 }
 
 impl Validator<'_> {
     fn function(&mut self, function: &Function) {
         self.span(function.span);
+        if !self.seen_function_sources.insert(function.source) {
+            self.diagnostics.push(
+                Diagnostic::error("multiple MIR functions have the same source identity")
+                    .with_code("E5156")
+                    .at(function.span),
+            );
+        }
         self.ty(function.result, function.span);
-        if let Some(definition) = function.definition {
+        if let Some(definition) = function.definition() {
             if definition.index() >= self.model.resolutions.definitions.len() {
                 self.invalid_id("definition", definition.index(), function.span);
+            } else {
+                if !self.seen_function_definitions.insert(definition) {
+                    self.diagnostics.push(
+                        Diagnostic::error("one definition maps to multiple MIR functions")
+                            .with_code("E5157")
+                            .at(function.span),
+                    );
+                }
+                let expected = if function.owner().is_some() {
+                    DefinitionKind::Method
+                } else {
+                    DefinitionKind::Function
+                };
+                if self.model.resolutions.definitions[definition.index()].kind != expected {
+                    self.diagnostics.push(
+                        Diagnostic::error("MIR function definition has the wrong semantic kind")
+                            .with_code("E5158")
+                            .at(function.span),
+                    );
+                }
             }
+        }
+        match function.origin {
+            FunctionOrigin::Definition {
+                owner: Some(owner), ..
+            } => {
+                if owner.index() >= self.model.resolutions.definitions.len() {
+                    self.invalid_id("function owner", owner.index(), function.span);
+                } else if !matches!(
+                    self.model.resolutions.definitions[owner.index()].kind,
+                    DefinitionKind::Struct | DefinitionKind::Enum
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::error("MIR method owner is not a struct or enum")
+                            .with_code("E5160")
+                            .at(function.span),
+                    );
+                }
+            }
+            FunctionOrigin::Closure => {}
+            FunctionOrigin::GlobalInitializer { global } => {
+                if global.index() >= self.model.resolutions.definitions.len() {
+                    self.invalid_id("global initializer owner", global.index(), function.span);
+                } else if self.model.resolutions.definitions[global.index()].kind
+                    != DefinitionKind::Global
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error("MIR initializer owner is not a global")
+                            .with_code("E5159")
+                            .at(function.span),
+                    );
+                }
+                if !function.parameters.is_empty() || !function.captures.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::error("MIR global initializer has parameters or captures")
+                            .with_code("E5183")
+                            .at(function.span),
+                    );
+                }
+            }
+            FunctionOrigin::Definition { owner: None, .. } => {}
         }
 
         let mut source_locals = HashSet::new();
@@ -122,6 +248,24 @@ impl Validator<'_> {
                     Diagnostic::error("MIR parameter appears more than once")
                         .with_code("E5104")
                         .at(function.span),
+                );
+            }
+        }
+        if let Some(definition) = function.definition() {
+            let parameter_types = function
+                .parameters
+                .iter()
+                .filter_map(|parameter| function.locals.get(parameter.index()))
+                .map(|local| local.ty)
+                .collect::<Vec<_>>();
+            if parameter_types.len() == function.parameters.len() {
+                self.function_signature(
+                    definition,
+                    &parameter_types,
+                    function.result,
+                    false,
+                    "function",
+                    function.span,
                 );
             }
         }
@@ -412,6 +556,19 @@ impl Validator<'_> {
             }
             _ => false,
         }
+    }
+
+    fn array_element_matches(&self, element: TypeId, dimensions: &[u64], actual: TypeId) -> bool {
+        if dimensions.len() <= 1 {
+            return element == actual;
+        }
+        matches!(
+            self.valid_type_kind(actual),
+            Some(TypeKind::Array {
+                element: actual_element,
+                dimensions: actual_dimensions,
+            }) if *actual_element == element && actual_dimensions == &dimensions[1..]
+        )
     }
 
     fn is_sequence(&self, ty: TypeId) -> bool {

@@ -144,7 +144,7 @@ fn lowers_non_capturing_lambdas_as_nested_functions() {
     let closure = module
         .functions
         .iter()
-        .find(|function| function.definition.is_none())
+        .find(|function| function.origin == FunctionOrigin::Closure)
         .expect("lambda should become a nested MIR function");
 
     assert!(closure.captures.is_empty());

@@ -14,14 +14,96 @@ use crate::syntax::ast::{BinaryOperator, Literal, UnaryOperator};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
+    /// Runtime and ABI declarations needed independently of function bodies.
+    pub declarations: Vec<Declaration>,
     pub functions: Vec<Function>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Declaration {
+    pub source: NodeId,
+    pub span: Span,
+    pub exported: bool,
+    pub kind: DeclarationKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeclarationKind {
+    Struct {
+        definition: DefId,
+        fields: Vec<FieldDeclaration>,
+        methods: Vec<DefId>,
+    },
+    Enum {
+        definition: DefId,
+        variants: Vec<VariantDeclaration>,
+        methods: Vec<DefId>,
+    },
+    Trait {
+        definition: DefId,
+        supertraits: Vec<DefId>,
+        methods: Vec<TraitMethodDeclaration>,
+    },
+    /// Shapes participate in compile-time structural constraints but have no
+    /// runtime layout. Keeping their signatures here makes MIR self-describing.
+    Shape {
+        definition: DefId,
+        methods: Vec<TraitMethodDeclaration>,
+    },
+    Implementation {
+        traits: Vec<TypeId>,
+        target: TypeId,
+    },
+    ExternFunction {
+        definition: DefId,
+        parameters: Vec<TypeId>,
+        result: TypeId,
+    },
+    Global {
+        definition: DefId,
+        ty: TypeId,
+        mutable: bool,
+        /// Source identity of the initializer's executable MIR body.
+        initializer: Option<NodeId>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldDeclaration {
+    pub id: FieldId,
+    pub name: String,
+    pub ty: TypeId,
+    pub mutable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantDeclaration {
+    pub id: VariantId,
+    pub name: String,
+    pub payload: Vec<TypeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraitMethodDeclaration {
+    pub definition: DefId,
+    pub name: String,
+    pub receiver: Option<Receiver>,
+    pub parameters: Vec<TypeId>,
+    pub result: TypeId,
+    pub default_body: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Receiver {
+    pub mutable: bool,
+    pub is_const: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Function {
     pub source: NodeId,
     pub span: Span,
-    pub definition: Option<DefId>,
+    pub origin: FunctionOrigin,
     /// Locals supplied by a closure environment, in environment field order.
     pub captures: Vec<MirLocalId>,
     pub parameters: Vec<MirLocalId>,
@@ -29,6 +111,35 @@ pub struct Function {
     pub locals: Vec<Local>,
     pub entry: MirBlockId,
     pub blocks: Vec<BasicBlock>,
+}
+
+impl Function {
+    pub fn definition(&self) -> Option<DefId> {
+        match self.origin {
+            FunctionOrigin::Definition { definition, .. } => Some(definition),
+            FunctionOrigin::Closure | FunctionOrigin::GlobalInitializer { .. } => None,
+        }
+    }
+
+    pub fn owner(&self) -> Option<DefId> {
+        match self.origin {
+            FunctionOrigin::Definition { owner, .. } => owner,
+            FunctionOrigin::Closure | FunctionOrigin::GlobalInitializer { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionOrigin {
+    Definition {
+        definition: DefId,
+        /// Nominal type that owns a method; absent for free functions.
+        owner: Option<DefId>,
+    },
+    Closure,
+    GlobalInitializer {
+        global: DefId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +307,9 @@ pub struct Rvalue {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RvalueKind {
     Use(Operand),
+    /// A semantic conversion approved by the front end. Keeping it explicit
+    /// prevents code generation from guessing at assignment boundaries.
+    Coerce(Operand),
     Unary {
         operator: UnaryOperator,
         operand: Operand,

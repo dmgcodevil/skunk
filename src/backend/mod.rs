@@ -9,6 +9,7 @@ use crate::analysis::resolver::DefinitionKind;
 use crate::analysis::types::TypeKind as SemanticTypeKind;
 use crate::ids::{DefId, TypeId};
 use crate::intrinsics::IntrinsicType;
+use crate::mir::{self, DeclarationKind};
 use crate::specialization::tree::{self as ast, Literal, Node, Operator, Type, UnaryOperator};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -337,24 +338,22 @@ fn array_len_from_dimension(dimension: &Node) -> Result<usize, String> {
     })
 }
 
-/// Builds native layouts from validated HIR.
+/// Builds native layouts from validated MIR declarations.
 fn collect_typed_layouts(
-    module: &crate::hir::Module,
+    module: &mir::Module,
     model: &SemanticModel,
 ) -> Result<BackendLayouts, String> {
     let nominal_kinds = typed_nominal_kinds(module);
 
     let mut structs = HashMap::new();
     let mut enums = HashMap::new();
-    for item in &module.items {
-        let Some(definition) = item.definition else {
-            continue;
-        };
-        let name = definition_name(model, definition)?.to_string();
-        match &item.kind {
-            crate::hir::ItemKind::Struct(declaration) => {
-                let fields = declaration
-                    .fields
+    for declaration in &module.declarations {
+        match &declaration.kind {
+            DeclarationKind::Struct {
+                definition, fields, ..
+            } => {
+                let name = definition_name(model, *definition)?.to_string();
+                let fields = fields
                     .iter()
                     .map(|field| {
                         Ok((
@@ -365,10 +364,14 @@ fn collect_typed_layouts(
                     .collect::<Result<Vec<_>, String>>()?;
                 structs.insert(name.clone(), StructLayout { name, fields });
             }
-            crate::hir::ItemKind::Enum(declaration) => {
+            DeclarationKind::Enum {
+                definition,
+                variants,
+                ..
+            } => {
+                let name = definition_name(model, *definition)?.to_string();
                 let mut next_field_index = 1usize;
-                let variants = declaration
-                    .variants
+                let variants = variants
                     .iter()
                     .enumerate()
                     .map(|(tag, variant)| {
@@ -399,12 +402,10 @@ fn collect_typed_layouts(
     }
 
     let trait_declarations = module
-        .items
+        .declarations
         .iter()
-        .filter_map(|item| match (&item.kind, item.definition) {
-            (crate::hir::ItemKind::Trait(declaration), Some(definition)) => {
-                Some((definition, declaration))
-            }
+        .filter_map(|declaration| match &declaration.kind {
+            DeclarationKind::Trait { definition, .. } => Some((*definition, declaration)),
             _ => None,
         })
         .collect::<HashMap<_, _>>();
@@ -423,72 +424,110 @@ fn collect_typed_layouts(
 }
 
 fn collect_typed_signatures(
-    module: &crate::hir::Module,
+    module: &mir::Module,
     model: &SemanticModel,
 ) -> Result<HashMap<String, FunctionSignature>, String> {
     let nominal_kinds = typed_nominal_kinds(module);
     let mut signatures = HashMap::new();
-    for item in &module.items {
-        match (&item.kind, item.definition) {
-            (crate::hir::ItemKind::Function(function), Some(definition)) => {
-                let name = definition_name(model, definition)?.to_string();
-                signatures.insert(
-                    name.clone(),
-                    typed_function_signature(
-                        format!("skunk_{name}"),
-                        function,
-                        model,
-                        &nominal_kinds,
-                        false,
-                    )?,
-                );
+    for declaration in &module.declarations {
+        let DeclarationKind::ExternFunction {
+            definition,
+            parameters,
+            result,
+        } = &declaration.kind
+        else {
+            continue;
+        };
+        let name = definition_name(model, *definition)?.to_string();
+        signatures.insert(
+            name.clone(),
+            FunctionSignature {
+                symbol_name: name,
+                return_type: llvm_type_id(*result, model, &nominal_kinds)?,
+                parameters: parameters
+                    .iter()
+                    .map(|ty| llvm_type_id(*ty, model, &nominal_kinds))
+                    .collect::<Result<Vec<_>, String>>()?,
+            },
+        );
+    }
+    for function in &module.functions {
+        let Some(definition) = function.definition() else {
+            continue;
+        };
+        let name = definition_name(model, definition)?;
+        let (key, symbol_name) = match function.owner() {
+            Some(owner) => {
+                let owner_name = definition_name(model, owner)?;
+                (
+                    format!("{owner_name}::{name}"),
+                    format!(
+                        "skunk_{}_{}",
+                        sanitize_name(owner_name),
+                        sanitize_name(name)
+                    ),
+                )
             }
-            (crate::hir::ItemKind::ExternFunction(signature), Some(definition)) => {
-                let name = definition_name(model, definition)?.to_string();
-                signatures.insert(
-                    name.clone(),
-                    FunctionSignature {
-                        symbol_name: name,
-                        return_type: llvm_type_id(signature.result, model, &nominal_kinds)?,
-                        parameters: signature
-                            .parameters
-                            .iter()
-                            .map(|ty| llvm_type_id(*ty, model, &nominal_kinds))
-                            .collect::<Result<Vec<_>, String>>()?,
-                    },
-                );
-            }
-            (crate::hir::ItemKind::Struct(declaration), Some(owner)) => {
-                collect_typed_method_signatures(
-                    owner,
-                    &declaration.methods,
-                    model,
-                    &nominal_kinds,
-                    &mut signatures,
-                )?;
-            }
-            (crate::hir::ItemKind::Enum(declaration), Some(owner)) => {
-                collect_typed_method_signatures(
-                    owner,
-                    &declaration.methods,
-                    model,
-                    &nominal_kinds,
-                    &mut signatures,
-                )?;
-            }
-            _ => {}
-        }
+            None => (name.to_string(), format!("skunk_{name}")),
+        };
+        signatures.insert(
+            key,
+            typed_function_signature(
+                symbol_name,
+                function,
+                model,
+                &nominal_kinds,
+                mir_function_has_receiver(function, model),
+            )?,
+        );
     }
     Ok(signatures)
 }
 
+fn mir_function_has_receiver(function: &mir::Function, model: &SemanticModel) -> bool {
+    function.owner().is_some()
+        && function
+            .parameters
+            .first()
+            .and_then(|parameter| function.locals.get(parameter.index()))
+            .and_then(|local| local.source)
+            .and_then(|source| model.resolutions.locals.get(source.index()))
+            .is_some_and(|local| local.name == "self")
+}
+
+fn typed_function_signature(
+    symbol_name: String,
+    function: &mir::Function,
+    model: &SemanticModel,
+    nominal_kinds: &HashMap<DefId, DefinitionKind>,
+    skip_receiver: bool,
+) -> Result<FunctionSignature, String> {
+    let parameters = function
+        .parameters
+        .iter()
+        .skip(usize::from(skip_receiver))
+        .map(|parameter| {
+            let local = function
+                .locals
+                .get(parameter.index())
+                .ok_or_else(|| format!("unknown MIR parameter local {}", parameter.index()))?;
+            llvm_type_id(local.ty, model, nominal_kinds)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(FunctionSignature {
+        symbol_name,
+        return_type: llvm_type_id(function.result, model, nominal_kinds)?,
+        parameters,
+    })
+}
+
 fn collect_typed_implementations(
-    module: &crate::hir::Module,
+    module: &mir::Module,
     model: &SemanticModel,
 ) -> Result<Vec<(String, String)>, String> {
     let mut implementations = Vec::new();
-    for item in &module.items {
-        let crate::hir::ItemKind::Implementation { traits, target } = &item.kind else {
+    for declaration in &module.declarations {
+        let DeclarationKind::Implementation { traits, target } = &declaration.kind else {
             continue;
         };
         let target = nominal_type_name(*target, model)?.to_string();
@@ -555,68 +594,16 @@ fn add_trait_vtable(
     Ok(())
 }
 
-fn collect_typed_method_signatures(
-    owner: DefId,
-    methods: &[crate::hir::Function],
-    model: &SemanticModel,
-    nominal_kinds: &HashMap<DefId, DefinitionKind>,
-    signatures: &mut HashMap<String, FunctionSignature>,
-) -> Result<(), String> {
-    let owner_name = definition_name(model, owner)?;
-    for method in methods {
-        let definition = method
-            .definition
-            .ok_or_else(|| format!("method on `{owner_name}` has no definition id"))?;
-        let method_name = definition_name(model, definition)?;
-        let key = format!("{owner_name}::{method_name}");
-        let symbol = format!(
-            "skunk_{}_{}",
-            sanitize_name(owner_name),
-            sanitize_name(method_name)
-        );
-        let has_receiver = method
-            .parameters
-            .first()
-            .and_then(|parameter| model.resolutions.locals.get(parameter.local.index()))
-            .is_some_and(|local| local.name == "self");
-        signatures.insert(
-            key,
-            typed_function_signature(symbol, method, model, nominal_kinds, has_receiver)?,
-        );
-    }
-    Ok(())
-}
-
-fn typed_function_signature(
-    symbol_name: String,
-    function: &crate::hir::Function,
-    model: &SemanticModel,
-    nominal_kinds: &HashMap<DefId, DefinitionKind>,
-    skip_receiver: bool,
-) -> Result<FunctionSignature, String> {
-    Ok(FunctionSignature {
-        symbol_name,
-        return_type: llvm_type_id(function.result, model, nominal_kinds)?,
-        parameters: function
-            .parameters
-            .iter()
-            .skip(usize::from(skip_receiver))
-            .map(|parameter| llvm_type_id(parameter.ty, model, nominal_kinds))
-            .collect::<Result<Vec<_>, String>>()?,
-    })
-}
-
-fn typed_nominal_kinds(module: &crate::hir::Module) -> HashMap<DefId, DefinitionKind> {
+fn typed_nominal_kinds(module: &mir::Module) -> HashMap<DefId, DefinitionKind> {
     module
-        .items
+        .declarations
         .iter()
-        .filter_map(|item| {
-            let definition = item.definition?;
-            let kind = match item.kind {
-                crate::hir::ItemKind::Struct(_) => DefinitionKind::Struct,
-                crate::hir::ItemKind::Enum(_) => DefinitionKind::Enum,
-                crate::hir::ItemKind::Trait(_) => DefinitionKind::Trait,
-                crate::hir::ItemKind::Shape(_) => DefinitionKind::Shape,
+        .filter_map(|declaration| {
+            let (definition, kind) = match declaration.kind {
+                DeclarationKind::Struct { definition, .. } => (definition, DefinitionKind::Struct),
+                DeclarationKind::Enum { definition, .. } => (definition, DefinitionKind::Enum),
+                DeclarationKind::Trait { definition, .. } => (definition, DefinitionKind::Trait),
+                DeclarationKind::Shape { definition, .. } => (definition, DefinitionKind::Shape),
                 _ => return None,
             };
             Some((definition, kind))
@@ -626,7 +613,7 @@ fn typed_nominal_kinds(module: &crate::hir::Module) -> HashMap<DefId, Definition
 
 fn build_typed_trait_layout(
     definition: DefId,
-    declarations: &HashMap<DefId, &crate::hir::Trait>,
+    declarations: &HashMap<DefId, &mir::Declaration>,
     model: &SemanticModel,
     nominal_kinds: &HashMap<DefId, DefinitionKind>,
     layouts: &mut HashMap<String, TraitLayout>,
@@ -652,11 +639,21 @@ fn build_typed_trait_layout(
     }
     let declaration = declarations
         .get(&definition)
-        .ok_or_else(|| format!("missing HIR declaration for trait `{name}`"))?;
+        .ok_or_else(|| format!("missing MIR declaration for trait `{name}`"))?;
+    let DeclarationKind::Trait {
+        supertraits,
+        methods: declared_methods,
+        ..
+    } = &declaration.kind
+    else {
+        return Err(format!(
+            "MIR definition `{name}` is not a trait declaration"
+        ));
+    };
     visiting.push(definition);
     let mut methods = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for supertrait in &declaration.supertraits {
+    for supertrait in supertraits {
         let inherited = build_typed_trait_layout(
             *supertrait,
             declarations,
@@ -671,7 +668,7 @@ fn build_typed_trait_layout(
             }
         }
     }
-    for method in &declaration.methods {
+    for method in declared_methods {
         if !seen.insert(method.name.clone()) {
             return Err(format!(
                 "trait `{name}` declares duplicate inherited method `{}`",
@@ -1098,9 +1095,10 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let (structs, enums, traits) = collect_typed_layouts(&program.hir, &program.semantics)?;
-    let typed_signatures = collect_typed_signatures(&program.hir, &program.semantics)?;
-    let typed_implementations = collect_typed_implementations(&program.hir, &program.semantics)?;
+    let mir = crate::pipeline::lower_to_mir(program)?;
+    let (structs, enums, traits) = collect_typed_layouts(&mir, &program.semantics)?;
+    let typed_signatures = collect_typed_signatures(&mir, &program.semantics)?;
+    let typed_implementations = collect_typed_implementations(&mir, &program.semantics)?;
     let lowered_program = from_hir::lower_program(&program.hir, &program.semantics)?;
     let program = &lowered_program;
     let statements = match program {

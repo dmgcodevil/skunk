@@ -6,6 +6,7 @@
 
 mod captures;
 mod control_flow;
+mod declaration;
 mod expression;
 
 use super::*;
@@ -22,53 +23,13 @@ use std::collections::HashMap;
 pub fn lower(module: &hir::Module, model: &SemanticModel) -> Result<Module, Vec<Diagnostic>> {
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
-
-    for item in &module.items {
-        match &item.kind {
-            hir::ItemKind::Function(function) => collect_function(
-                function,
-                item.source,
-                item.span,
-                model,
-                &mut functions,
-                &mut diagnostics,
-            ),
-            hir::ItemKind::Struct(declaration) => {
-                for function in &declaration.methods {
-                    collect_function(
-                        function,
-                        function.body.source,
-                        function.body.span,
-                        model,
-                        &mut functions,
-                        &mut diagnostics,
-                    );
-                }
-            }
-            hir::ItemKind::Enum(declaration) => {
-                for function in &declaration.methods {
-                    collect_function(
-                        function,
-                        function.body.source,
-                        function.body.span,
-                        model,
-                        &mut functions,
-                        &mut diagnostics,
-                    );
-                }
-            }
-            hir::ItemKind::Trait(_)
-            | hir::ItemKind::Shape(_)
-            | hir::ItemKind::Implementation { .. }
-            | hir::ItemKind::ExternFunction(_)
-            | hir::ItemKind::Global(_)
-            | hir::ItemKind::Test(_)
-            | hir::ItemKind::Statement(_) => {}
-        }
-    }
+    let declarations = declaration::lower_module(module, model, &mut functions, &mut diagnostics);
 
     if diagnostics.is_empty() {
-        Ok(Module { functions })
+        Ok(Module {
+            declarations,
+            functions,
+        })
     } else {
         Err(diagnostics)
     }
@@ -78,11 +39,12 @@ fn collect_function(
     function: &hir::Function,
     source: NodeId,
     span: Span,
+    owner: Option<crate::ids::DefId>,
     model: &SemanticModel,
     functions: &mut Vec<Function>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    match FunctionLowerer::new(function, source, span, model, Vec::new()).lower() {
+    match FunctionLowerer::new(function, source, span, owner, model, Vec::new()).lower() {
         Ok(mut lowered) => functions.append(&mut lowered),
         Err(mut errors) => diagnostics.append(&mut errors),
     }
@@ -102,8 +64,27 @@ struct DraftBlock {
     reachable: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FunctionBody<'a> {
+    Block(&'a hir::Block),
+    Expression(&'a hir::Expr),
+}
+
+#[derive(Clone, Copy)]
+struct FunctionInput<'a> {
+    origin: FunctionOrigin,
+    parameters: &'a [hir::Parameter],
+    result: TypeId,
+    body: FunctionBody<'a>,
+    source: NodeId,
+    span: Span,
+}
+
 struct FunctionLowerer<'a> {
-    hir: &'a hir::Function,
+    origin: FunctionOrigin,
+    parameter_inputs: &'a [hir::Parameter],
+    result: TypeId,
+    body: FunctionBody<'a>,
     source: NodeId,
     span: Span,
     model: &'a SemanticModel,
@@ -124,13 +105,62 @@ impl<'a> FunctionLowerer<'a> {
         hir: &'a hir::Function,
         source: NodeId,
         span: Span,
+        owner: Option<crate::ids::DefId>,
+        model: &'a SemanticModel,
+        capture_bindings: Vec<CaptureBinding>,
+    ) -> Self {
+        let origin = match hir.definition {
+            Some(definition) => FunctionOrigin::Definition { definition, owner },
+            None => FunctionOrigin::Closure,
+        };
+        Self::with_body(
+            FunctionInput {
+                origin,
+                parameters: &hir.parameters,
+                result: hir.result,
+                body: FunctionBody::Block(&hir.body),
+                source,
+                span,
+            },
+            model,
+            capture_bindings,
+        )
+    }
+
+    fn new_initializer(
+        expression: &'a hir::Expr,
+        result: TypeId,
+        global: crate::ids::DefId,
+        source: NodeId,
+        span: Span,
+        model: &'a SemanticModel,
+    ) -> Self {
+        Self::with_body(
+            FunctionInput {
+                origin: FunctionOrigin::GlobalInitializer { global },
+                parameters: &[],
+                result,
+                body: FunctionBody::Expression(expression),
+                source,
+                span,
+            },
+            model,
+            Vec::new(),
+        )
+    }
+
+    fn with_body(
+        input: FunctionInput<'a>,
         model: &'a SemanticModel,
         capture_bindings: Vec<CaptureBinding>,
     ) -> Self {
         Self {
-            hir,
-            source,
-            span,
+            origin: input.origin,
+            parameter_inputs: input.parameters,
+            result: input.result,
+            body: input.body,
+            source: input.source,
+            span: input.span,
             model,
             locals: Vec::new(),
             source_locals: HashMap::new(),
@@ -162,7 +192,7 @@ impl<'a> FunctionLowerer<'a> {
                 self.captures.push(local);
             }
         }
-        for parameter in &self.hir.parameters {
+        for parameter in self.parameter_inputs {
             if let Some(local) = self.register_source_local(
                 parameter.local,
                 parameter.ty,
@@ -174,8 +204,20 @@ impl<'a> FunctionLowerer<'a> {
             }
         }
 
-        let body = &self.hir.body;
-        self.lower_block(body);
+        match self.body {
+            FunctionBody::Block(body) => self.lower_block(body),
+            FunctionBody::Expression(expression) => {
+                if let Some(value) = self.lower_expression(expression).and_then(|value| {
+                    self.coerce_operand(value, self.result, expression.source, expression.span)
+                }) {
+                    self.terminate(Terminator {
+                        source: expression.source,
+                        span: expression.span,
+                        kind: TerminatorKind::Return(Some(value)),
+                    });
+                }
+            }
+        }
         self.finish_open_blocks();
 
         if !self.diagnostics.is_empty() {
@@ -205,10 +247,10 @@ impl<'a> FunctionLowerer<'a> {
         let function = Function {
             source: self.source,
             span: self.span,
-            definition: self.hir.definition,
+            origin: self.origin,
             captures: self.captures,
             parameters: self.parameters,
-            result: self.hir.result,
+            result: self.result,
             locals: self.locals,
             entry: MirBlockId::new(0),
             blocks,
@@ -252,10 +294,7 @@ impl<'a> FunctionLowerer<'a> {
                     if let Some(value) = self.lower_expression(initializer) {
                         self.assign(
                             Place::local(destination),
-                            Rvalue {
-                                ty: value.ty,
-                                kind: RvalueKind::Use(value),
-                            },
+                            self.use_or_coerce(value, *ty),
                             statement.source,
                             statement.span,
                         );
@@ -271,10 +310,7 @@ impl<'a> FunctionLowerer<'a> {
                 if let (Some(destination), Some(value)) = (destination, value) {
                     self.assign(
                         destination,
-                        Rvalue {
-                            ty: value.ty,
-                            kind: RvalueKind::Use(value),
-                        },
+                        self.use_or_coerce(value, target.ty),
                         statement.source,
                         statement.span,
                     );
@@ -286,7 +322,10 @@ impl<'a> FunctionLowerer<'a> {
             hir::StmtKind::Return(value) => {
                 let value = value
                     .as_ref()
-                    .and_then(|expression| self.lower_expression(expression));
+                    .and_then(|expression| self.lower_expression(expression))
+                    .and_then(|value| {
+                        self.coerce_operand(value, self.result, statement.source, statement.span)
+                    });
                 self.emit_all_scope_defers();
                 self.terminate(Terminator {
                     source: statement.source,
@@ -573,7 +612,7 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn finish_open_blocks(&mut self) {
-        let result_is_void = self.type_is_void(self.hir.result);
+        let result_is_void = self.type_is_void(self.result);
         for index in 0..self.blocks.len() {
             if self.blocks[index].terminator.is_some() {
                 continue;
@@ -616,6 +655,41 @@ impl<'a> FunctionLowerer<'a> {
             OperandKind::Definition(definition)
         };
         Operand { ty, kind }
+    }
+
+    fn use_or_coerce(&self, operand: Operand, expected: TypeId) -> Rvalue {
+        let kind = if operand.ty == expected {
+            RvalueKind::Use(operand)
+        } else {
+            RvalueKind::Coerce(operand)
+        };
+        Rvalue { ty: expected, kind }
+    }
+
+    fn coerce_operand(
+        &mut self,
+        operand: Operand,
+        expected: TypeId,
+        source: NodeId,
+        span: Span,
+    ) -> Option<Operand> {
+        if operand.ty == expected {
+            return Some(operand);
+        }
+        let local = self.allocate_local(None, expected, true, LocalKind::Temporary, span)?;
+        self.assign(
+            Place::local(local),
+            Rvalue {
+                ty: expected,
+                kind: RvalueKind::Coerce(operand),
+            },
+            source,
+            span,
+        );
+        Some(Operand {
+            ty: expected,
+            kind: OperandKind::Copy(Place::local(local)),
+        })
     }
 
     fn definition_is_global(&self, definition: crate::ids::DefId) -> bool {

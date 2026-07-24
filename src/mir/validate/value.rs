@@ -14,6 +14,16 @@ impl Validator<'_> {
                     );
                 }
             }
+            RvalueKind::Coerce(operand) => {
+                self.operand(function, operand, span);
+                if operand.ty == value.ty || !self.can_coerce(operand.ty, value.ty) {
+                    self.diagnostics.push(
+                        Diagnostic::error("MIR coercion has incompatible source and result types")
+                            .with_code("E5179")
+                            .at(span),
+                    );
+                }
+            }
             RvalueKind::Unary { operand, .. } => self.operand(function, operand, span),
             RvalueKind::Binary { left, right, .. } => {
                 self.operand(function, left, span);
@@ -90,6 +100,13 @@ impl Validator<'_> {
             );
             return;
         };
+        if shape.origin != FunctionOrigin::Closure {
+            self.diagnostics.push(
+                Diagnostic::error("MIR closure does not reference an anonymous function")
+                    .with_code("E5182")
+                    .at(span),
+            );
+        }
         if captures.len() != shape.captures.len() {
             self.diagnostics.push(
                 Diagnostic::error("MIR closure capture count does not match its nested function")
@@ -304,11 +321,9 @@ impl Validator<'_> {
                 }
             }
             Aggregate::Array(elements) => {
-                let expected_element = match self.valid_type_kind(result).cloned() {
-                    Some(TypeKind::Array {
-                        element,
-                        dimensions,
-                    }) => {
+                let result_kind = self.valid_type_kind(result).cloned();
+                match &result_kind {
+                    Some(TypeKind::Array { dimensions, .. }) => {
                         if dimensions
                             .first()
                             .is_some_and(|length| *length != elements.len() as u64)
@@ -321,9 +336,8 @@ impl Validator<'_> {
                                 .at(span),
                             );
                         }
-                        Some(element)
                     }
-                    Some(TypeKind::Slice(element)) => Some(element),
+                    Some(TypeKind::Slice(_)) => {}
                     _ => {
                         self.diagnostics.push(
                             Diagnostic::error(
@@ -332,12 +346,19 @@ impl Validator<'_> {
                             .with_code("E5128")
                             .at(span),
                         );
-                        None
                     }
-                };
+                }
                 for element in elements {
                     self.operand(function, element, span);
-                    if expected_element.is_some_and(|expected| expected != element.ty) {
+                    let matches = match &result_kind {
+                        Some(TypeKind::Array {
+                            element: expected,
+                            dimensions,
+                        }) => self.array_element_matches(*expected, dimensions, element.ty),
+                        Some(TypeKind::Slice(expected)) => *expected == element.ty,
+                        _ => true,
+                    };
+                    if !matches {
                         self.diagnostics.push(
                             Diagnostic::error("MIR array element does not match its element type")
                                 .with_code("E5129")

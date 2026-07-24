@@ -17,7 +17,7 @@ fn captures_only_outer_locals_referenced_by_a_lambda() {
     let closure = module
         .functions
         .iter()
-        .find(|function| function.definition.is_none())
+        .find(|function| function.origin == FunctionOrigin::Closure)
         .expect("lambda should become a nested MIR function");
 
     assert_eq!(closure.captures.len(), 1);
@@ -51,7 +51,7 @@ fn captured_mutation_targets_a_capture_local() {
     let closure = module
         .functions
         .iter()
-        .find(|function| function.definition.is_none())
+        .find(|function| function.origin == FunctionOrigin::Closure)
         .expect("counter should contain a nested closure");
     let capture = closure.captures[0];
 
@@ -91,7 +91,7 @@ fn recursive_lambda_captures_its_own_binding() {
     let closure = module
         .functions
         .iter()
-        .find(|function| function.definition.is_none())
+        .find(|function| function.origin == FunctionOrigin::Closure)
         .expect("factorial should become a nested MIR function");
 
     assert_eq!(closure.captures.len(), 1);

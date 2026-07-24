@@ -5,6 +5,7 @@ use crate::ids::MirBlockId;
 
 pub(super) fn lower_source(source: &str) -> (Module, model::SemanticModel) {
     let syntax = crate::syntax::parser::parse_test_module(source);
+    let syntax = crate::syntax::normalize::normalize(syntax).unwrap();
     let resolutions = resolver::resolve(&syntax).unwrap();
     let mut semantics = model::analyze_declarations(&syntax, resolutions).unwrap();
     let hir = hir::lower::lower(&syntax, &mut semantics).unwrap();
@@ -23,7 +24,7 @@ pub(super) fn function_named<'a>(
         .functions
         .iter()
         .find(|function| {
-            function.definition.is_some_and(|definition| {
+            function.definition().is_some_and(|definition| {
                 semantics.resolutions.definitions[definition.index()].name == name
             })
         })
@@ -32,5 +33,7 @@ pub(super) fn function_named<'a>(
 
 mod basic;
 mod closures;
+mod coercions;
 mod control_flow;
+mod declarations;
 mod places;
