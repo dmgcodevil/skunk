@@ -8,7 +8,7 @@
 pub mod lower;
 pub mod validate;
 
-use crate::ids::{DefId, LocalId, MirBlockId, MirLocalId, NodeId, TypeId};
+use crate::ids::{DefId, FieldId, LocalId, MirBlockId, MirLocalId, NodeId, TypeId, VariantId};
 use crate::source_map::Span;
 use crate::syntax::ast::{BinaryOperator, Literal, UnaryOperator};
 
@@ -67,10 +67,36 @@ pub enum StatementKind {
     },
     Call {
         destination: Option<Place>,
-        callee: Operand,
+        target: CallTarget,
         argument_groups: Vec<Vec<Operand>>,
         result: TypeId,
     },
+}
+
+/// A resolved call site. Dispatch remains explicit so code generation never
+/// has to repeat method lookup or distinguish enum constructors by name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallTarget {
+    Operand(Operand),
+    Method {
+        receiver: Operand,
+        method: MethodCallee,
+    },
+    Static(StaticCallee),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MethodCallee {
+    Definition(DefId),
+    Dynamic { owner: TypeId, method: DefId },
+    Intrinsic { owner: TypeId, name: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaticCallee {
+    Definition(DefId),
+    Variant(VariantId),
+    Intrinsic { owner: TypeId, name: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,9 +120,41 @@ pub enum TerminatorKind {
     Unreachable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Place {
-    pub local: MirLocalId,
+    /// The storage location from which projections start.
+    pub base: PlaceBase,
+    /// Ordered operations that select the final addressable value.
+    pub projections: Vec<Projection>,
+}
+
+impl Place {
+    pub fn local(local: MirLocalId) -> Self {
+        Self {
+            base: PlaceBase::Local(local),
+            projections: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlaceBase {
+    Local(MirLocalId),
+    Definition(DefId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Projection {
+    /// The type of the place immediately after this projection is applied.
+    pub ty: TypeId,
+    pub kind: ProjectionKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProjectionKind {
+    Dereference,
+    Field(FieldId),
+    Index(Vec<Operand>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -136,6 +194,26 @@ pub enum RvalueKind {
         operator: BinaryOperator,
         right: Operand,
     },
+    Reference {
+        mutable: bool,
+        place: Place,
+    },
+    Length(Operand),
+    Slice {
+        receiver: Operand,
+        start: Option<Operand>,
+        end: Option<Operand>,
+    },
+    Aggregate(Aggregate),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Aggregate {
+    Struct {
+        definition: DefId,
+        fields: Vec<(FieldId, Operand)>,
+    },
+    Array(Vec<Operand>),
 }
 
 #[cfg(test)]
