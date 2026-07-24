@@ -15,7 +15,9 @@ pub struct SemanticModel {
     pub syntax_types: HashMap<NodeId, TypeId>,
     pub local_types: HashMap<LocalId, TypeId>,
     pub field_types: HashMap<FieldId, TypeId>,
+    pub field_owners: HashMap<FieldId, DefId>,
     pub variant_payloads: HashMap<VariantId, Vec<TypeId>>,
+    pub variant_owners: HashMap<VariantId, DefId>,
 }
 
 pub fn analyze_declarations(
@@ -30,7 +32,9 @@ pub fn analyze_declarations(
         syntax_types: HashMap::new(),
         local_types: HashMap::new(),
         field_types: HashMap::new(),
+        field_owners: HashMap::new(),
         variant_payloads: HashMap::new(),
+        variant_owners: HashMap::new(),
         aliases: HashMap::new(),
         diagnostics: Vec::new(),
     };
@@ -46,7 +50,9 @@ pub fn analyze_declarations(
             syntax_types: analyzer.syntax_types,
             local_types: analyzer.local_types,
             field_types: analyzer.field_types,
+            field_owners: analyzer.field_owners,
             variant_payloads: analyzer.variant_payloads,
+            variant_owners: analyzer.variant_owners,
         })
     } else {
         Err(analyzer.diagnostics)
@@ -61,7 +67,9 @@ struct Analyzer<'a> {
     syntax_types: HashMap<NodeId, TypeId>,
     local_types: HashMap<LocalId, TypeId>,
     field_types: HashMap<FieldId, TypeId>,
+    field_owners: HashMap<FieldId, DefId>,
     variant_payloads: HashMap<VariantId, Vec<TypeId>>,
+    variant_owners: HashMap<VariantId, DefId>,
     aliases: HashMap<DefId, &'a TypeSyntax>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -160,18 +168,18 @@ impl Analyzer<'_> {
                 }
             }
             TopLevelKind::Struct(declaration) => {
-                let owner = self
-                    .resolutions
-                    .item_definitions
-                    .get(&entry.id)
-                    .and_then(|definition| self.definition_types.get(definition))
-                    .copied();
+                let owner_definition = self.resolutions.item_definitions.get(&entry.id).copied();
+                let owner = owner_definition
+                    .and_then(|definition| self.definition_types.get(&definition).copied());
                 for field in &declaration.fields {
                     let ty = self.lower_type(&field.ty, owner);
                     if let Some(field_id) =
                         self.resolutions.field_definitions.get(&field.id).copied()
                     {
                         self.field_types.insert(field_id, ty);
+                        if let Some(owner) = owner_definition {
+                            self.field_owners.insert(field_id, owner);
+                        }
                     }
                 }
                 for method in &declaration.methods {
@@ -179,12 +187,9 @@ impl Analyzer<'_> {
                 }
             }
             TopLevelKind::Enum(declaration) => {
-                let owner = self
-                    .resolutions
-                    .item_definitions
-                    .get(&entry.id)
-                    .and_then(|definition| self.definition_types.get(definition))
-                    .copied();
+                let owner_definition = self.resolutions.item_definitions.get(&entry.id).copied();
+                let owner = owner_definition
+                    .and_then(|definition| self.definition_types.get(&definition).copied());
                 for variant in &declaration.variants {
                     let payload = variant
                         .payload
@@ -198,6 +203,9 @@ impl Analyzer<'_> {
                         .copied()
                     {
                         self.variant_payloads.insert(variant_id, payload);
+                        if let Some(owner) = owner_definition {
+                            self.variant_owners.insert(variant_id, owner);
+                        }
                     }
                 }
                 for method in &declaration.methods {

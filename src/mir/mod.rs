@@ -22,6 +22,8 @@ pub struct Function {
     pub source: NodeId,
     pub span: Span,
     pub definition: Option<DefId>,
+    /// Locals supplied by a closure environment, in environment field order.
+    pub captures: Vec<MirLocalId>,
     pub parameters: Vec<MirLocalId>,
     pub result: TypeId,
     pub locals: Vec<Local>,
@@ -31,6 +33,7 @@ pub struct Function {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalKind {
+    Capture,
     Parameter,
     User,
     Temporary,
@@ -71,6 +74,8 @@ pub enum StatementKind {
         argument_groups: Vec<Vec<Operand>>,
         result: TypeId,
     },
+    Print(Operand),
+    Input,
 }
 
 /// A resolved call site. Dispatch remains explicit so code generation never
@@ -116,6 +121,11 @@ pub enum TerminatorKind {
         then_target: MirBlockId,
         else_target: MirBlockId,
     },
+    SwitchEnum {
+        discriminator: Operand,
+        targets: Vec<(VariantId, MirBlockId)>,
+        otherwise: MirBlockId,
+    },
     Return(Option<Operand>),
     Unreachable,
 }
@@ -155,6 +165,7 @@ pub enum ProjectionKind {
     Dereference,
     Field(FieldId),
     Index(Vec<Operand>),
+    VariantField { variant: VariantId, index: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -205,6 +216,10 @@ pub enum RvalueKind {
         end: Option<Operand>,
     },
     Aggregate(Aggregate),
+    Closure {
+        function: NodeId,
+        captures: Vec<Place>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
