@@ -44,6 +44,32 @@ fn compile_and_run(source: &str) -> Result<String, String> {
 }
 
 #[test]
+fn lowers_global_storage_and_initializers_from_mir_and_runs() {
+    let source = r#"
+        seed: int = 40;
+        counter: int = seed + 1;
+
+        function bump(): void {
+            counter = counter + 1;
+        }
+
+        function main(): void {
+            print(counter);
+            bump();
+            print(counter);
+        }
+    "#;
+
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert!(ir.contains("@skunk_global_seed = internal global i32 zeroinitializer"));
+    assert!(ir.contains("define i32 @skunk_init_skunk_global_counter()"));
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 4);
+
+    assert_eq!(compile_and_run(source).unwrap(), "41\n42\n");
+}
+
+#[test]
 fn nested_block_return_is_recognized_and_runs() {
     let output = compile_and_run(
         r#"
@@ -200,6 +226,68 @@ fn compiles_basic_program_to_ir() {
     assert!(ir.contains("define i32 @skunk_add(i32 %arg0, i32 %arg1)"));
     assert!(ir.contains("define void @skunk_main()"));
     assert!(ir.contains("call i32 (ptr, ...) @printf"));
+}
+
+#[test]
+fn lowers_scalar_control_flow_directly_from_mir_and_runs() {
+    let source = r#"
+        function magnitude(value: int): long {
+            if (value < 0) {
+                return -value;
+            }
+            return value;
+        }
+
+        function main(): void {
+            total: int = 0;
+            for (i: int = 0; i < 6; i = i + 1) {
+                if (i % 2 == 0) {
+                    total = total + i;
+                }
+            }
+            print(total);
+            print(magnitude(-3));
+        }
+    "#;
+
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 2);
+    assert!(ir.contains("br label %mir_bb"));
+
+    let stdout = compile_and_run(source).unwrap();
+    assert_eq!(stdout, "6\n3\n");
+}
+
+#[test]
+fn lowers_structs_and_arrays_directly_from_mir_and_runs() {
+    let source = r#"
+        struct Point {
+            x: int;
+            y: int;
+        }
+
+        function sum(point: Point): int {
+            return point.x + point.y;
+        }
+
+        function main(): void {
+            point: Point = Point { x: 20, y: 22 };
+            values: [2]int = [point.x, point.y];
+            values[0] = values[0] + values.len;
+            print(sum(point));
+            print(values[0]);
+        }
+    "#;
+
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 2);
+    assert!(ir.contains("insertvalue %struct.Point"));
+    assert!(ir.contains("getelementptr inbounds [2 x i32]"));
+
+    let stdout = compile_and_run(source).unwrap();
+    assert_eq!(stdout, "42\n22\n");
 }
 
 #[test]
@@ -853,8 +941,7 @@ fn runs_compiled_lambda_program() {
 
 #[test]
 fn runs_compiled_closure_program() {
-    let stdout = compile_and_run(
-        r#"
+    let source = r#"
         function counter(): () -> int {
             c: int = 0;
             return function(): int {
@@ -868,10 +955,14 @@ fn runs_compiled_closure_program() {
             print(count());
             print(count());
         }
-        "#,
-    )
-    .unwrap();
+    "#;
 
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert!(ir.contains("define i32 @skunk_mir_lambda_"));
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 3);
+
+    let stdout = compile_and_run(source).unwrap();
     assert_eq!(stdout, "1\n2\n");
 }
 
@@ -1453,6 +1544,7 @@ fn compiles_generic_enum_to_ir() {
     let ir = compile_to_llvm_ir(&program).unwrap();
     assert!(ir.contains("%enum.Option__int = type { i32, i32 }"));
     assert!(ir.contains("switch i32"));
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 1);
 }
 
 #[test]
@@ -1761,8 +1853,7 @@ fn runs_compiled_shape_bound_program() {
 
 #[test]
 fn runs_compiled_trait_object_dynamic_dispatch_program() {
-    let stdout = compile_and_run(
-        r#"
+    let source = r#"
         trait Writer {
             function write(mut self, value: int): int;
         }
@@ -1783,10 +1874,13 @@ fn runs_compiled_trait_object_dynamic_dispatch_program() {
             print(writer.write(4));
             print(writer.write(7));
         }
-        "#,
-    )
-    .unwrap();
+    "#;
 
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 2);
+
+    let stdout = compile_and_run(source).unwrap();
     assert_eq!(stdout, "5\n12\n");
 }
 
@@ -2092,8 +2186,7 @@ fn rejects_trait_object_assignment_for_non_impl_type() {
 
 #[test]
 fn runs_compiled_unsafe_address_of_and_dereference_program() {
-    let stdout = compile_and_run(
-        r#"
+    let source = r#"
         function main(): void {
             value: int = 41;
             unsafe {
@@ -2103,17 +2196,19 @@ fn runs_compiled_unsafe_address_of_and_dereference_program() {
             }
             print(value);
         }
-        "#,
-    )
-    .unwrap();
+    "#;
 
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 1);
+
+    let stdout = compile_and_run(source).unwrap();
     assert_eq!(stdout, "41\n42\n");
 }
 
 #[test]
 fn runs_compiled_size_of_and_align_of_program() {
-    let stdout = compile_and_run(
-        r#"
+    let source = r#"
         struct Pair {
             left: int;
             right: int;
@@ -2125,10 +2220,13 @@ fn runs_compiled_size_of_and_align_of_program() {
             print(Pair::size_of());
             print(Pair::align_of());
         }
-        "#,
-    )
-    .unwrap();
+    "#;
 
+    let program = crate::pipeline::check_source("compiler-test.skunk", source).unwrap();
+    let ir = compile_to_llvm_ir(&program).unwrap();
+    assert_eq!(ir.matches("; lowered directly from MIR").count(), 1);
+
+    let stdout = compile_and_run(source).unwrap();
     assert_eq!(stdout, "4\n4\n8\n4\n");
 }
 

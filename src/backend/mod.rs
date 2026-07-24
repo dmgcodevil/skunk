@@ -1,8 +1,8 @@
 //! LLVM backend and native build facade.
 //!
-//! This module defines the shared LLVM value/layout model, collects program
-//! layouts, and assembles whole-module IR. Function-body lowering is separated
-//! into core lowering, access/call lowering, and coercion/runtime operations.
+//! This module defines LLVM value/layout models and assembles whole-module IR
+//! from validated MIR. Instruction selection, representation coercions, and
+//! low-level emission live in focused child modules.
 
 use crate::analysis::model::SemanticModel;
 use crate::analysis::resolver::DefinitionKind;
@@ -10,18 +10,16 @@ use crate::analysis::types::TypeKind as SemanticTypeKind;
 use crate::ids::{DefId, TypeId};
 use crate::intrinsics::IntrinsicType;
 use crate::mir::{self, DeclarationKind};
-use crate::specialization::tree::{self as ast, Literal, Node, Operator, Type, UnaryOperator};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-mod access;
 mod coercion;
-mod from_hir;
-mod lowering;
+mod emitter;
+mod mir_codegen;
 
 #[cfg(test)]
 mod tests;
@@ -101,13 +99,6 @@ impl LlvmType {
     }
 }
 
-fn is_pointer_like_llvm_type(llvm_type: &LlvmType) -> bool {
-    matches!(
-        llvm_type,
-        LlvmType::Pointer { .. } | LlvmType::Reference { .. }
-    )
-}
-
 #[derive(Clone, Debug)]
 struct FunctionSignature {
     symbol_name: String,
@@ -122,15 +113,6 @@ type BackendLayouts = (
 );
 
 #[derive(Clone, Debug)]
-struct FunctionPlan {
-    signature_key: String,
-    symbol_name: String,
-    parameters: Vec<(String, Type)>,
-    body: Vec<Node>,
-    is_method: bool,
-}
-
-#[derive(Clone, Debug)]
 struct StructLayout {
     name: String,
     fields: Vec<(String, LlvmType)>,
@@ -138,10 +120,7 @@ struct StructLayout {
 
 #[derive(Clone, Debug)]
 struct EnumVariantLayout {
-    name: String,
-    tag: usize,
     payload_types: Vec<LlvmType>,
-    field_indices: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -157,23 +136,10 @@ struct TraitMethodLayout {
     parameters: Vec<LlvmType>,
 }
 
-#[derive(Clone)]
-struct DeferredExpression {
-    expression: Node,
-    locals: HashMap<String, LocalVar>,
-    unsafe_depth: usize,
-}
-
 #[derive(Clone, Debug)]
 struct TraitLayout {
     name: String,
     methods: Vec<TraitMethodLayout>,
-}
-
-#[derive(Clone, Debug)]
-struct ClosureEnv {
-    type_name: String,
-    captures: Vec<(String, LlvmType)>,
 }
 
 #[derive(Clone, Debug)]
@@ -218,126 +184,6 @@ fn escape_llvm_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Maps a checked Skunk type to the value representation used by the LLVM
-/// backend, consulting collected nominal and trait layouts when necessary.
-fn llvm_type(
-    sk_type: &Type,
-    structs: &HashMap<String, StructLayout>,
-    enums: &HashMap<String, EnumLayout>,
-    traits: &HashMap<String, TraitLayout>,
-) -> Result<LlvmType, String> {
-    match sk_type {
-        Type::Const { inner } | Type::BindingConst { inner } => {
-            llvm_type(inner, structs, enums, traits)
-        }
-        Type::Byte => Ok(LlvmType::I8),
-        Type::Short => Ok(LlvmType::I16),
-        Type::Int => Ok(LlvmType::I32),
-        Type::Long => Ok(LlvmType::I64),
-        Type::Float => Ok(LlvmType::F32),
-        Type::Double => Ok(LlvmType::F64),
-        Type::Boolean => Ok(LlvmType::I1),
-        Type::String => Ok(LlvmType::PtrI8),
-        Type::Char => Ok(LlvmType::Char16),
-        Type::Allocator => Ok(LlvmType::Allocator),
-        Type::Arena => Ok(LlvmType::Arena),
-        Type::Array {
-            elem_type,
-            dimensions,
-        } => {
-            let mut llvm_elem = llvm_type(elem_type, structs, enums, traits)?;
-            for dimension in dimensions.iter().rev() {
-                llvm_elem = LlvmType::Array {
-                    elem_type: Box::new(llvm_elem),
-                    len: array_len_from_dimension(dimension)?,
-                };
-            }
-            Ok(llvm_elem)
-        }
-        Type::Slice { elem_type } => Ok(LlvmType::Slice {
-            elem_type: Box::new(llvm_type(elem_type, structs, enums, traits)?),
-        }),
-        Type::Reference {
-            target_type,
-            mutable,
-        } => Ok(LlvmType::Reference {
-            target_type: Box::new(llvm_type(target_type, structs, enums, traits)?),
-            mutable: *mutable,
-        }),
-        Type::Pointer { target_type } => Ok(LlvmType::Pointer {
-            target_type: Box::new(llvm_type(target_type, structs, enums, traits)?),
-        }),
-        Type::Function {
-            parameters,
-            return_type,
-        } => Ok(LlvmType::Function {
-            parameters: parameters
-                .iter()
-                .map(|param| llvm_type(param, structs, enums, traits))
-                .collect::<Result<Vec<_>, _>>()?,
-            return_type: Box::new(llvm_type(return_type, structs, enums, traits)?),
-        }),
-        Type::Union(members) => Ok(LlvmType::Union(
-            members
-                .iter()
-                .map(|member| llvm_type(member, structs, enums, traits))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        Type::Intersection(members) => {
-            let names = members
-                .iter()
-                .map(|member| match member {
-                    Type::Custom(name) if traits.contains_key(name) => Ok(name.clone()),
-                    other => Err(format!(
-                        "LLVM backend requires trait intersection members, found `{}`",
-                        ast::type_to_string(other)
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(LlvmType::TraitIntersection(names))
-        }
-        Type::Custom(name) => {
-            if name == "Color" {
-                Ok(LlvmType::I32)
-            } else if name == "Window" {
-                Ok(LlvmType::Window)
-            } else if structs.contains_key(name) {
-                Ok(LlvmType::Struct(name.clone()))
-            } else if enums.contains_key(name) {
-                Ok(LlvmType::Enum(name.clone()))
-            } else if traits.contains_key(name) {
-                Ok(LlvmType::TraitObject(name.clone()))
-            } else {
-                Err(format!("unknown nominal type `{}` in LLVM backend", name))
-            }
-        }
-        Type::Void => Ok(LlvmType::Void),
-        other => Err(format!(
-            "LLVM backend does not support type `{}` yet",
-            ast::type_to_string(other)
-        )),
-    }
-}
-
-fn array_len_from_dimension(dimension: &Node) -> Result<usize, String> {
-    let value = match dimension {
-        Node::Literal(Literal::Integer(value)) => *value,
-        Node::Literal(Literal::Long(value)) => *value,
-        other => {
-            return Err(format!(
-                "LLVM backend requires array dimensions to be integer literals, found `{:?}`",
-                other
-            ))
-        }
-    };
-    usize::try_from(value).map_err(|_| {
-        format!(
-            "LLVM backend requires non-negative array dimensions, found `{}`",
-            value
-        )
-    })
-}
-
 /// Builds native layouts from validated MIR declarations.
 fn collect_typed_layouts(
     module: &mir::Module,
@@ -370,29 +216,15 @@ fn collect_typed_layouts(
                 ..
             } => {
                 let name = definition_name(model, *definition)?.to_string();
-                let mut next_field_index = 1usize;
                 let variants = variants
                     .iter()
-                    .enumerate()
-                    .map(|(tag, variant)| {
+                    .map(|variant| {
                         let payload_types = variant
                             .payload
                             .iter()
                             .map(|ty| llvm_type_id(*ty, model, &nominal_kinds))
                             .collect::<Result<Vec<_>, String>>()?;
-                        let field_indices = (0..payload_types.len())
-                            .map(|_| {
-                                let index = next_field_index;
-                                next_field_index += 1;
-                                index
-                            })
-                            .collect();
-                        Ok(EnumVariantLayout {
-                            name: variant.name.clone(),
-                            tag,
-                            payload_types,
-                            field_indices,
-                        })
+                        Ok(EnumVariantLayout { payload_types })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 enums.insert(name.clone(), EnumLayout { name, variants });
@@ -859,14 +691,9 @@ struct FunctionCompiler<'a> {
     extra_type_decls: &'a mut Vec<String>,
     extra_function_irs: &'a mut Vec<String>,
     lambda_counter: &'a mut usize,
-    closure_env: Option<ClosureEnv>,
-    scopes: Vec<HashMap<String, LocalVar>>,
-    deferred_scopes: Vec<Vec<DeferredExpression>>,
     lines: Vec<String>,
     temp_counter: usize,
     label_counter: usize,
-    terminated: bool,
-    unsafe_depth: usize,
 }
 
 fn align_up(value: usize, align: usize) -> usize {
@@ -879,6 +706,57 @@ fn align_up(value: usize, align: usize) -> usize {
         } else {
             value + (align - rem)
         }
+    }
+}
+
+fn llvm_type_align(
+    llvm_type: &LlvmType,
+    structs: &HashMap<String, StructLayout>,
+    enums: &HashMap<String, EnumLayout>,
+) -> usize {
+    match llvm_type {
+        LlvmType::I8 | LlvmType::I1 => 1,
+        LlvmType::I16 | LlvmType::Char16 => 2,
+        LlvmType::I32 | LlvmType::F32 => 4,
+        LlvmType::I64
+        | LlvmType::F64
+        | LlvmType::PtrI8
+        | LlvmType::Allocator
+        | LlvmType::Arena
+        | LlvmType::Window
+        | LlvmType::TraitObject(_)
+        | LlvmType::TraitIntersection(_)
+        | LlvmType::Union(_)
+        | LlvmType::Reference { .. }
+        | LlvmType::Pointer { .. }
+        | LlvmType::Function { .. }
+        | LlvmType::Slice { .. } => 8,
+        LlvmType::Struct(name) => structs
+            .get(name)
+            .map(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .map(|(_, field)| llvm_type_align(field, structs, enums))
+                    .max()
+                    .unwrap_or(1)
+            })
+            .unwrap_or(8),
+        LlvmType::Enum(name) => enums
+            .get(name)
+            .map(|layout| {
+                layout
+                    .variants
+                    .iter()
+                    .flat_map(|variant| &variant.payload_types)
+                    .map(|payload| llvm_type_align(payload, structs, enums))
+                    .max()
+                    .unwrap_or(4)
+                    .max(4)
+            })
+            .unwrap_or(8),
+        LlvmType::Array { elem_type, .. } => llvm_type_align(elem_type, structs, enums),
+        LlvmType::Void => 1,
     }
 }
 
@@ -1088,31 +966,12 @@ pub fn compile_to_executable_with_options(
 /// Lowers a checked Skunk program into textual LLVM IR without invoking the
 /// system linker.
 pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<String, String> {
-    crate::hir::validate::validate(&program.hir, &program.semantics).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| diagnostic.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    let semantic_model = &program.semantics;
     let mir = crate::pipeline::lower_to_mir(program)?;
     let (structs, enums, traits) = collect_typed_layouts(&mir, &program.semantics)?;
-    let typed_signatures = collect_typed_signatures(&mir, &program.semantics)?;
+    let signatures = collect_typed_signatures(&mir, &program.semantics)?;
     let typed_implementations = collect_typed_implementations(&mir, &program.semantics)?;
-    let lowered_program = from_hir::lower_program(&program.hir, &program.semantics)?;
-    let program = &lowered_program;
-    let statements = match program {
-        Node::Program { statements } => statements,
-        other => {
-            return Err(format!(
-                "expected a program root for LLVM compilation, found `{:?}`",
-                other
-            ))
-        }
-    };
-
-    let mut signatures = HashMap::<String, FunctionSignature>::new();
-    let mut functions = Vec::<FunctionPlan>::new();
+    let mir_codegen_context = mir_codegen::CodegenContext::new(&mir, semantic_model)?;
     let mut trait_vtables = HashMap::<String, String>::new();
     let mut trait_vtable_globals = Vec::<String>::new();
     let mut extern_declares = Vec::<String>::new();
@@ -1147,161 +1006,35 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
         "skunk_keyboard_is_down",
     ];
 
-    for statement in statements {
-        match statement {
-            Node::FunctionDeclaration {
-                name,
-                parameters,
-                return_type,
-                body,
-                ..
-            } => {
-                let params = parameters
-                    .iter()
-                    .map(|(_, ty)| llvm_type(ty, &structs, &enums, &traits))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let llvm_return_type = llvm_type(return_type, &structs, &enums, &traits)?;
-                signatures.insert(
-                    name.clone(),
-                    FunctionSignature {
-                        symbol_name: format!("skunk_{}", name),
-                        return_type: llvm_return_type,
-                        parameters: params,
-                    },
-                );
-                functions.push(FunctionPlan {
-                    signature_key: name.clone(),
-                    symbol_name: format!("skunk_{}", name),
-                    parameters: parameters.clone(),
-                    body: body.clone(),
-                    is_method: false,
-                });
-            }
-            Node::ExternFunctionDeclaration {
-                name,
-                parameters,
-                return_type,
-            } => {
-                if RESERVED_RUNTIME_SYMBOLS.contains(&name.as_str()) {
-                    return Err(format!(
-                        "extern function `{}` redeclares a reserved runtime symbol",
-                        name
-                    ));
-                }
-                if let Some(existing) = signatures.get(name) {
-                    // Identical redeclarations (e.g. the same binding imported
-                    // through two modules) are tolerated; conflicts are not.
-                    let params = parameters
-                        .iter()
-                        .map(|(_, ty)| llvm_type(ty, &structs, &enums, &traits))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let return_ty = llvm_type(return_type, &structs, &enums, &traits)?;
-                    if existing.parameters != params || existing.return_type != return_ty {
-                        return Err(format!(
-                            "conflicting extern declarations for `{}`",
-                            name
-                        ));
-                    }
-                    continue;
-                }
-                let params = parameters
-                    .iter()
-                    .map(|(_, ty)| llvm_type(ty, &structs, &enums, &traits))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let llvm_return_type = llvm_type(return_type, &structs, &enums, &traits)?;
-                extern_declares.push(format!(
-                    "declare {} @{}({})",
-                    llvm_return_type.ir(),
-                    name,
-                    params
-                        .iter()
-                        .map(|param| param.ir())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                signatures.insert(
-                    name.clone(),
-                    FunctionSignature {
-                        symbol_name: name.clone(),
-                        return_type: llvm_return_type,
-                        parameters: params,
-                    },
-                );
-            }
-            Node::End => {}
-            Node::TraitDeclaration { .. }
-            | Node::ShapeDeclaration { .. }
-            | Node::ImplDeclaration { .. } => {}
-            Node::StructDeclaration {
-                name,
-                functions: nominal_functions,
-                ..
-            }
-            | Node::EnumDeclaration {
-                name,
-                functions: nominal_functions,
-                ..
-            } => {
-                for function in nominal_functions {
-                    if let Node::FunctionDeclaration {
-                        name: method_name,
-                        parameters,
-                        return_type,
-                        body,
-                        ..
-                    } = function
-                    {
-                        let mut parameter_types = Vec::new();
-                        let has_receiver = parameters
-                            .first()
-                            .is_some_and(|(_, param_type)| ast::is_self_type(param_type));
-                        let mut compile_params = Vec::new();
-                        for (index, (param_name, param_type)) in parameters.iter().enumerate() {
-                            if has_receiver && index == 0 {
-                                continue;
-                            }
-                            parameter_types.push(llvm_type(param_type, &structs, &enums, &traits)?);
-                            compile_params.push((param_name.clone(), param_type.clone()));
-                        }
-                        let llvm_return_type = llvm_type(return_type, &structs, &enums, &traits)?;
-                        let key = format!("{}::{}", name, method_name);
-                        let symbol_name =
-                            format!("skunk_{}_{}", sanitize_name(name), sanitize_name(method_name));
-                        signatures.insert(
-                            key.clone(),
-                            FunctionSignature {
-                                symbol_name: symbol_name.clone(),
-                                return_type: llvm_return_type.clone(),
-                                parameters: parameter_types,
-                            },
-                        );
-                        functions.push(FunctionPlan {
-                            signature_key: key,
-                            symbol_name,
-                            parameters: if has_receiver {
-                                let mut method_params =
-                                    vec![("self".to_string(), Type::Custom(name.clone()))];
-                                method_params.extend(compile_params);
-                                method_params
-                            } else {
-                                compile_params
-                            },
-                            body: body.clone(),
-                            is_method: has_receiver,
-                        });
-                    }
-                }
-            }
-            other => {
-                return Err(format!(
-                    "LLVM backend currently expects top-level function, struct, and enum declarations only, found `{:?}`",
-                    other
-                ))
-            }
+    let mut emitted_externs = std::collections::HashSet::new();
+    for declaration in &mir.declarations {
+        let DeclarationKind::ExternFunction { definition, .. } = declaration.kind else {
+            continue;
+        };
+        let name = definition_name(semantic_model, definition)?;
+        if RESERVED_RUNTIME_SYMBOLS.contains(&name) {
+            return Err(format!(
+                "extern function `{name}` redeclares a reserved runtime symbol"
+            ));
         }
+        if !emitted_externs.insert(name) {
+            continue;
+        }
+        let signature = signatures
+            .get(name)
+            .ok_or_else(|| format!("missing typed signature for extern function `{name}`"))?;
+        extern_declares.push(format!(
+            "declare {} @{}({})",
+            signature.return_type.ir(),
+            signature.symbol_name,
+            signature
+                .parameters
+                .iter()
+                .map(LlvmType::ir)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
-
-    signatures = typed_signatures;
 
     if !signatures.contains_key("main") {
         return Err("LLVM backend currently requires `function main(): ... {}`".to_string());
@@ -1322,29 +1055,83 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
     let mut extra_type_decls = Vec::<String>::new();
     let mut function_irs = Vec::<String>::new();
     let mut extra_function_irs = Vec::<String>::new();
+    let program_global_decls = mir
+        .declarations
+        .iter()
+        .filter_map(|declaration| match declaration.kind {
+            DeclarationKind::Global { definition, .. } => {
+                mir_codegen_context.globals.get(&definition)
+            }
+            _ => None,
+        })
+        .map(|global| {
+            format!(
+                "@{} = internal global {} zeroinitializer, align {}",
+                global.symbol_name,
+                global.llvm_type.ir(),
+                llvm_type_align(&global.llvm_type, &structs, &enums)
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut global_initializers = Vec::<(String, mir_codegen::GlobalCodegenInfo)>::new();
     let mut lambda_counter = 0usize;
 
-    for function in &functions {
-        let signature = signatures.get(&function.signature_key).ok_or_else(|| {
-            format!(
-                "missing typed signature for function `{}`",
-                function.signature_key
-            )
-        })?;
-        let llvm_return_type = signature.return_type.clone();
-        let param_defs = if function.is_method {
-            let mut defs = vec![format!("ptr %arg0")];
-            for (index, ty) in signature.parameters.iter().enumerate() {
-                defs.push(format!("{} %arg{}", ty.ir(), index + 1));
-            }
-            defs
-        } else {
-            signature
-                .parameters
-                .iter()
-                .enumerate()
-                .map(|(index, ty)| format!("{} %arg{}", ty.ir(), index))
-                .collect()
+    for function in &mir.functions {
+        let (symbol_name, llvm_return_type, param_defs, initialized_global) =
+            match function.origin {
+                mir::FunctionOrigin::Definition { .. } => {
+                    let signature_key = mir_codegen_context
+                        .function_key(function)?
+                        .ok_or_else(|| "defined MIR function has no signature key".to_string())?;
+                    let signature = signatures.get(&signature_key).ok_or_else(|| {
+                        format!("missing typed signature for function `{signature_key}`")
+                    })?;
+                    let has_receiver = mir_function_has_receiver(function, semantic_model);
+                    let param_defs =
+                        if has_receiver {
+                            std::iter::once("ptr %arg0".to_string())
+                                .chain(
+                                    signature.parameters.iter().enumerate().map(|(index, ty)| {
+                                        format!("{} %arg{}", ty.ir(), index + 1)
+                                    }),
+                                )
+                                .collect()
+                        } else {
+                            signature
+                                .parameters
+                                .iter()
+                                .enumerate()
+                                .map(|(index, ty)| format!("{} %arg{}", ty.ir(), index))
+                                .collect()
+                        };
+                    (
+                        signature.symbol_name.clone(),
+                        signature.return_type.clone(),
+                        param_defs,
+                        None,
+                    )
+                }
+                mir::FunctionOrigin::GlobalInitializer { global } => {
+                    let global_info = mir_codegen_context
+                        .globals
+                        .get(&global)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!("missing codegen layout for global {}", global.index())
+                        })?;
+                    (
+                        format!("skunk_init_{}", global_info.symbol_name),
+                        global_info.llvm_type.clone(),
+                        Vec::new(),
+                        Some(global_info),
+                    )
+                }
+                mir::FunctionOrigin::Closure => continue,
+            };
+        if initialized_global.is_some() && llvm_return_type == LlvmType::Void {
+            return Err(format!(
+                "LLVM global/function `{symbol_name}` cannot use void as a stored result"
+            ));
         };
         let dependencies = FunctionCompilerDependencies {
             signatures: &signatures,
@@ -1357,19 +1144,14 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
             extra_function_irs: &mut extra_function_irs,
             lambda_counter: &mut lambda_counter,
         };
-        let compiler = FunctionCompiler::new(
-            &function.symbol_name,
-            llvm_return_type.clone(),
-            dependencies,
-            None,
-        );
-        let body_lines = compiler.compile(&function.parameters, &function.body)?;
+        let compiler = FunctionCompiler::new(&symbol_name, llvm_return_type.clone(), dependencies);
+        let body_lines = compiler.compile_mir(function, &mir_codegen_context)?;
         let mut function_ir = String::new();
         let _ = writeln!(
             function_ir,
             "define {} @{}({}) {{",
             llvm_return_type.ir(),
-            function.symbol_name,
+            symbol_name,
             param_defs.join(", ")
         );
         let _ = writeln!(function_ir, "entry:");
@@ -1378,6 +1160,9 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
         }
         let _ = writeln!(function_ir, "}}");
         function_irs.push(function_ir);
+        if let Some(global) = initialized_global {
+            global_initializers.push((symbol_name, global));
+        }
     }
 
     let main_signature = signatures
@@ -1387,7 +1172,7 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
         return Err("LLVM backend requires `main` to take no parameters".to_string());
     }
 
-    let c_main_body = match main_signature.return_type {
+    let skunk_main_body = match main_signature.return_type {
         LlvmType::I8 => {
             "  %result = call i8 @skunk_main()\n  %exit_code = sext i8 %result to i32\n  ret i32 %exit_code\n"
         }
@@ -1435,6 +1220,23 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
             )
         }
     };
+    let mut c_main_body = String::new();
+    for (index, (initializer, global)) in global_initializers.iter().enumerate() {
+        let value = format!("%global_init_{index}");
+        let _ = writeln!(
+            c_main_body,
+            "  {value} = call {} @{}()",
+            global.llvm_type.ir(),
+            initializer
+        );
+        let _ = writeln!(
+            c_main_body,
+            "  store {} {value}, ptr @{}",
+            global.llvm_type.ir(),
+            global.symbol_name
+        );
+    }
+    c_main_body.push_str(skunk_main_body);
 
     let mut ir = String::new();
     let _ = writeln!(ir, "declare i32 @printf(ptr, ...)");
@@ -1536,6 +1338,12 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
         let _ = writeln!(ir, "{}", global);
     }
     if !trait_vtable_globals.is_empty() {
+        let _ = writeln!(ir);
+    }
+    for global in &program_global_decls {
+        let _ = writeln!(ir, "{}", global);
+    }
+    if !program_global_decls.is_empty() {
         let _ = writeln!(ir);
     }
     for decl in &extra_type_decls {

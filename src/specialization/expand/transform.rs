@@ -9,6 +9,15 @@ struct ExpressionTransformContext<'a> {
 }
 
 impl Monomorphizer {
+    pub(super) fn global_env(&mut self) -> Result<Env, String> {
+        let globals = self.globals.clone();
+        let mut env = Env::new();
+        for (name, ty) in globals {
+            env.insert(name, self.expand_type(&ty)?);
+        }
+        Ok(env)
+    }
+
     /// Transforms one function template into a concrete declaration, seeding
     /// its local type environment with substituted parameters and receiver.
     pub(super) fn transform_named_function(
@@ -20,7 +29,7 @@ impl Monomorphizer {
         substitutions: &HashMap<String, Type>,
         self_type: Option<Type>,
     ) -> Result<Node, String> {
-        let mut env = Env::new();
+        let mut env = self.global_env()?;
         let mut output_parameters = Vec::new();
         for (param_name, param_type) in parameters {
             let internal_type = if ast::is_self_type(param_type) {

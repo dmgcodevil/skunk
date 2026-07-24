@@ -12,7 +12,8 @@ use std::path::Path;
 
 /// A program that passed every front-end phase and is ready for lowering.
 ///
-/// Typed HIR and semantic tables are the complete code-generation input.
+/// HIR and semantic tables are retained so callers can inspect the checked
+/// program; native code generation first lowers them to validated MIR.
 #[derive(Debug)]
 pub struct CheckedProgram {
     pub hir: crate::hir::Module,
@@ -38,8 +39,8 @@ pub fn check_loaded(program: syntax::loader::LoadedProgram) -> Result<CheckedPro
 }
 
 /// Lowers a checked program into typed MIR and verifies its backend-facing
-/// invariants. Native compilation consumes MIR declarations and signatures;
-/// function instruction selection is the remaining HIR-to-MIR migration seam.
+/// invariants. Native compilation consumes only this validated MIR plus the
+/// semantic type and definition tables retained by `CheckedProgram`.
 pub fn lower_to_mir(program: &CheckedProgram) -> Result<crate::mir::Module, String> {
     let mir = crate::mir::lower::lower(&program.hir, &program.semantics)
         .map_err(|diagnostics| render_diagnostics(diagnostics, program.sources.as_ref()))?;

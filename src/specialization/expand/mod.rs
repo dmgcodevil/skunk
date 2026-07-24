@@ -220,6 +220,8 @@ struct Monomorphizer {
     /// Non-generic source trait declarations that can be copied directly to the
     /// beginning of the prepared program.
     root_traits: Vec<Node>,
+    /// Top-level values visible from functions and other global initializers.
+    globals: HashMap<String, Type>,
     /// Source impl declarations with no impl parameters and only plain named
     /// trait references, so they can be copied directly to prepared output.
     root_concrete_impls: Vec<Node>,
@@ -274,6 +276,7 @@ impl Monomorphizer {
         let mut type_aliases = HashMap::new();
         let mut impls = Vec::new();
         let mut root_traits = Vec::new();
+        let mut globals = HashMap::new();
         let mut root_concrete_impls = Vec::new();
         let mut root_statements = Vec::new();
 
@@ -496,6 +499,10 @@ impl Monomorphizer {
                     );
                     root_statements.push(statement.clone());
                 }
+                Node::VariableDeclaration { name, var_type, .. } => {
+                    globals.insert(name.clone(), var_type.clone());
+                    root_statements.push(statement.clone());
+                }
                 // Test declarations only take part in `skunk test`, where they
                 // are rewritten into plain functions before this pass runs.
                 // In a normal build they are simply dropped.
@@ -532,6 +539,7 @@ impl Monomorphizer {
             impls,
             implemented_traits: HashMap::new(),
             root_traits,
+            globals,
             root_concrete_impls,
             generated_impl_keys: HashSet::new(),
             generated_impls: Vec::new(),
@@ -624,7 +632,7 @@ impl Monomorphizer {
                     output.push(extern_decl);
                 }
                 other => {
-                    let mut env = Env::new();
+                    let mut env = self.global_env()?;
                     let (statement, _) = self.transform_statement(
                         &other,
                         &mut env,
