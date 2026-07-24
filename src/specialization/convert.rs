@@ -1,24 +1,20 @@
-//! Temporary, behavior-preserving bridge to the original all-purpose AST.
-//!
-//! The bridge lets the new phase-specific syntax model sit on the executable
-//! path before every downstream phase has migrated. It is intentionally kept
-//! in one module so no new compiler code starts depending on legacy `Node`.
+//! Conversion between source syntax and the internal generic-expansion tree.
 
-use super::ast as syntax;
-use crate::ast as legacy;
 use crate::diagnostic::Diagnostic;
 use crate::ids::{FileId, NodeId, NodeIdAllocator};
 use crate::source_map::Span;
+use crate::specialization::tree;
+use crate::syntax::ast as syntax;
 
-type LegacyGenericParts = (
+type TreeGenericParts = (
     Vec<String>,
     HashMap<String, Vec<String>>,
-    HashMap<String, legacy::SubtypeBounds>,
+    HashMap<String, tree::SubtypeBounds>,
 );
 use std::collections::HashMap;
 
-pub fn from_legacy(
-    program: &legacy::Node,
+pub(crate) fn from_tree(
+    program: &tree::Node,
     file: FileId,
     source_len: usize,
 ) -> Result<syntax::Module, Diagnostic> {
@@ -26,31 +22,31 @@ pub fn from_legacy(
         Diagnostic::error("source file is too large to represent with compiler spans")
             .with_code("E0001")
     })?;
-    LegacyToSyntax {
-        ids: NodeIdAllocator::default(),
+    TreeToSyntax {
+        ids: NodeIdAllocator::for_file(file),
         span,
     }
     .module(program)
 }
 
-pub fn to_legacy(module: &syntax::Module) -> legacy::Node {
-    SyntaxToLegacy.module(module)
+pub(crate) fn to_tree(module: &syntax::Module) -> tree::Node {
+    SyntaxToTree.module(module)
 }
 
-struct LegacyToSyntax {
+struct TreeToSyntax {
     ids: NodeIdAllocator,
     span: Span,
 }
 
-impl LegacyToSyntax {
+impl TreeToSyntax {
     fn id(&mut self) -> NodeId {
         self.ids.allocate()
     }
 
-    fn module(&mut self, node: &legacy::Node) -> Result<syntax::Module, Diagnostic> {
-        let legacy::Node::Program { statements } = node else {
+    fn module(&mut self, node: &tree::Node) -> Result<syntax::Module, Diagnostic> {
+        let tree::Node::Program { statements } = node else {
             return Err(
-                Diagnostic::error("compiler compatibility input must have a program root")
+                Diagnostic::error("specialization input must have a program root")
                     .with_code("E9001"),
             );
         };
@@ -59,11 +55,11 @@ impl LegacyToSyntax {
         let mut entries = Vec::new();
         for statement in statements {
             match statement {
-                legacy::Node::Module { name: module_name } => {
+                tree::Node::Module { name: module_name } => {
                     name = Some(syntax::Path::from_qualified(module_name));
                 }
-                legacy::Node::EOI => {}
-                legacy::Node::Export { declaration } => {
+                tree::Node::End => {}
+                tree::Node::Export { declaration } => {
                     entries.push(self.top_level(declaration, syntax::Visibility::Public)?);
                 }
                 other => {
@@ -83,14 +79,14 @@ impl LegacyToSyntax {
 
     fn top_level(
         &mut self,
-        node: &legacy::Node,
+        node: &tree::Node,
         visibility: syntax::Visibility,
     ) -> Result<syntax::TopLevel, Diagnostic> {
         let kind = match node {
-            legacy::Node::Import { name } => syntax::TopLevelKind::Import(syntax::ImportDecl {
+            tree::Node::Import { name } => syntax::TopLevelKind::Import(syntax::ImportDecl {
                 module: syntax::Path::from_qualified(name),
             }),
-            legacy::Node::TypeAliasDeclaration {
+            tree::Node::TypeAliasDeclaration {
                 name,
                 generic_params,
                 generic_bounds,
@@ -105,7 +101,7 @@ impl LegacyToSyntax {
                 ),
                 target: self.ty(target_type),
             }),
-            legacy::Node::StructDeclaration {
+            tree::Node::StructDeclaration {
                 name,
                 fields,
                 functions,
@@ -117,7 +113,7 @@ impl LegacyToSyntax {
                 fields,
                 functions,
             )?),
-            legacy::Node::GenericStructDeclaration {
+            tree::Node::GenericStructDeclaration {
                 name,
                 generic_params,
                 generic_bounds,
@@ -132,7 +128,7 @@ impl LegacyToSyntax {
                 fields,
                 functions,
             )?),
-            legacy::Node::EnumDeclaration {
+            tree::Node::EnumDeclaration {
                 name,
                 variants,
                 functions,
@@ -144,7 +140,7 @@ impl LegacyToSyntax {
                 variants,
                 functions,
             )?),
-            legacy::Node::GenericEnumDeclaration {
+            tree::Node::GenericEnumDeclaration {
                 name,
                 generic_params,
                 generic_bounds,
@@ -159,7 +155,7 @@ impl LegacyToSyntax {
                 variants,
                 functions,
             )?),
-            legacy::Node::TraitDeclaration {
+            tree::Node::TraitDeclaration {
                 name,
                 generic_params,
                 generic_bounds,
@@ -185,7 +181,7 @@ impl LegacyToSyntax {
                     methods,
                 })
             }
-            legacy::Node::ShapeDeclaration { name, methods } => {
+            tree::Node::ShapeDeclaration { name, methods } => {
                 let methods = methods
                     .iter()
                     .map(|method| self.trait_method(method))
@@ -195,7 +191,7 @@ impl LegacyToSyntax {
                     methods,
                 })
             }
-            legacy::Node::AttachDeclaration {
+            tree::Node::AttachDeclaration {
                 generic_params,
                 generic_bounds,
                 subtype_bounds,
@@ -216,7 +212,7 @@ impl LegacyToSyntax {
                     methods,
                 })
             }
-            legacy::Node::ConformDeclaration {
+            tree::Node::ConformDeclaration {
                 generic_params,
                 generic_bounds,
                 subtype_bounds,
@@ -239,7 +235,7 @@ impl LegacyToSyntax {
                     methods,
                 })
             }
-            legacy::Node::ImplDeclaration {
+            tree::Node::ImplDeclaration {
                 generic_params,
                 generic_bounds,
                 subtype_bounds,
@@ -254,11 +250,11 @@ impl LegacyToSyntax {
                 traits: trait_types.iter().map(|ty| self.ty(ty)).collect(),
                 target: self.ty(target_type),
             }),
-            legacy::Node::FunctionDeclaration { lambda: false, .. }
-            | legacy::Node::GenericFunctionDeclaration { lambda: false, .. } => {
+            tree::Node::FunctionDeclaration { lambda: false, .. }
+            | tree::Node::GenericFunctionDeclaration { lambda: false, .. } => {
                 syntax::TopLevelKind::Function(self.function(node)?)
             }
-            legacy::Node::ExternFunctionDeclaration {
+            tree::Node::ExternFunctionDeclaration {
                 name,
                 parameters,
                 return_type,
@@ -268,21 +264,21 @@ impl LegacyToSyntax {
                 parameters: self.parameters(parameters),
                 return_type: self.ty(return_type),
             }),
-            legacy::Node::TestDeclaration { name, body } => {
+            tree::Node::TestDeclaration { name, body } => {
                 syntax::TopLevelKind::Test(syntax::TestDecl {
                     name: name.clone(),
                     body: self.block(body)?,
                 })
             }
-            legacy::Node::VariableDeclaration {
+            tree::Node::VariableDeclaration {
                 var_type,
                 name,
                 value,
                 ..
             } => syntax::TopLevelKind::Global(self.local_decl(name, var_type, value.as_deref())?),
-            legacy::Node::Module { .. } | legacy::Node::Export { .. } | legacy::Node::EOI => {
+            tree::Node::Module { .. } | tree::Node::Export { .. } | tree::Node::End => {
                 return Err(Diagnostic::error(format!(
-                    "invalid nested compiler compatibility node: {node:?}"
+                    "invalid nested specialization node: {node:?}"
                 ))
                 .with_code("E9002"));
             }
@@ -303,9 +299,9 @@ impl LegacyToSyntax {
         name: &str,
         generic_params: &[String],
         generic_bounds: &HashMap<String, Vec<String>>,
-        subtype_bounds: &HashMap<String, legacy::SubtypeBounds>,
-        fields: &[(String, legacy::Type)],
-        functions: &[legacy::Node],
+        subtype_bounds: &HashMap<String, tree::SubtypeBounds>,
+        fields: &[(String, tree::Type)],
+        functions: &[tree::Node],
     ) -> Result<syntax::StructDecl, Diagnostic> {
         let fields = fields
             .iter()
@@ -342,9 +338,9 @@ impl LegacyToSyntax {
         name: &str,
         generic_params: &[String],
         generic_bounds: &HashMap<String, Vec<String>>,
-        subtype_bounds: &HashMap<String, legacy::SubtypeBounds>,
-        variants: &[legacy::EnumVariant],
-        functions: &[legacy::Node],
+        subtype_bounds: &HashMap<String, tree::SubtypeBounds>,
+        variants: &[tree::EnumVariant],
+        functions: &[tree::Node],
     ) -> Result<syntax::EnumDecl, Diagnostic> {
         let variants = variants
             .iter()
@@ -376,7 +372,7 @@ impl LegacyToSyntax {
 
     fn trait_method(
         &mut self,
-        method: &legacy::TraitMethodSignature,
+        method: &tree::TraitMethodSignature,
     ) -> Result<syntax::TraitMethod, Diagnostic> {
         let default_body = method
             .default_body
@@ -394,9 +390,9 @@ impl LegacyToSyntax {
         })
     }
 
-    fn function(&mut self, node: &legacy::Node) -> Result<syntax::FunctionDecl, Diagnostic> {
+    fn function(&mut self, node: &tree::Node) -> Result<syntax::FunctionDecl, Diagnostic> {
         let (name, generic_parameters, parameters, return_type, body) = match node {
-            legacy::Node::FunctionDeclaration {
+            tree::Node::FunctionDeclaration {
                 name,
                 parameters,
                 return_type,
@@ -409,7 +405,7 @@ impl LegacyToSyntax {
                 self.ty(return_type),
                 self.block(body)?,
             ),
-            legacy::Node::GenericFunctionDeclaration {
+            tree::Node::GenericFunctionDeclaration {
                 name,
                 generic_params,
                 generic_bounds,
@@ -427,7 +423,7 @@ impl LegacyToSyntax {
             ),
             other => {
                 return Err(Diagnostic::error(format!(
-                    "expected a function in compiler compatibility bridge, found {other:?}"
+                    "expected a function in specialization conversion, found {other:?}"
                 ))
                 .with_code("E9003"));
             }
@@ -446,7 +442,7 @@ impl LegacyToSyntax {
         &mut self,
         names: &[String],
         capabilities: &HashMap<String, Vec<String>>,
-        subtype_bounds: &HashMap<String, legacy::SubtypeBounds>,
+        subtype_bounds: &HashMap<String, tree::SubtypeBounds>,
     ) -> Vec<syntax::GenericParameter> {
         names
             .iter()
@@ -474,16 +470,16 @@ impl LegacyToSyntax {
             .collect()
     }
 
-    fn parameters(&mut self, parameters: &[(String, legacy::Type)]) -> Vec<syntax::Parameter> {
+    fn parameters(&mut self, parameters: &[(String, tree::Type)]) -> Vec<syntax::Parameter> {
         parameters
             .iter()
             .map(|(name, ty)| {
                 let kind = match ty {
-                    legacy::Type::SkSelf => syntax::ParameterKind::Receiver {
+                    tree::Type::SkSelf => syntax::ParameterKind::Receiver {
                         mutable: false,
                         is_const: false,
                     },
-                    legacy::Type::MutSelf => syntax::ParameterKind::Receiver {
+                    tree::Type::MutSelf => syntax::ParameterKind::Receiver {
                         mutable: true,
                         is_const: false,
                     },
@@ -506,7 +502,7 @@ impl LegacyToSyntax {
             .collect()
     }
 
-    fn block(&mut self, statements: &[legacy::Node]) -> Result<syntax::Block, Diagnostic> {
+    fn block(&mut self, statements: &[tree::Node]) -> Result<syntax::Block, Diagnostic> {
         let statements = statements
             .iter()
             .map(|statement| self.stmt(statement))
@@ -519,15 +515,15 @@ impl LegacyToSyntax {
         })
     }
 
-    fn stmt(&mut self, node: &legacy::Node) -> Result<syntax::Stmt, Diagnostic> {
+    fn stmt(&mut self, node: &tree::Node) -> Result<syntax::Stmt, Diagnostic> {
         let kind = match node {
-            legacy::Node::VariableDeclaration {
+            tree::Node::VariableDeclaration {
                 var_type,
                 name,
                 value,
                 ..
             } => syntax::StmtKind::Local(self.local_decl(name, var_type, value.as_deref())?),
-            legacy::Node::StructDestructure {
+            tree::Node::StructDestructure {
                 struct_type,
                 fields,
                 value,
@@ -543,15 +539,15 @@ impl LegacyToSyntax {
                     .collect(),
                 value: self.expr(value)?,
             }),
-            legacy::Node::Assignment { var, value, .. } => syntax::StmtKind::Assignment {
+            tree::Node::Assignment { var, value, .. } => syntax::StmtKind::Assignment {
                 target: self.expr(var)?,
                 value: self.expr(value)?,
             },
-            legacy::Node::Block { statements } => syntax::StmtKind::Block(self.block(statements)?),
-            legacy::Node::UnsafeBlock { statements } => {
+            tree::Node::Block { statements } => syntax::StmtKind::Block(self.block(statements)?),
+            tree::Node::UnsafeBlock { statements } => {
                 syntax::StmtKind::Unsafe(self.block(statements)?)
             }
-            legacy::Node::If {
+            tree::Node::If {
                 condition,
                 body,
                 else_if_blocks,
@@ -559,12 +555,12 @@ impl LegacyToSyntax {
             } => {
                 let mut else_if = Vec::new();
                 for branch in else_if_blocks {
-                    let legacy::Node::If {
+                    let tree::Node::If {
                         condition, body, ..
                     } = branch
                     else {
                         return Err(Diagnostic::error(
-                            "legacy else-if branch was not represented by an if node",
+                            "tree else-if branch was not represented by an if node",
                         )
                         .with_code("E9004"));
                     };
@@ -580,11 +576,11 @@ impl LegacyToSyntax {
                         .transpose()?,
                 })
             }
-            legacy::Node::Match { value, cases } => {
+            tree::Node::Match { value, cases } => {
                 let mut converted = Vec::new();
                 for case in cases {
                     let pattern = match &case.pattern {
-                        legacy::MatchPattern::EnumVariant {
+                        tree::MatchPattern::EnumVariant {
                             enum_type,
                             variant,
                             bindings,
@@ -593,7 +589,7 @@ impl LegacyToSyntax {
                             variant: variant.clone(),
                             bindings: bindings.clone(),
                         },
-                        legacy::MatchPattern::Struct {
+                        tree::MatchPattern::Struct {
                             struct_type,
                             fields,
                         } => syntax::Pattern::Struct {
@@ -620,7 +616,7 @@ impl LegacyToSyntax {
                     cases: converted,
                 })
             }
-            legacy::Node::For {
+            tree::Node::For {
                 init,
                 condition,
                 update,
@@ -640,29 +636,29 @@ impl LegacyToSyntax {
                     .transpose()?,
                 body: self.block(body)?,
             }),
-            legacy::Node::Defer(expression) => syntax::StmtKind::Defer(self.expr(expression)?),
-            legacy::Node::Return(expression) => syntax::StmtKind::Return(
+            tree::Node::Defer(expression) => syntax::StmtKind::Defer(self.expr(expression)?),
+            tree::Node::Return(expression) => syntax::StmtKind::Return(
                 expression
                     .as_deref()
                     .map(|expression| self.expr(expression))
                     .transpose()?,
             ),
-            legacy::Node::Print(expression) => syntax::StmtKind::Print(self.expr(expression)?),
-            legacy::Node::Input => syntax::StmtKind::Input,
-            legacy::Node::FunctionDeclaration { lambda: false, .. }
-            | legacy::Node::GenericFunctionDeclaration { lambda: false, .. }
-            | legacy::Node::ExternFunctionDeclaration { .. }
-            | legacy::Node::TestDeclaration { .. }
-            | legacy::Node::TypeAliasDeclaration { .. }
-            | legacy::Node::StructDeclaration { .. }
-            | legacy::Node::GenericStructDeclaration { .. }
-            | legacy::Node::EnumDeclaration { .. }
-            | legacy::Node::GenericEnumDeclaration { .. }
-            | legacy::Node::TraitDeclaration { .. }
-            | legacy::Node::ShapeDeclaration { .. }
-            | legacy::Node::AttachDeclaration { .. }
-            | legacy::Node::ConformDeclaration { .. }
-            | legacy::Node::ImplDeclaration { .. } => syntax::StmtKind::Declaration(Box::new(
+            tree::Node::Print(expression) => syntax::StmtKind::Print(self.expr(expression)?),
+            tree::Node::Input => syntax::StmtKind::Input,
+            tree::Node::FunctionDeclaration { lambda: false, .. }
+            | tree::Node::GenericFunctionDeclaration { lambda: false, .. }
+            | tree::Node::ExternFunctionDeclaration { .. }
+            | tree::Node::TestDeclaration { .. }
+            | tree::Node::TypeAliasDeclaration { .. }
+            | tree::Node::StructDeclaration { .. }
+            | tree::Node::GenericStructDeclaration { .. }
+            | tree::Node::EnumDeclaration { .. }
+            | tree::Node::GenericEnumDeclaration { .. }
+            | tree::Node::TraitDeclaration { .. }
+            | tree::Node::ShapeDeclaration { .. }
+            | tree::Node::AttachDeclaration { .. }
+            | tree::Node::ConformDeclaration { .. }
+            | tree::Node::ImplDeclaration { .. } => syntax::StmtKind::Declaration(Box::new(
                 self.top_level(node, syntax::Visibility::Private)?,
             )),
             other => syntax::StmtKind::Expression(self.expr(other)?),
@@ -678,8 +674,8 @@ impl LegacyToSyntax {
     fn local_decl(
         &mut self,
         name: &str,
-        ty: &legacy::Type,
-        initializer: Option<&legacy::Node>,
+        ty: &tree::Type,
+        initializer: Option<&tree::Node>,
     ) -> Result<syntax::LocalDecl, Diagnostic> {
         let (is_const, ty) = split_binding_const(ty);
         Ok(syntax::LocalDecl {
@@ -692,19 +688,19 @@ impl LegacyToSyntax {
         })
     }
 
-    fn expr(&mut self, node: &legacy::Node) -> Result<syntax::Expr, Diagnostic> {
+    fn expr(&mut self, node: &tree::Node) -> Result<syntax::Expr, Diagnostic> {
         let kind = match node {
-            legacy::Node::Literal(literal) => syntax::ExprKind::Literal(match literal {
-                legacy::Literal::Integer(value) => syntax::Literal::Integer(*value),
-                legacy::Literal::Long(value) => syntax::Literal::Long(*value),
-                legacy::Literal::Float(value) => syntax::Literal::Float(*value),
-                legacy::Literal::Double(value) => syntax::Literal::Double(*value),
-                legacy::Literal::StringLiteral(value) => syntax::Literal::String(value.clone()),
-                legacy::Literal::Boolean(value) => syntax::Literal::Boolean(*value),
-                legacy::Literal::Char(value) => syntax::Literal::Char(*value),
+            tree::Node::Literal(literal) => syntax::ExprKind::Literal(match literal {
+                tree::Literal::Integer(value) => syntax::Literal::Integer(*value),
+                tree::Literal::Long(value) => syntax::Literal::Long(*value),
+                tree::Literal::Float(value) => syntax::Literal::Float(*value),
+                tree::Literal::Double(value) => syntax::Literal::Double(*value),
+                tree::Literal::String(value) => syntax::Literal::String(value.clone()),
+                tree::Literal::Boolean(value) => syntax::Literal::Boolean(*value),
+                tree::Literal::Char(value) => syntax::Literal::Char(*value),
             }),
-            legacy::Node::Identifier(name) => syntax::ExprKind::Name(syntax::Path::single(name)),
-            legacy::Node::BinaryOp {
+            tree::Node::Identifier(name) => syntax::ExprKind::Name(syntax::Path::single(name)),
+            tree::Node::BinaryOp {
                 left,
                 operator,
                 right,
@@ -713,11 +709,11 @@ impl LegacyToSyntax {
                 operator: binary_operator(operator.clone()),
                 right: Box::new(self.expr(right)?),
             },
-            legacy::Node::UnaryOp { operator, operand } => syntax::ExprKind::Unary {
+            tree::Node::UnaryOp { operator, operand } => syntax::ExprKind::Unary {
                 operator: unary_operator(operator.clone()),
                 operand: Box::new(self.expr(operand)?),
             },
-            legacy::Node::FunctionCall {
+            tree::Node::FunctionCall {
                 name,
                 type_arguments,
                 arguments,
@@ -735,15 +731,15 @@ impl LegacyToSyntax {
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             },
-            legacy::Node::Access { nodes } => return self.access_expr(nodes),
-            legacy::Node::StructInitialization { _type, fields } => syntax::ExprKind::StructInit {
+            tree::Node::Access { nodes } => return self.access_expr(nodes),
+            tree::Node::StructInitialization { _type, fields } => syntax::ExprKind::StructInit {
                 ty: self.ty(_type),
                 fields: fields
                     .iter()
                     .map(|(name, value)| Ok((name.clone(), self.expr(value)?)))
                     .collect::<Result<Vec<_>, Diagnostic>>()?,
             },
-            legacy::Node::StaticFunctionCall {
+            tree::Node::StaticFunctionCall {
                 _type,
                 name,
                 arguments,
@@ -756,13 +752,13 @@ impl LegacyToSyntax {
                     .map(|argument| self.expr(argument))
                     .collect::<Result<Vec<_>, _>>()?,
             },
-            legacy::Node::ArrayInit { elements } => syntax::ExprKind::Array(
+            tree::Node::ArrayInit { elements } => syntax::ExprKind::Array(
                 elements
                     .iter()
                     .map(|element| self.expr(element))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            legacy::Node::FunctionDeclaration {
+            tree::Node::FunctionDeclaration {
                 parameters,
                 return_type,
                 body,
@@ -773,16 +769,16 @@ impl LegacyToSyntax {
                 return_type: self.ty(return_type),
                 body: self.block(body)?,
             }),
-            legacy::Node::GenericFunctionDeclaration { lambda: true, .. } => {
+            tree::Node::GenericFunctionDeclaration { lambda: true, .. } => {
                 return Err(Diagnostic::error(
-                    "generic lambdas are not supported by the compatibility bridge",
+                    "generic lambdas are not supported during specialization conversion",
                 )
                 .with_code("E9005"));
             }
-            legacy::Node::Block { statements } => syntax::ExprKind::Block(self.block(statements)?),
+            tree::Node::Block { statements } => syntax::ExprKind::Block(self.block(statements)?),
             other => {
                 return Err(Diagnostic::error(format!(
-                    "expected expression in compiler compatibility bridge, found {other:?}"
+                    "expected expression in specialization conversion, found {other:?}"
                 ))
                 .with_code("E9006"));
             }
@@ -805,21 +801,21 @@ impl LegacyToSyntax {
         }
     }
 
-    fn access_expr(&mut self, nodes: &[legacy::Node]) -> Result<syntax::Expr, Diagnostic> {
+    fn access_expr(&mut self, nodes: &[tree::Node]) -> Result<syntax::Expr, Diagnostic> {
         let Some((first, rest)) = nodes.split_first() else {
             return Err(Diagnostic::error("empty access expression").with_code("E9007"));
         };
         let mut receiver = self.expr(first)?;
         for step in rest {
             let kind = match step {
-                legacy::Node::ArrayAccess { coordinates } => syntax::ExprKind::Index {
+                tree::Node::ArrayAccess { coordinates } => syntax::ExprKind::Index {
                     receiver: Box::new(receiver),
                     coordinates: coordinates
                         .iter()
                         .map(|coordinate| self.expr(coordinate))
                         .collect::<Result<Vec<_>, _>>()?,
                 },
-                legacy::Node::SliceAccess { start, end } => syntax::ExprKind::Slice {
+                tree::Node::SliceAccess { start, end } => syntax::ExprKind::Slice {
                     receiver: Box::new(receiver),
                     start: start
                         .as_deref()
@@ -830,12 +826,12 @@ impl LegacyToSyntax {
                         .map(|expression| self.expr(expression).map(Box::new))
                         .transpose()?,
                 },
-                legacy::Node::MemberAccess { member, .. } => match member.as_ref() {
-                    legacy::Node::Identifier(name) => syntax::ExprKind::Field {
+                tree::Node::MemberAccess { member, .. } => match member.as_ref() {
+                    tree::Node::Identifier(name) => syntax::ExprKind::Field {
                         receiver: Box::new(receiver),
                         name: name.clone(),
                     },
-                    legacy::Node::FunctionCall {
+                    tree::Node::FunctionCall {
                         name,
                         type_arguments,
                         arguments,
@@ -866,18 +862,18 @@ impl LegacyToSyntax {
                     }
                     other => {
                         return Err(Diagnostic::error(format!(
-                            "unsupported member access in compatibility bridge: {other:?}"
+                            "unsupported member access in specialization conversion: {other:?}"
                         ))
                         .with_code("E9008"));
                     }
                 },
-                legacy::Node::Dereference { .. } => syntax::ExprKind::Unary {
+                tree::Node::Dereference { .. } => syntax::ExprKind::Unary {
                     operator: syntax::UnaryOperator::Dereference,
                     operand: Box::new(receiver),
                 },
                 other => {
                     return Err(Diagnostic::error(format!(
-                        "unsupported access step in compatibility bridge: {other:?}"
+                        "unsupported access step in specialization conversion: {other:?}"
                     ))
                     .with_code("E9009"));
                 }
@@ -892,26 +888,26 @@ impl LegacyToSyntax {
         Ok(receiver)
     }
 
-    fn ty(&mut self, ty: &legacy::Type) -> syntax::TypeSyntax {
+    fn ty(&mut self, ty: &tree::Type) -> syntax::TypeSyntax {
         let kind = match ty {
-            legacy::Type::Void => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Void),
-            legacy::Type::Byte => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Byte),
-            legacy::Type::Short => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Short),
-            legacy::Type::Int => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Int),
-            legacy::Type::Long => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Long),
-            legacy::Type::Float => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Float),
-            legacy::Type::Double => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Double),
-            legacy::Type::String => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::String),
-            legacy::Type::Boolean => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Boolean),
-            legacy::Type::Char => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Char),
-            legacy::Type::Allocator => {
+            tree::Type::Void => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Void),
+            tree::Type::Byte => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Byte),
+            tree::Type::Short => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Short),
+            tree::Type::Int => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Int),
+            tree::Type::Long => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Long),
+            tree::Type::Float => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Float),
+            tree::Type::Double => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Double),
+            tree::Type::String => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::String),
+            tree::Type::Boolean => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Boolean),
+            tree::Type::Char => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Char),
+            tree::Type::Allocator => {
                 syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Allocator)
             }
-            legacy::Type::Arena => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Arena),
-            legacy::Type::Const { inner } | legacy::Type::BindingConst { inner } => {
+            tree::Type::Arena => syntax::TypeSyntaxKind::Builtin(syntax::BuiltinType::Arena),
+            tree::Type::Const { inner } | tree::Type::BindingConst { inner } => {
                 syntax::TypeSyntaxKind::Const(Box::new(self.ty(inner)))
             }
-            legacy::Type::Array {
+            tree::Type::Array {
                 elem_type,
                 dimensions,
             } => syntax::TypeSyntaxKind::Array {
@@ -921,45 +917,45 @@ impl LegacyToSyntax {
                     .filter_map(|dimension| self.expr(dimension).ok())
                     .collect(),
             },
-            legacy::Type::Reference {
+            tree::Type::Reference {
                 target_type,
                 mutable,
             } => syntax::TypeSyntaxKind::Reference {
                 target: Box::new(self.ty(target_type)),
                 mutable: *mutable,
             },
-            legacy::Type::Pointer { target_type } => {
+            tree::Type::Pointer { target_type } => {
                 syntax::TypeSyntaxKind::Pointer(Box::new(self.ty(target_type)))
             }
-            legacy::Type::Slice { elem_type } => {
+            tree::Type::Slice { elem_type } => {
                 syntax::TypeSyntaxKind::Slice(Box::new(self.ty(elem_type)))
             }
-            legacy::Type::GenericInstance {
+            tree::Type::GenericInstance {
                 base,
                 type_arguments,
             } => syntax::TypeSyntaxKind::Named {
                 path: syntax::Path::from_qualified(base),
                 arguments: type_arguments.iter().map(|ty| self.ty(ty)).collect(),
             },
-            legacy::Type::Union(types) => {
+            tree::Type::Union(types) => {
                 syntax::TypeSyntaxKind::Union(types.iter().map(|ty| self.ty(ty)).collect())
             }
-            legacy::Type::Intersection(types) => {
+            tree::Type::Intersection(types) => {
                 syntax::TypeSyntaxKind::Intersection(types.iter().map(|ty| self.ty(ty)).collect())
             }
-            legacy::Type::Custom(name) => syntax::TypeSyntaxKind::Named {
+            tree::Type::Custom(name) => syntax::TypeSyntaxKind::Named {
                 path: syntax::Path::from_qualified(name),
                 arguments: Vec::new(),
             },
-            legacy::Type::Function {
+            tree::Type::Function {
                 parameters,
                 return_type,
             } => syntax::TypeSyntaxKind::Function {
                 parameters: parameters.iter().map(|ty| self.ty(ty)).collect(),
                 result: Box::new(self.ty(return_type)),
             },
-            legacy::Type::MutSelf => syntax::TypeSyntaxKind::SelfType { mutable: true },
-            legacy::Type::SkSelf => syntax::TypeSyntaxKind::SelfType { mutable: false },
+            tree::Type::MutSelf => syntax::TypeSyntaxKind::SelfType { mutable: true },
+            tree::Type::SkSelf => syntax::TypeSyntaxKind::SelfType { mutable: false },
         };
         let id = self.id();
         syntax::TypeSyntax {
@@ -970,30 +966,30 @@ impl LegacyToSyntax {
     }
 }
 
-struct SyntaxToLegacy;
+struct SyntaxToTree;
 
-impl SyntaxToLegacy {
-    fn module(&self, module: &syntax::Module) -> legacy::Node {
+impl SyntaxToTree {
+    fn module(&self, module: &syntax::Module) -> tree::Node {
         let mut statements = Vec::new();
         if let Some(name) = &module.name {
-            statements.push(legacy::Node::Module {
+            statements.push(tree::Node::Module {
                 name: name.qualified_name(),
             });
         }
         statements.extend(module.entries.iter().map(|entry| self.top_level(entry)));
-        statements.push(legacy::Node::EOI);
-        legacy::Node::Program { statements }
+        statements.push(tree::Node::End);
+        tree::Node::Program { statements }
     }
 
-    fn top_level(&self, entry: &syntax::TopLevel) -> legacy::Node {
+    fn top_level(&self, entry: &syntax::TopLevel) -> tree::Node {
         let declaration = match &entry.kind {
-            syntax::TopLevelKind::Import(import) => legacy::Node::Import {
+            syntax::TopLevelKind::Import(import) => tree::Node::Import {
                 name: import.module.qualified_name(),
             },
             syntax::TopLevelKind::TypeAlias(alias) => {
                 let (generic_params, generic_bounds, subtype_bounds) =
                     self.generic_parts(&alias.generic_parameters);
-                legacy::Node::TypeAliasDeclaration {
+                tree::Node::TypeAliasDeclaration {
                     name: alias.name.clone(),
                     generic_params,
                     generic_bounds,
@@ -1006,7 +1002,7 @@ impl SyntaxToLegacy {
             syntax::TopLevelKind::Trait(declaration) => {
                 let (generic_params, generic_bounds, subtype_bounds) =
                     self.generic_parts(&declaration.generic_parameters);
-                legacy::Node::TraitDeclaration {
+                tree::Node::TraitDeclaration {
                     name: declaration.name.clone(),
                     generic_params,
                     generic_bounds,
@@ -1023,7 +1019,7 @@ impl SyntaxToLegacy {
                         .collect(),
                 }
             }
-            syntax::TopLevelKind::Shape(declaration) => legacy::Node::ShapeDeclaration {
+            syntax::TopLevelKind::Shape(declaration) => tree::Node::ShapeDeclaration {
                 name: declaration.name.clone(),
                 methods: declaration
                     .methods
@@ -1034,7 +1030,7 @@ impl SyntaxToLegacy {
             syntax::TopLevelKind::Attach(declaration) => {
                 let (generic_params, generic_bounds, subtype_bounds) =
                     self.generic_parts(&declaration.generic_parameters);
-                legacy::Node::AttachDeclaration {
+                tree::Node::AttachDeclaration {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
@@ -1049,7 +1045,7 @@ impl SyntaxToLegacy {
             syntax::TopLevelKind::Conformance(declaration) => {
                 let (generic_params, generic_bounds, subtype_bounds) =
                     self.generic_parts(&declaration.generic_parameters);
-                legacy::Node::ConformDeclaration {
+                tree::Node::ConformDeclaration {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
@@ -1057,7 +1053,7 @@ impl SyntaxToLegacy {
                         .traits
                         .first()
                         .map(|ty| self.ty(ty))
-                        .unwrap_or_else(|| legacy::Type::Custom("<missing-trait>".to_string())),
+                        .unwrap_or_else(|| tree::Type::Custom("<missing-trait>".to_string())),
                     target_type: self.ty(&declaration.target),
                     functions: declaration
                         .methods
@@ -1069,7 +1065,7 @@ impl SyntaxToLegacy {
             syntax::TopLevelKind::Implementation(declaration) => {
                 let (generic_params, generic_bounds, subtype_bounds) =
                     self.generic_parts(&declaration.generic_parameters);
-                legacy::Node::ImplDeclaration {
+                tree::Node::ImplDeclaration {
                     generic_params,
                     generic_bounds,
                     subtype_bounds,
@@ -1079,14 +1075,14 @@ impl SyntaxToLegacy {
             }
             syntax::TopLevelKind::Function(function) => self.function(function, false),
             syntax::TopLevelKind::ExternFunction(function) => {
-                legacy::Node::ExternFunctionDeclaration {
+                tree::Node::ExternFunctionDeclaration {
                     name: function.name.clone(),
                     parameters: self.parameters(&function.parameters),
                     return_type: self.ty(&function.return_type),
                 }
             }
             syntax::TopLevelKind::Global(global) => self.local(global),
-            syntax::TopLevelKind::Test(test) => legacy::Node::TestDeclaration {
+            syntax::TopLevelKind::Test(test) => tree::Node::TestDeclaration {
                 name: test.name.clone(),
                 body: self.block_statements(&test.body),
             },
@@ -1094,9 +1090,9 @@ impl SyntaxToLegacy {
         };
 
         if entry.visibility == syntax::Visibility::Public
-            && !matches!(declaration, legacy::Node::Import { .. })
+            && !matches!(declaration, tree::Node::Import { .. })
         {
-            legacy::Node::Export {
+            tree::Node::Export {
                 declaration: Box::new(declaration),
             }
         } else {
@@ -1104,7 +1100,7 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn struct_decl(&self, declaration: &syntax::StructDecl) -> legacy::Node {
+    fn struct_decl(&self, declaration: &syntax::StructDecl) -> tree::Node {
         let fields = declaration
             .fields
             .iter()
@@ -1113,7 +1109,7 @@ impl SyntaxToLegacy {
                 (
                     field.name.clone(),
                     if field.is_const {
-                        legacy::Type::BindingConst {
+                        tree::Type::Const {
                             inner: Box::new(ty),
                         }
                     } else {
@@ -1128,7 +1124,7 @@ impl SyntaxToLegacy {
             .map(|method| self.function(method, false))
             .collect();
         if declaration.generic_parameters.is_empty() {
-            legacy::Node::StructDeclaration {
+            tree::Node::StructDeclaration {
                 name: declaration.name.clone(),
                 fields,
                 functions,
@@ -1136,7 +1132,7 @@ impl SyntaxToLegacy {
         } else {
             let (generic_params, generic_bounds, subtype_bounds) =
                 self.generic_parts(&declaration.generic_parameters);
-            legacy::Node::GenericStructDeclaration {
+            tree::Node::GenericStructDeclaration {
                 name: declaration.name.clone(),
                 generic_params,
                 generic_bounds,
@@ -1147,11 +1143,11 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn enum_decl(&self, declaration: &syntax::EnumDecl) -> legacy::Node {
+    fn enum_decl(&self, declaration: &syntax::EnumDecl) -> tree::Node {
         let variants = declaration
             .variants
             .iter()
-            .map(|variant| legacy::EnumVariant {
+            .map(|variant| tree::EnumVariant {
                 name: variant.name.clone(),
                 payload_types: variant.payload.iter().map(|ty| self.ty(ty)).collect(),
             })
@@ -1162,7 +1158,7 @@ impl SyntaxToLegacy {
             .map(|method| self.function(method, false))
             .collect();
         if declaration.generic_parameters.is_empty() {
-            legacy::Node::EnumDeclaration {
+            tree::Node::EnumDeclaration {
                 name: declaration.name.clone(),
                 variants,
                 functions,
@@ -1170,7 +1166,7 @@ impl SyntaxToLegacy {
         } else {
             let (generic_params, generic_bounds, subtype_bounds) =
                 self.generic_parts(&declaration.generic_parameters);
-            legacy::Node::GenericEnumDeclaration {
+            tree::Node::GenericEnumDeclaration {
                 name: declaration.name.clone(),
                 generic_params,
                 generic_bounds,
@@ -1181,12 +1177,12 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn function(&self, function: &syntax::FunctionDecl, lambda: bool) -> legacy::Node {
+    fn function(&self, function: &syntax::FunctionDecl, lambda: bool) -> tree::Node {
         let parameters = self.parameters(&function.parameters);
         let return_type = self.ty(&function.return_type);
         let body = self.block_statements(&function.body);
         if function.generic_parameters.is_empty() {
-            legacy::Node::FunctionDeclaration {
+            tree::Node::FunctionDeclaration {
                 name: function.name.clone(),
                 parameters,
                 return_type,
@@ -1196,7 +1192,7 @@ impl SyntaxToLegacy {
         } else {
             let (generic_params, generic_bounds, subtype_bounds) =
                 self.generic_parts(&function.generic_parameters);
-            legacy::Node::GenericFunctionDeclaration {
+            tree::Node::GenericFunctionDeclaration {
                 name: function.name.clone(),
                 generic_params,
                 generic_bounds,
@@ -1209,8 +1205,8 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn trait_method(&self, method: &syntax::TraitMethod) -> legacy::TraitMethodSignature {
-        legacy::TraitMethodSignature {
+    fn trait_method(&self, method: &syntax::TraitMethod) -> tree::TraitMethodSignature {
+        tree::TraitMethodSignature {
             name: method.name.clone(),
             parameters: self.parameters(&method.parameters),
             return_type: self.ty(&method.return_type),
@@ -1221,7 +1217,7 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn generic_parts(&self, parameters: &[syntax::GenericParameter]) -> LegacyGenericParts {
+    fn generic_parts(&self, parameters: &[syntax::GenericParameter]) -> TreeGenericParts {
         let mut names = Vec::new();
         let mut capabilities = HashMap::new();
         let mut subtype_bounds = HashMap::new();
@@ -1240,7 +1236,7 @@ impl SyntaxToLegacy {
             if parameter.lower_bound.is_some() || parameter.upper_bound.is_some() {
                 subtype_bounds.insert(
                     parameter.name.clone(),
-                    legacy::SubtypeBounds {
+                    tree::SubtypeBounds {
                         lower: parameter.lower_bound.as_ref().map(|ty| self.ty(ty)),
                         upper: parameter.upper_bound.as_ref().map(|ty| self.ty(ty)),
                     },
@@ -1250,7 +1246,7 @@ impl SyntaxToLegacy {
         (names, capabilities, subtype_bounds)
     }
 
-    fn parameters(&self, parameters: &[syntax::Parameter]) -> Vec<(String, legacy::Type)> {
+    fn parameters(&self, parameters: &[syntax::Parameter]) -> Vec<(String, tree::Type)> {
         parameters
             .iter()
             .map(|parameter| match &parameter.kind {
@@ -1259,7 +1255,7 @@ impl SyntaxToLegacy {
                     (
                         name.clone(),
                         if *is_const {
-                            legacy::Type::BindingConst {
+                            tree::Type::BindingConst {
                                 inner: Box::new(ty),
                             }
                         } else {
@@ -1268,16 +1264,16 @@ impl SyntaxToLegacy {
                     )
                 }
                 syntax::ParameterKind::Receiver { mutable: true, .. } => {
-                    ("self".to_string(), legacy::Type::MutSelf)
+                    ("self".to_string(), tree::Type::MutSelf)
                 }
                 syntax::ParameterKind::Receiver { mutable: false, .. } => {
-                    ("self".to_string(), legacy::Type::SkSelf)
+                    ("self".to_string(), tree::Type::SkSelf)
                 }
             })
             .collect()
     }
 
-    fn block_statements(&self, block: &syntax::Block) -> Vec<legacy::Node> {
+    fn block_statements(&self, block: &syntax::Block) -> Vec<tree::Node> {
         block
             .statements
             .iter()
@@ -1285,54 +1281,54 @@ impl SyntaxToLegacy {
             .collect()
     }
 
-    fn stmt(&self, statement: &syntax::Stmt) -> legacy::Node {
+    fn stmt(&self, statement: &syntax::Stmt) -> tree::Node {
         match &statement.kind {
             syntax::StmtKind::Local(local) => self.local(local),
-            syntax::StmtKind::StructDestructure(pattern) => legacy::Node::StructDestructure {
+            syntax::StmtKind::StructDestructure(pattern) => tree::Node::StructDestructure {
                 struct_type: self.ty(&pattern.ty),
                 fields: pattern
                     .fields
                     .iter()
-                    .map(|field| legacy::StructPatternField {
+                    .map(|field| tree::StructPatternField {
                         field_name: field.name.clone(),
                         binding: field.binding.clone(),
                     })
                     .collect(),
                 value: Box::new(self.expr(&pattern.value)),
-                metadata: legacy::Metadata::EMPTY,
+                metadata: tree::Metadata::EMPTY,
             },
-            syntax::StmtKind::Assignment { target, value } => legacy::Node::Assignment {
+            syntax::StmtKind::Assignment { target, value } => tree::Node::Assignment {
                 var: Box::new(self.expr(target)),
                 value: Box::new(self.expr(value)),
-                metadata: legacy::Metadata::EMPTY,
+                metadata: tree::Metadata::EMPTY,
             },
             syntax::StmtKind::Expression(expression) => self.expr(expression),
-            syntax::StmtKind::Return(expression) => legacy::Node::Return(
+            syntax::StmtKind::Return(expression) => tree::Node::Return(
                 expression
                     .as_ref()
                     .map(|expression| Box::new(self.expr(expression))),
             ),
             syntax::StmtKind::Defer(expression) => {
-                legacy::Node::Defer(Box::new(self.expr(expression)))
+                tree::Node::Defer(Box::new(self.expr(expression)))
             }
             syntax::StmtKind::Print(expression) => {
-                legacy::Node::Print(Box::new(self.expr(expression)))
+                tree::Node::Print(Box::new(self.expr(expression)))
             }
-            syntax::StmtKind::Input => legacy::Node::Input,
+            syntax::StmtKind::Input => tree::Node::Input,
             syntax::StmtKind::Declaration(declaration) => self.top_level(declaration),
-            syntax::StmtKind::Block(block) => legacy::Node::Block {
+            syntax::StmtKind::Block(block) => tree::Node::Block {
                 statements: self.block_statements(block),
             },
-            syntax::StmtKind::Unsafe(block) => legacy::Node::UnsafeBlock {
+            syntax::StmtKind::Unsafe(block) => tree::Node::UnsafeBlock {
                 statements: self.block_statements(block),
             },
-            syntax::StmtKind::If(expression) => legacy::Node::If {
+            syntax::StmtKind::If(expression) => tree::Node::If {
                 condition: Box::new(self.expr(&expression.condition)),
                 body: self.block_statements(&expression.then_block),
                 else_if_blocks: expression
                     .else_if
                     .iter()
-                    .map(|(condition, body)| legacy::Node::If {
+                    .map(|(condition, body)| tree::Node::If {
                         condition: Box::new(self.expr(condition)),
                         body: self.block_statements(body),
                         else_if_blocks: Vec::new(),
@@ -1344,40 +1340,38 @@ impl SyntaxToLegacy {
                     .as_ref()
                     .map(|body| self.block_statements(body)),
             },
-            syntax::StmtKind::Match(expression) => legacy::Node::Match {
+            syntax::StmtKind::Match(expression) => tree::Node::Match {
                 value: Box::new(self.expr(&expression.value)),
                 cases: expression
                     .cases
                     .iter()
-                    .map(|case| legacy::MatchCase {
+                    .map(|case| tree::MatchCase {
                         pattern: match &case.pattern {
                             syntax::Pattern::EnumVariant {
                                 enum_type,
                                 variant,
                                 bindings,
-                            } => legacy::MatchPattern::EnumVariant {
+                            } => tree::MatchPattern::EnumVariant {
                                 enum_type: enum_type.as_ref().map(|ty| self.ty(ty)),
                                 variant: variant.clone(),
                                 bindings: bindings.clone(),
                             },
-                            syntax::Pattern::Struct { ty, fields } => {
-                                legacy::MatchPattern::Struct {
-                                    struct_type: self.ty(ty),
-                                    fields: fields
-                                        .iter()
-                                        .map(|field| legacy::StructPatternField {
-                                            field_name: field.name.clone(),
-                                            binding: field.binding.clone(),
-                                        })
-                                        .collect(),
-                                }
-                            }
+                            syntax::Pattern::Struct { ty, fields } => tree::MatchPattern::Struct {
+                                struct_type: self.ty(ty),
+                                fields: fields
+                                    .iter()
+                                    .map(|field| tree::StructPatternField {
+                                        field_name: field.name.clone(),
+                                        binding: field.binding.clone(),
+                                    })
+                                    .collect(),
+                            },
                         },
                         body: self.block_statements(&case.body),
                     })
                     .collect(),
             },
-            syntax::StmtKind::For(statement) => legacy::Node::For {
+            syntax::StmtKind::For(statement) => tree::Node::For {
                 init: statement
                     .initializer
                     .as_deref()
@@ -1395,11 +1389,11 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn local(&self, local: &syntax::LocalDecl) -> legacy::Node {
+    fn local(&self, local: &syntax::LocalDecl) -> tree::Node {
         let ty = self.ty(&local.ty);
-        legacy::Node::VariableDeclaration {
+        tree::Node::VariableDeclaration {
             var_type: if local.is_const {
-                legacy::Type::BindingConst {
+                tree::Type::BindingConst {
                     inner: Box::new(ty),
                 }
             } else {
@@ -1410,38 +1404,38 @@ impl SyntaxToLegacy {
                 .initializer
                 .as_ref()
                 .map(|expression| Box::new(self.expr(expression))),
-            metadata: legacy::Metadata::EMPTY,
+            metadata: tree::Metadata::EMPTY,
         }
     }
 
-    fn expr(&self, expression: &syntax::Expr) -> legacy::Node {
+    fn expr(&self, expression: &syntax::Expr) -> tree::Node {
         if let Some(parts) = self.access_parts(expression) {
             return if parts.len() == 1
-                && matches!(parts.first(), Some(legacy::Node::FunctionCall { .. }))
+                && matches!(parts.first(), Some(tree::Node::FunctionCall { .. }))
             {
                 parts.into_iter().next().unwrap()
             } else {
-                legacy::Node::Access { nodes: parts }
+                tree::Node::Access { nodes: parts }
             };
         }
 
         match &expression.kind {
-            syntax::ExprKind::Literal(literal) => legacy::Node::Literal(match literal {
-                syntax::Literal::Integer(value) => legacy::Literal::Integer(*value),
-                syntax::Literal::Long(value) => legacy::Literal::Long(*value),
-                syntax::Literal::Float(value) => legacy::Literal::Float(*value),
-                syntax::Literal::Double(value) => legacy::Literal::Double(*value),
-                syntax::Literal::String(value) => legacy::Literal::StringLiteral(value.clone()),
-                syntax::Literal::Boolean(value) => legacy::Literal::Boolean(*value),
-                syntax::Literal::Char(value) => legacy::Literal::Char(*value),
+            syntax::ExprKind::Literal(literal) => tree::Node::Literal(match literal {
+                syntax::Literal::Integer(value) => tree::Literal::Integer(*value),
+                syntax::Literal::Long(value) => tree::Literal::Long(*value),
+                syntax::Literal::Float(value) => tree::Literal::Float(*value),
+                syntax::Literal::Double(value) => tree::Literal::Double(*value),
+                syntax::Literal::String(value) => tree::Literal::String(value.clone()),
+                syntax::Literal::Boolean(value) => tree::Literal::Boolean(*value),
+                syntax::Literal::Char(value) => tree::Literal::Char(*value),
             }),
-            syntax::ExprKind::Unary { operator, operand } => legacy::Node::UnaryOp {
+            syntax::ExprKind::Unary { operator, operand } => tree::Node::UnaryOp {
                 operator: match operator {
-                    syntax::UnaryOperator::Plus => legacy::UnaryOperator::Plus,
-                    syntax::UnaryOperator::Minus => legacy::UnaryOperator::Minus,
-                    syntax::UnaryOperator::Not => legacy::UnaryOperator::Negate,
-                    syntax::UnaryOperator::AddressOf => legacy::UnaryOperator::AddressOf,
-                    syntax::UnaryOperator::AddressOfMut => legacy::UnaryOperator::AddressOfMut,
+                    syntax::UnaryOperator::Plus => tree::UnaryOperator::Plus,
+                    syntax::UnaryOperator::Minus => tree::UnaryOperator::Minus,
+                    syntax::UnaryOperator::Not => tree::UnaryOperator::Negate,
+                    syntax::UnaryOperator::AddressOf => tree::UnaryOperator::AddressOf,
+                    syntax::UnaryOperator::AddressOfMut => tree::UnaryOperator::AddressOfMut,
                     syntax::UnaryOperator::Dereference => {
                         unreachable!("dereference expressions are converted through access_parts")
                     }
@@ -1452,12 +1446,12 @@ impl SyntaxToLegacy {
                 left,
                 operator,
                 right,
-            } => legacy::Node::BinaryOp {
+            } => tree::Node::BinaryOp {
                 left: Box::new(self.expr(left)),
-                operator: legacy_binary_operator(*operator),
+                operator: tree_binary_operator(*operator),
                 right: Box::new(self.expr(right)),
             },
-            syntax::ExprKind::StructInit { ty, fields } => legacy::Node::StructInitialization {
+            syntax::ExprKind::StructInit { ty, fields } => tree::Node::StructInitialization {
                 _type: self.ty(ty),
                 fields: fields
                     .iter()
@@ -1468,26 +1462,26 @@ impl SyntaxToLegacy {
                 ty,
                 name,
                 arguments,
-            } => legacy::Node::StaticFunctionCall {
+            } => tree::Node::StaticFunctionCall {
                 _type: self.ty(ty),
                 name: name.clone(),
                 arguments: arguments
                     .iter()
                     .map(|argument| self.expr(argument))
                     .collect(),
-                metadata: legacy::Metadata::EMPTY,
+                metadata: tree::Metadata::EMPTY,
             },
-            syntax::ExprKind::Array(elements) => legacy::Node::ArrayInit {
+            syntax::ExprKind::Array(elements) => tree::Node::ArrayInit {
                 elements: elements.iter().map(|element| self.expr(element)).collect(),
             },
-            syntax::ExprKind::Lambda(lambda) => legacy::Node::FunctionDeclaration {
+            syntax::ExprKind::Lambda(lambda) => tree::Node::FunctionDeclaration {
                 name: String::new(),
                 parameters: self.parameters(&lambda.parameters),
                 return_type: self.ty(&lambda.return_type),
                 body: self.block_statements(&lambda.body),
                 lambda: true,
             },
-            syntax::ExprKind::Block(block) => legacy::Node::Block {
+            syntax::ExprKind::Block(block) => tree::Node::Block {
                 statements: self.block_statements(block),
             },
             syntax::ExprKind::Name(_)
@@ -1500,10 +1494,10 @@ impl SyntaxToLegacy {
         }
     }
 
-    fn access_parts(&self, expression: &syntax::Expr) -> Option<Vec<legacy::Node>> {
+    fn access_parts(&self, expression: &syntax::Expr) -> Option<Vec<tree::Node>> {
         match &expression.kind {
             syntax::ExprKind::Name(path) if path.segments.len() == 1 => {
-                Some(vec![legacy::Node::Identifier(path.qualified_name())])
+                Some(vec![tree::Node::Identifier(path.qualified_name())])
             }
             syntax::ExprKind::Call {
                 callee,
@@ -1519,9 +1513,9 @@ impl SyntaxToLegacy {
                 }
                 syntax::ExprKind::Field { receiver, name } => {
                     let mut parts = self.access_parts(receiver)?;
-                    parts.push(legacy::Node::MemberAccess {
+                    parts.push(tree::Node::MemberAccess {
                         member: Box::new(self.function_call(name, type_arguments, argument_groups)),
-                        metadata: legacy::Metadata::EMPTY,
+                        metadata: tree::Metadata::EMPTY,
                     });
                     Some(parts)
                 }
@@ -1529,9 +1523,9 @@ impl SyntaxToLegacy {
             },
             syntax::ExprKind::Field { receiver, name } => {
                 let mut parts = self.access_parts(receiver)?;
-                parts.push(legacy::Node::MemberAccess {
-                    member: Box::new(legacy::Node::Identifier(name.clone())),
-                    metadata: legacy::Metadata::EMPTY,
+                parts.push(tree::Node::MemberAccess {
+                    member: Box::new(tree::Node::Identifier(name.clone())),
+                    metadata: tree::Metadata::EMPTY,
                 });
                 Some(parts)
             }
@@ -1540,7 +1534,7 @@ impl SyntaxToLegacy {
                 coordinates,
             } => {
                 let mut parts = self.access_parts(receiver)?;
-                parts.push(legacy::Node::ArrayAccess {
+                parts.push(tree::Node::ArrayAccess {
                     coordinates: coordinates
                         .iter()
                         .map(|coordinate| self.expr(coordinate))
@@ -1554,7 +1548,7 @@ impl SyntaxToLegacy {
                 end,
             } => {
                 let mut parts = self.access_parts(receiver)?;
-                parts.push(legacy::Node::SliceAccess {
+                parts.push(tree::Node::SliceAccess {
                     start: start
                         .as_deref()
                         .map(|expression| Box::new(self.expr(expression))),
@@ -1569,8 +1563,8 @@ impl SyntaxToLegacy {
                 operand,
             } => {
                 let mut parts = self.access_parts(operand)?;
-                parts.push(legacy::Node::Dereference {
-                    metadata: legacy::Metadata::EMPTY,
+                parts.push(tree::Node::Dereference {
+                    metadata: tree::Metadata::EMPTY,
                 });
                 Some(parts)
             }
@@ -1583,135 +1577,135 @@ impl SyntaxToLegacy {
         name: &str,
         type_arguments: &[syntax::TypeSyntax],
         argument_groups: &[Vec<syntax::Expr>],
-    ) -> legacy::Node {
-        legacy::Node::FunctionCall {
+    ) -> tree::Node {
+        tree::Node::FunctionCall {
             name: name.to_string(),
             type_arguments: type_arguments.iter().map(|ty| self.ty(ty)).collect(),
             arguments: argument_groups
                 .iter()
                 .map(|group| group.iter().map(|argument| self.expr(argument)).collect())
                 .collect(),
-            metadata: legacy::Metadata::EMPTY,
+            metadata: tree::Metadata::EMPTY,
         }
     }
 
-    fn ty(&self, ty: &syntax::TypeSyntax) -> legacy::Type {
+    fn ty(&self, ty: &syntax::TypeSyntax) -> tree::Type {
         match &ty.kind {
             syntax::TypeSyntaxKind::Builtin(builtin) => match builtin {
-                syntax::BuiltinType::Void => legacy::Type::Void,
-                syntax::BuiltinType::Byte => legacy::Type::Byte,
-                syntax::BuiltinType::Short => legacy::Type::Short,
-                syntax::BuiltinType::Int => legacy::Type::Int,
-                syntax::BuiltinType::Long => legacy::Type::Long,
-                syntax::BuiltinType::Float => legacy::Type::Float,
-                syntax::BuiltinType::Double => legacy::Type::Double,
-                syntax::BuiltinType::String => legacy::Type::String,
-                syntax::BuiltinType::Boolean => legacy::Type::Boolean,
-                syntax::BuiltinType::Char => legacy::Type::Char,
-                syntax::BuiltinType::Allocator => legacy::Type::Allocator,
-                syntax::BuiltinType::Arena => legacy::Type::Arena,
+                syntax::BuiltinType::Void => tree::Type::Void,
+                syntax::BuiltinType::Byte => tree::Type::Byte,
+                syntax::BuiltinType::Short => tree::Type::Short,
+                syntax::BuiltinType::Int => tree::Type::Int,
+                syntax::BuiltinType::Long => tree::Type::Long,
+                syntax::BuiltinType::Float => tree::Type::Float,
+                syntax::BuiltinType::Double => tree::Type::Double,
+                syntax::BuiltinType::String => tree::Type::String,
+                syntax::BuiltinType::Boolean => tree::Type::Boolean,
+                syntax::BuiltinType::Char => tree::Type::Char,
+                syntax::BuiltinType::Allocator => tree::Type::Allocator,
+                syntax::BuiltinType::Arena => tree::Type::Arena,
             },
             syntax::TypeSyntaxKind::Named { path, arguments } => {
                 if arguments.is_empty() {
-                    legacy::Type::Custom(path.qualified_name())
+                    tree::Type::Custom(path.qualified_name())
                 } else {
-                    legacy::Type::GenericInstance {
+                    tree::Type::GenericInstance {
                         base: path.qualified_name(),
                         type_arguments: arguments.iter().map(|ty| self.ty(ty)).collect(),
                     }
                 }
             }
-            syntax::TypeSyntaxKind::Const(inner) => legacy::Type::Const {
+            syntax::TypeSyntaxKind::Const(inner) => tree::Type::Const {
                 inner: Box::new(self.ty(inner)),
             },
             syntax::TypeSyntaxKind::Array {
                 element,
                 dimensions,
-            } => legacy::Type::Array {
+            } => tree::Type::Array {
                 elem_type: Box::new(self.ty(element)),
                 dimensions: dimensions
                     .iter()
                     .map(|dimension| self.expr(dimension))
                     .collect(),
             },
-            syntax::TypeSyntaxKind::Reference { target, mutable } => legacy::Type::Reference {
+            syntax::TypeSyntaxKind::Reference { target, mutable } => tree::Type::Reference {
                 target_type: Box::new(self.ty(target)),
                 mutable: *mutable,
             },
-            syntax::TypeSyntaxKind::Pointer(target) => legacy::Type::Pointer {
+            syntax::TypeSyntaxKind::Pointer(target) => tree::Type::Pointer {
                 target_type: Box::new(self.ty(target)),
             },
-            syntax::TypeSyntaxKind::Slice(element) => legacy::Type::Slice {
+            syntax::TypeSyntaxKind::Slice(element) => tree::Type::Slice {
                 elem_type: Box::new(self.ty(element)),
             },
             syntax::TypeSyntaxKind::Union(types) => {
-                legacy::Type::Union(types.iter().map(|ty| self.ty(ty)).collect())
+                tree::Type::Union(types.iter().map(|ty| self.ty(ty)).collect())
             }
             syntax::TypeSyntaxKind::Intersection(types) => {
-                legacy::Type::Intersection(types.iter().map(|ty| self.ty(ty)).collect())
+                tree::Type::Intersection(types.iter().map(|ty| self.ty(ty)).collect())
             }
-            syntax::TypeSyntaxKind::Function { parameters, result } => legacy::Type::Function {
+            syntax::TypeSyntaxKind::Function { parameters, result } => tree::Type::Function {
                 parameters: parameters.iter().map(|ty| self.ty(ty)).collect(),
                 return_type: Box::new(self.ty(result)),
             },
-            syntax::TypeSyntaxKind::SelfType { mutable: true } => legacy::Type::MutSelf,
-            syntax::TypeSyntaxKind::SelfType { mutable: false } => legacy::Type::SkSelf,
+            syntax::TypeSyntaxKind::SelfType { mutable: true } => tree::Type::MutSelf,
+            syntax::TypeSyntaxKind::SelfType { mutable: false } => tree::Type::SkSelf,
         }
     }
 }
 
-fn split_binding_const(ty: &legacy::Type) -> (bool, &legacy::Type) {
+fn split_binding_const(ty: &tree::Type) -> (bool, &tree::Type) {
     match ty {
-        legacy::Type::BindingConst { inner } => (true, inner),
+        tree::Type::BindingConst { inner } => (true, inner),
         other => (false, other),
     }
 }
 
-fn binary_operator(operator: legacy::Operator) -> syntax::BinaryOperator {
+fn binary_operator(operator: tree::Operator) -> syntax::BinaryOperator {
     match operator {
-        legacy::Operator::Add => syntax::BinaryOperator::Add,
-        legacy::Operator::Subtract => syntax::BinaryOperator::Subtract,
-        legacy::Operator::Multiply => syntax::BinaryOperator::Multiply,
-        legacy::Operator::Divide => syntax::BinaryOperator::Divide,
-        legacy::Operator::Mod => syntax::BinaryOperator::Modulo,
-        legacy::Operator::Power => syntax::BinaryOperator::Power,
-        legacy::Operator::Equals => syntax::BinaryOperator::Equals,
-        legacy::Operator::NotEquals => syntax::BinaryOperator::NotEquals,
-        legacy::Operator::LessThan => syntax::BinaryOperator::LessThan,
-        legacy::Operator::GreaterThan => syntax::BinaryOperator::GreaterThan,
-        legacy::Operator::LessThanOrEqual => syntax::BinaryOperator::LessThanOrEqual,
-        legacy::Operator::GreaterThanOrEqual => syntax::BinaryOperator::GreaterThanOrEqual,
-        legacy::Operator::And => syntax::BinaryOperator::And,
-        legacy::Operator::Or => syntax::BinaryOperator::Or,
+        tree::Operator::Add => syntax::BinaryOperator::Add,
+        tree::Operator::Subtract => syntax::BinaryOperator::Subtract,
+        tree::Operator::Multiply => syntax::BinaryOperator::Multiply,
+        tree::Operator::Divide => syntax::BinaryOperator::Divide,
+        tree::Operator::Mod => syntax::BinaryOperator::Modulo,
+        tree::Operator::Power => syntax::BinaryOperator::Power,
+        tree::Operator::Equals => syntax::BinaryOperator::Equals,
+        tree::Operator::NotEquals => syntax::BinaryOperator::NotEquals,
+        tree::Operator::LessThan => syntax::BinaryOperator::LessThan,
+        tree::Operator::GreaterThan => syntax::BinaryOperator::GreaterThan,
+        tree::Operator::LessThanOrEqual => syntax::BinaryOperator::LessThanOrEqual,
+        tree::Operator::GreaterThanOrEqual => syntax::BinaryOperator::GreaterThanOrEqual,
+        tree::Operator::And => syntax::BinaryOperator::And,
+        tree::Operator::Or => syntax::BinaryOperator::Or,
     }
 }
 
-fn legacy_binary_operator(operator: syntax::BinaryOperator) -> legacy::Operator {
+fn tree_binary_operator(operator: syntax::BinaryOperator) -> tree::Operator {
     match operator {
-        syntax::BinaryOperator::Add => legacy::Operator::Add,
-        syntax::BinaryOperator::Subtract => legacy::Operator::Subtract,
-        syntax::BinaryOperator::Multiply => legacy::Operator::Multiply,
-        syntax::BinaryOperator::Divide => legacy::Operator::Divide,
-        syntax::BinaryOperator::Modulo => legacy::Operator::Mod,
-        syntax::BinaryOperator::Power => legacy::Operator::Power,
-        syntax::BinaryOperator::Equals => legacy::Operator::Equals,
-        syntax::BinaryOperator::NotEquals => legacy::Operator::NotEquals,
-        syntax::BinaryOperator::LessThan => legacy::Operator::LessThan,
-        syntax::BinaryOperator::GreaterThan => legacy::Operator::GreaterThan,
-        syntax::BinaryOperator::LessThanOrEqual => legacy::Operator::LessThanOrEqual,
-        syntax::BinaryOperator::GreaterThanOrEqual => legacy::Operator::GreaterThanOrEqual,
-        syntax::BinaryOperator::And => legacy::Operator::And,
-        syntax::BinaryOperator::Or => legacy::Operator::Or,
+        syntax::BinaryOperator::Add => tree::Operator::Add,
+        syntax::BinaryOperator::Subtract => tree::Operator::Subtract,
+        syntax::BinaryOperator::Multiply => tree::Operator::Multiply,
+        syntax::BinaryOperator::Divide => tree::Operator::Divide,
+        syntax::BinaryOperator::Modulo => tree::Operator::Mod,
+        syntax::BinaryOperator::Power => tree::Operator::Power,
+        syntax::BinaryOperator::Equals => tree::Operator::Equals,
+        syntax::BinaryOperator::NotEquals => tree::Operator::NotEquals,
+        syntax::BinaryOperator::LessThan => tree::Operator::LessThan,
+        syntax::BinaryOperator::GreaterThan => tree::Operator::GreaterThan,
+        syntax::BinaryOperator::LessThanOrEqual => tree::Operator::LessThanOrEqual,
+        syntax::BinaryOperator::GreaterThanOrEqual => tree::Operator::GreaterThanOrEqual,
+        syntax::BinaryOperator::And => tree::Operator::And,
+        syntax::BinaryOperator::Or => tree::Operator::Or,
     }
 }
 
-fn unary_operator(operator: legacy::UnaryOperator) -> syntax::UnaryOperator {
+fn unary_operator(operator: tree::UnaryOperator) -> syntax::UnaryOperator {
     match operator {
-        legacy::UnaryOperator::Plus => syntax::UnaryOperator::Plus,
-        legacy::UnaryOperator::Minus => syntax::UnaryOperator::Minus,
-        legacy::UnaryOperator::Negate => syntax::UnaryOperator::Not,
-        legacy::UnaryOperator::AddressOf => syntax::UnaryOperator::AddressOf,
-        legacy::UnaryOperator::AddressOfMut => syntax::UnaryOperator::AddressOfMut,
+        tree::UnaryOperator::Plus => syntax::UnaryOperator::Plus,
+        tree::UnaryOperator::Minus => syntax::UnaryOperator::Minus,
+        tree::UnaryOperator::Negate => syntax::UnaryOperator::Not,
+        tree::UnaryOperator::AddressOf => syntax::UnaryOperator::AddressOf,
+        tree::UnaryOperator::AddressOfMut => syntax::UnaryOperator::AddressOfMut,
     }
 }
 
@@ -1726,10 +1720,10 @@ mod tests {
             function sum(point: Point): int { return point.x + point.y; }
             function main(): void { print(sum(Point { x: 2, y: 3 })); }
         "#;
-        let legacy = crate::ast::try_parse(source).unwrap();
-        let syntax = from_legacy(&legacy, FileId::new(0), source.len()).unwrap();
-        let rebuilt = to_legacy(&syntax);
+        let tree = crate::specialization::tree::try_parse(source).unwrap();
+        let syntax = from_tree(&tree, FileId::new(0), source.len()).unwrap();
+        let rebuilt = to_tree(&syntax);
 
-        crate::monomorphize::prepare_program(&rebuilt).unwrap();
+        crate::specialization::expand::prepare_program(&rebuilt).unwrap();
     }
 }

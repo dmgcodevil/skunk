@@ -1,5 +1,5 @@
 use colored::*;
-use skunk::{ast, compiler, manifest, pipeline, source, testing};
+use skunk::{backend, manifest, pipeline, source, testing};
 use std::env;
 use std::fs;
 use std::io;
@@ -141,15 +141,9 @@ fn temporary_run_output_path() -> PathBuf {
     env::temp_dir().join(format!("skunk_run_{}_{}", std::process::id(), timestamp))
 }
 
-/// Loads, monomorphizes, and type-checks a program from disk.
+/// Loads and checks a complete program from disk.
 fn load_and_check(file_path: &Path) -> Result<pipeline::CheckedProgram, String> {
-    let node = source::load_program(file_path)?;
-    prepare_and_check(&node)
-}
-
-/// Monomorphizes and type-checks an already-loaded program.
-fn prepare_and_check(node: &ast::Node) -> Result<pipeline::CheckedProgram, String> {
-    pipeline::check(node)
+    pipeline::check_loaded(source::load_program(file_path)?)
 }
 
 /// Compiles and executes a program natively, then removes its temporary build artifacts.
@@ -157,7 +151,7 @@ fn run_native(
     program: &pipeline::CheckedProgram,
     source_path: &Path,
 ) -> Result<ExitStatus, String> {
-    run_native_with_options(program, source_path, &compiler::BuildOptions::default())
+    run_native_with_options(program, source_path, &backend::BuildOptions::default())
 }
 
 /// Compiles and executes a program with explicit linker and optimization
@@ -165,11 +159,11 @@ fn run_native(
 fn run_native_with_options(
     program: &pipeline::CheckedProgram,
     source_path: &Path,
-    options: &compiler::BuildOptions,
+    options: &backend::BuildOptions,
 ) -> Result<ExitStatus, String> {
     let output_path = temporary_run_output_path();
     let llvm_ir_path = output_path.with_extension("ll");
-    let artifact = match compiler::compile_to_executable_with_options(
+    let artifact = match backend::compile_to_executable_with_options(
         program,
         source_path,
         &output_path,
@@ -196,8 +190,8 @@ fn run_native_with_options(
 }
 
 /// Converts a project manifest's build table into compiler options.
-fn manifest_build_options(manifest: &manifest::Manifest) -> compiler::BuildOptions {
-    compiler::BuildOptions {
+fn manifest_build_options(manifest: &manifest::Manifest) -> backend::BuildOptions {
+    backend::BuildOptions {
         optimize: manifest.optimize,
         libraries: manifest.libraries.clone(),
         frameworks: manifest.frameworks.clone(),
@@ -215,9 +209,9 @@ fn emit_manifest_warnings(manifest: &manifest::Manifest) {
 /// uses defaults, while a project test inherits the complete `[build]` table.
 fn resolve_test_configuration(
     source: Option<String>,
-) -> Result<(PathBuf, compiler::BuildOptions), String> {
+) -> Result<(PathBuf, backend::BuildOptions), String> {
     if let Some(source) = source {
-        return Ok((PathBuf::from(source), compiler::BuildOptions::default()));
+        return Ok((PathBuf::from(source), backend::BuildOptions::default()));
     }
     let manifest_path = PathBuf::from(manifest::MANIFEST_FILE);
     if manifest_path.exists() {
@@ -239,8 +233,8 @@ fn resolve_test_configuration(
 fn run_tests(source: Option<String>, filter: Option<String>) -> Result<ExitStatus, String> {
     let (source_path, options) = resolve_test_configuration(source)?;
     let program = source::load_program(&source_path)?;
-    let (test_program, test_count) = testing::build_test_program(&program, filter.as_deref())?;
-    let test_program = prepare_and_check(&test_program)?;
+    let (test_program, test_count) = testing::build_test_program(program, filter.as_deref())?;
+    let test_program = pipeline::check_loaded(test_program)?;
     println!(
         "running {} test{} from {}\n",
         test_count,
@@ -267,7 +261,7 @@ fn run_build() -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to create `{}`: {}", target_dir.display(), err))?;
     let output_path = target_dir.join(&manifest.name);
     let options = manifest_build_options(&manifest);
-    let artifact = compiler::compile_to_executable_with_options(
+    let artifact = backend::compile_to_executable_with_options(
         &node,
         &manifest.entry,
         &output_path,
@@ -322,7 +316,7 @@ fn run_new(name: &str) -> Result<PathBuf, String> {
 
 /// The directory versioned binaries live in: `$SKUNK_HOME/bin`.
 fn bin_dir() -> PathBuf {
-    compiler::skunk_home().join("bin")
+    backend::skunk_home().join("bin")
 }
 
 /// Returns the version the `skunk` symlink in the bin directory points at,
@@ -456,7 +450,7 @@ fn main() -> io::Result<()> {
             };
             let output_path = output.unwrap_or_else(|| default_output_path(source_path));
             let now = Instant::now();
-            match compiler::compile_to_executable(&node, source_path, &output_path) {
+            match backend::compile_to_executable(&node, source_path, &output_path) {
                 Ok(artifact) => {
                     let elapsed = now.elapsed();
                     println!(

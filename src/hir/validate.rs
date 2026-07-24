@@ -4,11 +4,11 @@
 //! these invariants instead of repeating bounds checks or accepting sentinel
 //! IDs left behind by an incomplete lowering rule.
 
+use crate::analysis::model::SemanticModel;
+use crate::analysis::types::TypeKind;
 use crate::diagnostic::Diagnostic;
 use crate::hir;
 use crate::ids::{DefId, FieldId, LocalId, TypeId, VariantId};
-use crate::semantic_types::TypeKind;
-use crate::semantics::SemanticModel;
 use crate::source_map::Span;
 use std::collections::HashSet;
 
@@ -324,17 +324,7 @@ impl Validator<'_> {
                     }
                     hir::StaticTarget::Variant(variant) => self.variant(*variant, expression.span),
                     hir::StaticTarget::Intrinsic { owner, name } => {
-                        match owner {
-                            hir::StaticOwner::Definition(definition) => {
-                                self.definition(*definition, expression.span)
-                            }
-                            hir::StaticOwner::Intrinsic(intrinsic) => {
-                                let _ = intrinsic;
-                            }
-                            hir::StaticOwner::Builtin(builtin) => {
-                                let _ = builtin;
-                            }
-                        }
+                        self.ty(*owner, expression.span);
                         let _ = name;
                     }
                 }
@@ -481,16 +471,14 @@ fn statement_flow(kind: &hir::StmtKind) -> hir::Flow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::FileId;
 
     #[test]
     fn accepts_well_formed_hir() {
         let source = "function main(): void { print(42); }";
-        let legacy = crate::ast::try_parse(source).unwrap();
-        let module = crate::syntax::from_legacy(&legacy, FileId::new(0), source.len()).unwrap();
-        let resolutions = crate::resolver::resolve(&module).unwrap();
-        let mut model = crate::semantics::analyze_declarations(&module, resolutions).unwrap();
-        let hir = crate::hir_lowering::lower(&module, &mut model).unwrap();
+        let module = crate::syntax::parser::parse_test_module(source);
+        let resolutions = crate::analysis::resolver::resolve(&module).unwrap();
+        let mut model = crate::analysis::model::analyze_declarations(&module, resolutions).unwrap();
+        let hir = crate::hir::lower::lower(&module, &mut model).unwrap();
 
         validate(&hir, &model).unwrap();
     }

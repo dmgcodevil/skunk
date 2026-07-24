@@ -1,5 +1,5 @@
 use pest_derive::Parser;
 
 #[derive(Parser)]
-#[grammar = "grammar.pest"] // Specifies the grammar file
+#[grammar = "syntax/grammar.pest"]
 pub struct SkunkParser;

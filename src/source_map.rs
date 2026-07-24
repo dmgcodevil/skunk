@@ -11,6 +11,14 @@ pub struct Span {
 }
 
 impl Span {
+    pub const fn empty(file: FileId) -> Self {
+        Self {
+            file,
+            start: 0,
+            end: 0,
+        }
+    }
+
     pub fn new(file: FileId, start: usize, end: usize) -> Option<Self> {
         if start > end {
             return None;

@@ -1644,7 +1644,7 @@ impl Monomorphizer {
             | Node::Return(_)
             | Node::Print(_)
             | Node::Input
-            | Node::EOI
+            | Node::End
             | Node::Program { .. }
             | Node::Module { .. }
             | Node::Import { .. }
@@ -1665,7 +1665,6 @@ impl Monomorphizer {
             | Node::GenericFunctionDeclaration { .. }
             | Node::ExternFunctionDeclaration { .. }
             | Node::TestDeclaration { .. }
-            | Node::EMPTY
             | Node::Assignment { .. } => Err(format!(
                 "unsupported expression during monomorphization: `{:?}`",
                 node

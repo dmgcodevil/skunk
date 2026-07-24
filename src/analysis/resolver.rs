@@ -718,10 +718,15 @@ impl Resolver {
             self.resolutions
                 .generic_definitions
                 .insert(parameter.id, id);
-            self.type_scopes
-                .last_mut()
-                .expect("type scope was just created")
-                .insert(parameter.name.clone(), id);
+            if let Some(scope) = self.type_scopes.last_mut() {
+                scope.insert(parameter.name.clone(), id);
+            } else {
+                self.diagnostics.push(
+                    Diagnostic::error("internal resolver error: missing generic type scope")
+                        .with_code("E2099")
+                        .at(parameter.span),
+                );
+            }
         }
 
         for parameter in parameters {
@@ -755,10 +760,7 @@ impl Resolver {
             span,
             is_const,
         });
-        self.value_scopes
-            .last_mut()
-            .expect("value scope exists")
-            .insert(name.to_string(), id);
+        self.value_scopes.last_mut()?.insert(name.to_string(), id);
         Some(id)
     }
 

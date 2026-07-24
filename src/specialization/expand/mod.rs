@@ -4,7 +4,9 @@
 //! The implementation is split into semantic validation, AST transformation,
 //! and concrete specialization so each part can be read independently.
 
-use crate::ast::{self, Literal, Metadata, Node, Operator, Type, UnaryOperator};
+use crate::specialization::tree::{
+    self as ast, Literal, Metadata, Node, Operator, Type, UnaryOperator,
+};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 
@@ -499,7 +501,7 @@ impl Monomorphizer {
                 // In a normal build they are simply dropped.
                 Node::TestDeclaration { .. } => {}
                 Node::Module { .. } | Node::Import { .. } => {}
-                Node::EOI => {}
+                Node::End => {}
                 other => root_statements.push(other.clone()),
             }
         }
@@ -617,7 +619,7 @@ impl Monomorphizer {
                         None,
                     )?);
                 }
-                Node::EOI => {}
+                Node::End => {}
                 extern_decl @ Node::ExternFunctionDeclaration { .. } => {
                     output.push(extern_decl);
                 }
@@ -640,7 +642,7 @@ impl Monomorphizer {
         output.extend(self.generated_traits.values().cloned());
         output.extend(self.generated_impls.clone());
         output.extend(self.generated_functions.values().cloned());
-        output.push(Node::EOI);
+        output.push(Node::End);
         Ok(Node::Program { statements: output })
     }
 }

@@ -3,8 +3,10 @@
 //! HIR contains resolved identities and semantic `TypeId`s only. It never
 //! embeds syntax AST nodes or unresolved source names.
 
+pub mod lower;
+pub mod validate;
+
 use crate::ids::{DefId, FieldId, LocalId, NodeId, TypeId, VariantId};
-use crate::intrinsics::IntrinsicType;
 use crate::source_map::Span;
 use crate::syntax::ast::{BinaryOperator, Literal, UnaryOperator, Visibility};
 
@@ -277,18 +279,11 @@ pub enum ExprKind {
     Block(Block),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StaticOwner {
-    Definition(DefId),
-    Intrinsic(IntrinsicType),
-    Builtin(crate::syntax::ast::BuiltinType),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StaticTarget {
     Definition(DefId),
     Variant(VariantId),
-    Intrinsic { owner: StaticOwner, name: String },
+    Intrinsic { owner: TypeId, name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

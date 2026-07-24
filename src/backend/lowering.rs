@@ -261,7 +261,7 @@ impl<'a> FunctionCompiler<'a> {
                 let _ = self.compile_expr(node)?;
                 Ok(())
             }
-            Node::EOI => Ok(()),
+            Node::End => Ok(()),
             unsupported => Err(format!(
                 "LLVM backend does not support statement `{:?}` yet",
                 unsupported
@@ -687,7 +687,7 @@ impl<'a> FunctionCompiler<'a> {
                 llvm_type: LlvmType::Char16,
                 value: (*value as u32 as u16).to_string(),
             }),
-            Node::Literal(Literal::StringLiteral(value)) => {
+            Node::Literal(Literal::String(value)) => {
                 let parsed = ast::parse_string_literal(value)?;
                 let global = self.global_c_string("str", &parsed);
                 Ok(ExprValue {

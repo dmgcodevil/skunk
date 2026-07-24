@@ -1,5 +1,5 @@
-use crate::ast::Type::Void;
-use crate::ast::{
+use crate::specialization::tree::Type::Void;
+use crate::specialization::tree::{
     fits_integer_type, is_binding_const, is_const_view, is_integral_type, is_mut_self_type,
     is_numeric_assignable, is_numeric_type, is_scalar_type, is_self_type, promoted_numeric_type,
     strip_binding_const, strip_const_view, type_to_string, unwrap_binding_const, unwrap_const_view,
@@ -574,7 +574,10 @@ fn intersection_method_symbol(
             method_name,
             type_to_string(&Type::Intersection(members.to_vec()))
         )),
-        1 => Ok(matches.pop().unwrap().1),
+        1 => matches
+            .pop()
+            .map(|(_, method)| method)
+            .ok_or_else(|| "method lookup lost its only match".to_string()),
         _ => Err(format!(
             "ambiguous method `{}` on intersection `{}`",
             method_name,
@@ -663,10 +666,10 @@ enum MatchPatternResolution {
 fn resolve_match_pattern(
     global_scope: &GlobalScope,
     matched_type: &Type,
-    pattern: &crate::ast::MatchPattern,
+    pattern: &crate::specialization::tree::MatchPattern,
 ) -> Result<MatchPatternResolution, String> {
     match pattern {
-        crate::ast::MatchPattern::EnumVariant {
+        crate::specialization::tree::MatchPattern::EnumVariant {
             enum_type,
             variant,
             bindings,
@@ -710,7 +713,7 @@ fn resolve_match_pattern(
                     .collect(),
             })
         }
-        crate::ast::MatchPattern::Struct {
+        crate::specialization::tree::MatchPattern::Struct {
             struct_type,
             fields,
         } => {
@@ -789,7 +792,7 @@ fn resolve_literal_type(
         Literal::Long(_) => Ok(Type::Long),
         Literal::Float(_) => Ok(Type::Float),
         Literal::Double(_) => Ok(Type::Double),
-        Literal::StringLiteral(_) => Ok(Type::String),
+        Literal::String(_) => Ok(Type::String),
         Literal::Boolean(_) => Ok(Type::Boolean),
         Literal::Char(_) => Ok(Type::Char),
     }
@@ -872,7 +875,8 @@ fn resolve_mod(left: &Type, right: &Type) -> Result<Type, String> {
     let left = unwrap_binding_const(unwrap_const_view(left));
     let right = unwrap_binding_const(unwrap_const_view(right));
     if is_integral_type(left) && is_integral_type(right) {
-        Ok(promoted_numeric_type(left, right).unwrap())
+        promoted_numeric_type(left, right)
+            .ok_or_else(|| format!("cannot promote integral types {left:?} and {right:?}"))
     } else {
         Err(format!(
             "unexpected types for %: {:?} and {:?}",
@@ -1310,7 +1314,7 @@ fn resolve_access(
                                 access_nodes,
                             )
                         }
-                        _ => panic!("expected member access node"),
+                        _ => Err("trait member access must name a method".to_string()),
                     }
                 } else {
                     let (fields, functions, kind) = if let Some(struct_symbol) =
@@ -1381,7 +1385,7 @@ fn resolve_access(
                                 access_nodes,
                             )
                         }
-                        _ => panic!("expected member access node"),
+                        _ => Err("nominal member access must name a field or method".to_string()),
                     }
                 }
             }
@@ -1949,12 +1953,16 @@ fn resolve_function_call(
                     }
                     curr_type = return_type;
                 }
-                _ => panic!("expected function call"),
+                _ => {
+                    return Err(format!(
+                        "cannot apply another argument group to non-function type {curr_type:?}"
+                    ));
+                }
             }
         }
         Ok(curr_type.clone())
     } else {
-        panic!("expected function call");
+        Err("function-call resolver received a non-call node".to_string())
     }
 }
 
@@ -2451,8 +2459,8 @@ fn resolve_type(
                 }
             }
             match expected_type_opt {
-                Some(Type::Array { .. }) | Some(Type::Slice { .. }) => {
-                    Ok(ResolveResult::new(expected_type_opt.unwrap().clone()))
+                Some(expected @ (Type::Array { .. } | Type::Slice { .. })) => {
+                    Ok(ResolveResult::new(expected.clone()))
                 }
                 _ => Ok(ResolveResult::new(Type::Slice {
                     elem_type: Box::new(curr),
@@ -2462,7 +2470,7 @@ fn resolve_type(
         Node::Literal(literal) => {
             resolve_literal_type(literal, expected_type_opt).map(ResolveResult::new)
         }
-        Node::EOI => Ok(ResolveResult::new(Type::Void)),
+        Node::End => Ok(ResolveResult::new(Type::Void)),
         Node::Identifier(name) => {
             let res = symbol_tables
                 .get_symbol(name)
@@ -2476,13 +2484,11 @@ fn resolve_type(
             res
         }
         Node::Access { nodes } => {
-            let start = resolve_type(
-                global_scope,
-                symbol_tables,
-                nodes.first().unwrap(),
-                expected_type_opt,
-            )?
-            .sk_type;
+            let first = nodes
+                .first()
+                .ok_or_else(|| "access expression must contain a base value".to_string())?;
+            let start =
+                resolve_type(global_scope, symbol_tables, first, expected_type_opt)?.sk_type;
             resolve_access(global_scope, symbol_tables, start, 1, nodes).map(ResolveResult::new)
         }
         Node::StaticFunctionCall {
@@ -2925,7 +2931,9 @@ fn resolve_type(
                     return Ok(ResolveResult::new(Type::Boolean));
                 }
                 Type::Custom(custom_name) if global_scope.enums.contains_key(custom_name) => {
-                    let enum_symbol = global_scope.enums.get(custom_name).unwrap();
+                    let enum_symbol = global_scope.enums.get(custom_name).ok_or_else(|| {
+                        format!("enum `{custom_name}` disappeared during static-call resolution")
+                    })?;
                     if let Some(variant_symbol) = enum_symbol.variants.get(name) {
                         if arguments.len() != variant_symbol.payload_types.len() {
                             return Err(format!(
@@ -3352,13 +3360,11 @@ pub fn check(node: &Node) -> Result<(), String> {
     let mut var_tables = SymbolTables::new();
     var_tables.add(SymbolTable::new());
     let mut global_scope = GlobalScope::new();
-    match node {
-        Node::Program { statements } => {
-            for statement in statements {
-                global_scope.add(statement);
-            }
-        }
-        _ => panic!("expected program node"),
+    let Node::Program { statements } = node else {
+        return Err("type-checking input must have a program root".to_string());
+    };
+    for statement in statements {
+        global_scope.add(statement);
     }
     match resolve_type(&global_scope, &mut var_tables, node, None) {
         Err(e) => Err(e.to_string()),
@@ -3369,7 +3375,7 @@ pub fn check(node: &Node) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast;
+    use crate::specialization::tree as ast;
 
     #[test]
     fn test_check() {

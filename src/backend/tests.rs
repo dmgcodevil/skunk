@@ -1,11 +1,17 @@
 use super::*;
-use crate::monomorphize;
 use crate::source;
-use crate::type_checker;
 use std::env;
 use std::path::Path;
 use std::process::Command;
 use uuid::Uuid;
+
+fn loaded_source(source: &str) -> crate::syntax::loader::LoadedProgram {
+    let mut sources = crate::source_map::SourceMap::default();
+    let file = sources.add_file("compiler-test.skunk", source).unwrap();
+    let module = crate::syntax::parser::parse_module(&sources, file).unwrap();
+    let module = crate::syntax::normalize::normalize(module).unwrap();
+    crate::syntax::loader::LoadedProgram { module, sources }
+}
 
 fn compile_and_run(source: &str) -> Result<String, String> {
     let program = crate::pipeline::check_source("compiler-test.skunk", source)?;
@@ -122,8 +128,7 @@ fn compile_project_and_run(files: &[(&str, &str)], entry: &str) -> Result<String
     }
 
     let entry_path = root.join(entry);
-    let program = source::load_program(&entry_path)?;
-    let program = crate::pipeline::check(&program)?;
+    let program = crate::pipeline::check_loaded(source::load_program(&entry_path)?)?;
 
     let output_path = root.join("app_out");
     let artifact = compile_to_executable(&program, Path::new(&entry_path), &output_path)?;
@@ -176,7 +181,8 @@ fn materialized_file_writes_are_safe_when_concurrent() {
 
 #[test]
 fn compiles_basic_program_to_ir() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         function add(a: int, b: int): int {
             return a + b;
@@ -187,7 +193,8 @@ fn compiles_basic_program_to_ir() {
             print(total);
         }
         "#,
-    );
+    )
+    .unwrap();
 
     let ir = compile_to_llvm_ir(&program).unwrap();
     assert!(ir.contains("define i32 @skunk_add(i32 %arg0, i32 %arg1)"));
@@ -197,7 +204,8 @@ fn compiles_basic_program_to_ir() {
 
 #[test]
 fn compiles_structs_to_ir() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         struct Point {
             x: int;
@@ -215,7 +223,8 @@ fn compiles_structs_to_ir() {
             print(p.sum());
         }
         "#,
-    );
+    )
+    .unwrap();
 
     let ir = compile_to_llvm_ir(&program).unwrap();
     assert!(ir.contains("%struct.Point = type { i32, i32 }"));
@@ -226,7 +235,8 @@ fn compiles_structs_to_ir() {
 
 #[test]
 fn compiles_new_primitives_to_ir() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         function main(): double {
             b: byte = 10;
@@ -238,7 +248,8 @@ fn compiles_new_primitives_to_ir() {
             return l + f;
         }
         "#,
-    );
+    )
+    .unwrap();
 
     let ir = compile_to_llvm_ir(&program).unwrap();
     assert!(ir.contains("define double @skunk_main()"));
@@ -248,7 +259,8 @@ fn compiles_new_primitives_to_ir() {
 
 #[test]
 fn compiles_fixed_arrays_to_ir() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         function main(): void {
             values: [3]int = [1, 2, 3];
@@ -257,7 +269,8 @@ fn compiles_fixed_arrays_to_ir() {
             print(values.len);
         }
         "#,
-    );
+    )
+    .unwrap();
 
     let ir = compile_to_llvm_ir(&program).unwrap();
     assert!(ir.contains("[3 x i32]"));
@@ -1414,7 +1427,8 @@ fn runs_compiled_arena_destroy_and_free_program() {
 
 #[test]
 fn compiles_generic_enum_to_ir() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         enum Option[T] {
             None;
@@ -1433,8 +1447,8 @@ fn compiles_generic_enum_to_ir() {
             }
         }
         "#,
-    );
-    let program = monomorphize::prepare_program(&program).unwrap();
+    )
+    .unwrap();
 
     let ir = compile_to_llvm_ir(&program).unwrap();
     assert!(ir.contains("%enum.Option__int = type { i32, i32 }"));
@@ -2769,7 +2783,8 @@ fn runs_compiled_trait_intersection_alias_program() {
 
 #[test]
 fn extern_declaration_emits_unmangled_declare_and_call() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         extern "C" function cos(value: double): double;
 
@@ -2777,9 +2792,8 @@ fn extern_declaration_emits_unmangled_declare_and_call() {
             print(cos(0.0));
         }
         "#,
-    );
-    let program = monomorphize::prepare_program(&program).unwrap();
-    type_checker::check(&program).unwrap();
+    )
+    .unwrap();
     let ir = compile_to_llvm_ir(&program).unwrap();
 
     assert!(
@@ -2811,7 +2825,8 @@ fn extern_declaration_runs_natively() {
 
 #[test]
 fn extern_declaration_rejects_reserved_runtime_symbols() {
-    let program = ast::parse(
+    let program = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         extern "C" function malloc(size: long): *byte;
 
@@ -2819,8 +2834,8 @@ fn extern_declaration_rejects_reserved_runtime_symbols() {
             print(1);
         }
         "#,
-    );
-    let program = monomorphize::prepare_program(&program).unwrap();
+    )
+    .unwrap();
     let error = compile_to_llvm_ir(&program).unwrap_err();
     assert!(
         error.contains("reserved runtime symbol"),
@@ -2831,7 +2846,8 @@ fn extern_declaration_rejects_reserved_runtime_symbols() {
 
 #[test]
 fn extern_declaration_rejects_non_abi_safe_types() {
-    let program = ast::parse(
+    let error = crate::pipeline::check_source(
+        "compiler-test.skunk",
         r#"
         struct Point { x: int; y: int; }
 
@@ -2841,9 +2857,8 @@ fn extern_declaration_rejects_non_abi_safe_types() {
             print(1);
         }
         "#,
-    );
-    let program = monomorphize::prepare_program(&program).unwrap();
-    let error = type_checker::check(&program).unwrap_err();
+    )
+    .unwrap_err();
     assert!(
         error.contains("non C-ABI-safe"),
         "unexpected error: {}",
@@ -2853,7 +2868,7 @@ fn extern_declaration_rejects_non_abi_safe_types() {
 
 #[test]
 fn native_test_runner_reports_results() {
-    let program = ast::parse(
+    let program = loaded_source(
         r#"
         function add(a: int, b: int): int {
             return a + b;
@@ -2869,10 +2884,9 @@ fn native_test_runner_reports_results() {
         }
         "#,
     );
-    let (test_program, count) = crate::testing::build_test_program(&program, None).unwrap();
+    let (test_program, count) = crate::testing::build_test_program(program, None).unwrap();
     assert_eq!(count, 2);
-    let test_program = monomorphize::prepare_program(&test_program).unwrap();
-    type_checker::check(&test_program).unwrap();
+    let test_program = crate::pipeline::check_loaded(test_program).unwrap();
 
     let id = Uuid::new_v4().to_string();
     let source_path = env::temp_dir().join(format!("skunk_test_runner_{}.skunk", id));
@@ -2897,16 +2911,15 @@ fn native_test_runner_reports_results() {
 
 #[test]
 fn native_test_runner_fails_with_nonzero_exit() {
-    let program = ast::parse(
+    let program = loaded_source(
         r#"
         test "broken" {
             Testing::expect_eq(1, 2);
         }
         "#,
     );
-    let (test_program, _) = crate::testing::build_test_program(&program, None).unwrap();
-    let test_program = monomorphize::prepare_program(&test_program).unwrap();
-    type_checker::check(&test_program).unwrap();
+    let (test_program, _) = crate::testing::build_test_program(program, None).unwrap();
+    let test_program = crate::pipeline::check_loaded(test_program).unwrap();
 
     let id = Uuid::new_v4().to_string();
     let source_path = env::temp_dir().join(format!("skunk_test_runner_{}.skunk", id));

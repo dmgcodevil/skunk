@@ -1,12 +1,12 @@
 //! Lowers resolved, semantically typed syntax into HIR.
 
+use crate::analysis::model::SemanticModel;
+use crate::analysis::resolver::{TypeResolution, ValueResolution};
+use crate::analysis::types::TypeKind;
 use crate::diagnostic::Diagnostic;
 use crate::hir;
 use crate::ids::{DefId, FieldId, LocalId, TypeId, VariantId};
 use crate::intrinsics::IntrinsicType;
-use crate::resolver::{TypeResolution, ValueResolution};
-use crate::semantic_types::TypeKind;
-use crate::semantics::SemanticModel;
 use crate::syntax::ast as syntax;
 use std::collections::HashMap;
 
@@ -231,8 +231,8 @@ impl<'a> Lowerer<'a> {
                 hir::ItemKind::Implementation { traits, target }
             }
             syntax::TopLevelKind::Attach(_) | syntax::TopLevelKind::Conformance(_) => {
-                // Prepared syntax has already merged methods and retained only
-                // an explicit implementation record.
+                // Normalized syntax has already merged behavior methods and
+                // retained conformances as explicit implementation records.
                 return None;
             }
             syntax::TopLevelKind::Function(function) => {
@@ -853,7 +853,7 @@ impl<'a> Lowerer<'a> {
                 arguments,
             } => {
                 let owner_type = self.syntax_type(ty);
-                let target = self.static_target(ty, name);
+                let target = self.static_target(ty, owner_type, name);
                 let result = self.static_result(owner_type, name);
                 let arguments = arguments
                     .iter()
@@ -1133,20 +1133,15 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn static_owner(&self, ty: &syntax::TypeSyntax) -> hir::StaticOwner {
-        match self.model.resolutions.types.get(&ty.id).copied() {
-            Some(TypeResolution::Definition(definition)) => {
-                hir::StaticOwner::Definition(definition)
-            }
-            Some(TypeResolution::Intrinsic(intrinsic)) => hir::StaticOwner::Intrinsic(intrinsic),
-            Some(TypeResolution::Builtin(builtin)) => hir::StaticOwner::Builtin(builtin),
-            _ => hir::StaticOwner::Builtin(syntax::BuiltinType::Void),
-        }
-    }
-
-    fn static_target(&self, ty: &syntax::TypeSyntax, name: &str) -> hir::StaticTarget {
-        let owner = self.static_owner(ty);
-        if let hir::StaticOwner::Definition(definition) = owner {
+    fn static_target(
+        &self,
+        ty: &syntax::TypeSyntax,
+        owner: TypeId,
+        name: &str,
+    ) -> hir::StaticTarget {
+        if let Some(TypeResolution::Definition(definition)) =
+            self.model.resolutions.types.get(&ty.id).copied()
+        {
             if let Some(variant) = self
                 .variants
                 .get(&definition)
@@ -1477,7 +1472,6 @@ fn numeric_rank(kind: &TypeKind) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::FileId;
 
     #[test]
     fn nested_return_is_explicit_in_hir_flow() {
@@ -1486,10 +1480,9 @@ mod tests {
                 { return 42; }
             }
         "#;
-        let legacy = crate::ast::try_parse(source).unwrap();
-        let module = crate::syntax::from_legacy(&legacy, FileId::new(0), source.len()).unwrap();
-        let resolutions = crate::resolver::resolve(&module).unwrap();
-        let mut model = crate::semantics::analyze_declarations(&module, resolutions).unwrap();
+        let module = crate::syntax::parser::parse_test_module(source);
+        let resolutions = crate::analysis::resolver::resolve(&module).unwrap();
+        let mut model = crate::analysis::model::analyze_declarations(&module, resolutions).unwrap();
         let hir = lower(&module, &mut model).unwrap();
         let hir::ItemKind::Function(function) = &hir.items[0].kind else {
             panic!("expected function HIR");
@@ -1506,12 +1499,9 @@ mod tests {
                 print(p.x);
             }
         "#;
-        let legacy = crate::ast::try_parse(source).unwrap();
-        let prepared = crate::monomorphize::prepare_program(&legacy).unwrap();
-        crate::type_checker::check(&prepared).unwrap();
-        let module = crate::syntax::from_legacy(&prepared, FileId::new(0), source.len()).unwrap();
-        let resolutions = crate::resolver::resolve(&module).unwrap();
-        let mut model = crate::semantics::analyze_declarations(&module, resolutions).unwrap();
+        let module = crate::syntax::parser::parse_test_module(source);
+        let resolutions = crate::analysis::resolver::resolve(&module).unwrap();
+        let mut model = crate::analysis::model::analyze_declarations(&module, resolutions).unwrap();
         lower(&module, &mut model).unwrap();
     }
 }

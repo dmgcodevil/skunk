@@ -833,7 +833,7 @@ impl Monomorphizer {
             Literal::Long(_) => Ok(Type::Long),
             Literal::Float(_) => Ok(Type::Float),
             Literal::Double(_) => Ok(Type::Double),
-            Literal::StringLiteral(_) => Ok(Type::String),
+            Literal::String(_) => Ok(Type::String),
             Literal::Boolean(_) => Ok(Type::Boolean),
             Literal::Char(_) => Ok(Type::Char),
         }

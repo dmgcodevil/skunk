@@ -1,5 +1,5 @@
 use super::*;
-use crate::ast;
+use crate::specialization::tree as ast;
 
 fn prepared_statements(source: &str) -> Vec<Node> {
     let program = ast::parse(source);

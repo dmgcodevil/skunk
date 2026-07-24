@@ -1,9 +1,9 @@
 //! Semantic type construction over resolved syntax.
 
+use crate::analysis::resolver::{DefinitionKind, Resolutions, TypeResolution};
+use crate::analysis::types::{TypeKind, TypeStore};
 use crate::diagnostic::Diagnostic;
 use crate::ids::{DefId, FieldId, LocalId, NodeId, TypeId, VariantId};
-use crate::resolver::{DefinitionKind, Resolutions, TypeResolution};
-use crate::semantic_types::{TypeKind, TypeStore};
 use crate::syntax::ast::*;
 use std::collections::HashMap;
 
@@ -637,7 +637,6 @@ fn const_u64(expression: &Expr) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::FileId;
 
     #[test]
     fn separates_nominal_definition_from_instantiated_type() {
@@ -645,9 +644,8 @@ mod tests {
             struct Box[T] { value: T; }
             function use_box(value: Box[int]): int { return value.value; }
         "#;
-        let legacy = crate::ast::try_parse(source).unwrap();
-        let module = crate::syntax::from_legacy(&legacy, FileId::new(0), source.len()).unwrap();
-        let resolutions = crate::resolver::resolve(&module).unwrap();
+        let module = crate::syntax::parser::parse_test_module(source);
+        let resolutions = crate::analysis::resolver::resolve(&module).unwrap();
         let model = analyze_declarations(&module, resolutions).unwrap();
 
         assert!(model.types.len() > crate::intrinsics::IntrinsicType::ALL.len());

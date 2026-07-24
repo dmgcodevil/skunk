@@ -4,12 +4,12 @@
 //! layouts, and assembles whole-module IR. Function-body lowering is separated
 //! into core lowering, access/call lowering, and coercion/runtime operations.
 
-use crate::ast::{self, Literal, Node, Operator, Type, UnaryOperator};
+use crate::analysis::model::SemanticModel;
+use crate::analysis::resolver::DefinitionKind;
+use crate::analysis::types::TypeKind as SemanticTypeKind;
 use crate::ids::{DefId, TypeId};
 use crate::intrinsics::IntrinsicType;
-use crate::resolver::DefinitionKind;
-use crate::semantic_types::TypeKind as SemanticTypeKind;
-use crate::semantics::SemanticModel;
+use crate::specialization::tree::{self as ast, Literal, Node, Operator, Type, UnaryOperator};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod access;
 mod coercion;
+mod from_hir;
 mod lowering;
 
 #[cfg(test)]
@@ -336,209 +337,7 @@ fn array_len_from_dimension(dimension: &Node) -> Result<usize, String> {
     })
 }
 
-/// Collects the field order and concrete LLVM field types for every struct.
-fn collect_struct_layouts(statements: &[Node]) -> Result<HashMap<String, StructLayout>, String> {
-    let mut raw_fields = HashMap::<String, Vec<(String, Type)>>::new();
-    let enum_placeholders = collect_enum_placeholders(statements);
-    for statement in statements {
-        if let Node::StructDeclaration { name, fields, .. } = statement {
-            raw_fields.insert(name.clone(), fields.clone());
-        }
-    }
-
-    let mut layouts = HashMap::<String, StructLayout>::new();
-    for (name, fields) in &raw_fields {
-        let llvm_fields = fields
-            .iter()
-            .map(|(field_name, field_type)| {
-                Ok((
-                    field_name.clone(),
-                    llvm_type(
-                        field_type,
-                        &layouts_with_raw(raw_fields.keys(), &layouts),
-                        &enum_placeholders,
-                        &HashMap::new(),
-                    )?,
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        layouts.insert(
-            name.clone(),
-            StructLayout {
-                name: name.clone(),
-                fields: llvm_fields,
-            },
-        );
-    }
-    Ok(layouts)
-}
-
-/// Assigns enum tags and flattened payload slots used by construction and
-/// pattern matching.
-fn collect_enum_layouts(
-    statements: &[Node],
-    structs: &HashMap<String, StructLayout>,
-) -> Result<HashMap<String, EnumLayout>, String> {
-    let mut layouts = HashMap::<String, EnumLayout>::new();
-    let enum_placeholders = collect_enum_placeholders(statements);
-
-    for statement in statements {
-        let Node::EnumDeclaration { name, variants, .. } = statement else {
-            continue;
-        };
-
-        let mut variant_layouts = Vec::new();
-        let mut next_field_index = 1usize;
-        for (tag, variant) in variants.iter().enumerate() {
-            let payload_types = variant
-                .payload_types
-                .iter()
-                .map(|payload_type| {
-                    llvm_type(payload_type, structs, &enum_placeholders, &HashMap::new())
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let field_indices = (0..payload_types.len())
-                .map(|_| {
-                    let current = next_field_index;
-                    next_field_index += 1;
-                    current
-                })
-                .collect::<Vec<_>>();
-            variant_layouts.push(EnumVariantLayout {
-                name: variant.name.clone(),
-                tag,
-                payload_types,
-                field_indices,
-            });
-        }
-
-        layouts.insert(
-            name.clone(),
-            EnumLayout {
-                name: name.clone(),
-                variants: variant_layouts,
-            },
-        );
-    }
-
-    Ok(layouts)
-}
-
-fn collect_enum_placeholders(statements: &[Node]) -> HashMap<String, EnumLayout> {
-    statements
-        .iter()
-        .filter_map(|statement| match statement {
-            Node::EnumDeclaration { name, .. } => Some((
-                name.clone(),
-                EnumLayout {
-                    name: name.clone(),
-                    variants: Vec::new(),
-                },
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Builds inherited trait method tables in their final vtable slot order.
-fn collect_trait_layouts(
-    statements: &[Node],
-    structs: &HashMap<String, StructLayout>,
-    enums: &HashMap<String, EnumLayout>,
-) -> Result<HashMap<String, TraitLayout>, String> {
-    let trait_decls = statements
-        .iter()
-        .filter_map(|statement| match statement {
-            Node::TraitDeclaration {
-                name,
-                supertraits,
-                methods,
-                ..
-            } => Some((name.clone(), (supertraits.clone(), methods.clone()))),
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    fn build_trait_layout(
-        trait_name: &str,
-        trait_decls: &HashMap<String, (Vec<String>, Vec<ast::TraitMethodSignature>)>,
-        structs: &HashMap<String, StructLayout>,
-        enums: &HashMap<String, EnumLayout>,
-        layouts: &mut HashMap<String, TraitLayout>,
-        visiting: &mut Vec<String>,
-    ) -> Result<TraitLayout, String> {
-        if let Some(layout) = layouts.get(trait_name) {
-            return Ok(layout.clone());
-        }
-        if visiting.iter().any(|name| name == trait_name) {
-            visiting.push(trait_name.to_string());
-            return Err(format!(
-                "cyclic supertrait relationship detected: {}",
-                visiting.join(" -> ")
-            ));
-        }
-        let (supertraits, methods) = trait_decls
-            .get(trait_name)
-            .cloned()
-            .ok_or_else(|| format!("unknown trait `{}` in LLVM backend", trait_name))?;
-        visiting.push(trait_name.to_string());
-        let mut method_layouts = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for supertrait in supertraits {
-            let layout =
-                build_trait_layout(&supertrait, trait_decls, structs, enums, layouts, visiting)?;
-            for method in layout.methods {
-                if seen.insert(method.name.clone()) {
-                    method_layouts.push(method);
-                }
-            }
-        }
-        for method in methods {
-            method
-                .parameters
-                .first()
-                .ok_or_else(|| format!("trait method `{}` is missing self", method.name))?;
-            if !seen.insert(method.name.clone()) {
-                return Err(format!(
-                    "trait `{}` declares duplicate inherited method `{}`",
-                    trait_name, method.name
-                ));
-            }
-            method_layouts.push(TraitMethodLayout {
-                name: method.name.clone(),
-                return_type: llvm_type(&method.return_type, structs, enums, layouts)?,
-                parameters: method
-                    .parameters
-                    .iter()
-                    .skip(1)
-                    .map(|(_, ty)| llvm_type(ty, structs, enums, layouts))
-                    .collect::<Result<Vec<_>, String>>()?,
-            });
-        }
-        visiting.pop();
-        let layout = TraitLayout {
-            name: trait_name.to_string(),
-            methods: method_layouts,
-        };
-        layouts.insert(trait_name.to_string(), layout.clone());
-        Ok(layout)
-    }
-
-    let mut layouts = HashMap::new();
-    for trait_name in trait_decls.keys() {
-        build_trait_layout(
-            trait_name,
-            &trait_decls,
-            structs,
-            enums,
-            &mut layouts,
-            &mut Vec::new(),
-        )?;
-    }
-    Ok(layouts)
-}
-
-/// Builds native layouts from validated HIR. This is the production layout
-/// path; the legacy collectors above remain for focused backend unit tests.
+/// Builds native layouts from validated HIR.
 fn collect_typed_layouts(
     module: &crate::hir::Module,
     model: &SemanticModel,
@@ -1010,20 +809,6 @@ fn definition_name(model: &SemanticModel, definition: DefId) -> Result<&str, Str
         .ok_or_else(|| format!("unknown definition id {}", definition.index()))
 }
 
-fn layouts_with_raw<'a>(
-    raw_names: impl Iterator<Item = &'a String>,
-    layouts: &HashMap<String, StructLayout>,
-) -> HashMap<String, StructLayout> {
-    let mut merged = layouts.clone();
-    for name in raw_names {
-        merged.entry(name.clone()).or_insert_with(|| StructLayout {
-            name: name.clone(),
-            fields: Vec::new(),
-        });
-    }
-    merged
-}
-
 fn is_integer_llvm_type(llvm_type: &LlvmType) -> bool {
     matches!(
         llvm_type,
@@ -1111,34 +896,6 @@ pub struct CompiledArtifact {
     pub binary_path: PathBuf,
 }
 
-/// Input accepted by LLVM code generation.
-///
-/// `CheckedProgram` is the production path. The `Node` implementation keeps
-/// focused backend unit tests useful during the HIR-to-LLVM migration.
-pub trait CodegenInput {
-    fn legacy_codegen_program(&self) -> &Node;
-
-    fn checked_hir(&self) -> Option<(&crate::hir::Module, &crate::semantics::SemanticModel)> {
-        None
-    }
-}
-
-impl CodegenInput for Node {
-    fn legacy_codegen_program(&self) -> &Node {
-        self
-    }
-}
-
-impl CodegenInput for crate::pipeline::CheckedProgram {
-    fn legacy_codegen_program(&self) -> &Node {
-        self.legacy_codegen()
-    }
-
-    fn checked_hir(&self) -> Option<(&crate::hir::Module, &crate::semantics::SemanticModel)> {
-        Some((&self.hir, &self.semantics))
-    }
-}
-
 /// Linker and optimization options for a native build, typically sourced from
 /// a project's `skunk.toml`.
 #[derive(Clone, Debug)]
@@ -1164,9 +921,9 @@ impl Default for BuildOptions {
 // The C runtime sources are embedded into the compiler binary so an installed
 // `skunk` works without a source checkout. They are materialized on demand
 // into `$SKUNK_HOME/runtime/<version>/` (default `~/.skunk`).
-const RUNTIME_C_SOURCE: &str = include_str!("../runtime/skunk_runtime.c");
+const RUNTIME_C_SOURCE: &str = include_str!("../../runtime/skunk_runtime.c");
 #[cfg(target_os = "macos")]
-const RUNTIME_WINDOW_SOURCE: &str = include_str!("../runtime/skunk_window_runtime.m");
+const RUNTIME_WINDOW_SOURCE: &str = include_str!("../../runtime/skunk_window_runtime.m");
 
 static MATERIALIZED_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1254,7 +1011,7 @@ fn materialize_runtime_sources() -> Result<(PathBuf, Option<PathBuf>), String> {
 /// Compiles a checked Skunk program into LLVM IR and a native executable
 /// using default build options.
 pub fn compile_to_executable(
-    program: &impl CodegenInput,
+    program: &crate::pipeline::CheckedProgram,
     source_path: &Path,
     output_path: &Path,
 ) -> Result<CompiledArtifact, String> {
@@ -1263,7 +1020,7 @@ pub fn compile_to_executable(
 
 /// Compiles a checked Skunk program into LLVM IR and a native executable.
 pub fn compile_to_executable_with_options(
-    program: &impl CodegenInput,
+    program: &crate::pipeline::CheckedProgram,
     source_path: &Path,
     output_path: &Path,
     options: &BuildOptions,
@@ -1333,24 +1090,19 @@ pub fn compile_to_executable_with_options(
 
 /// Lowers a checked Skunk program into textual LLVM IR without invoking the
 /// system linker.
-pub fn compile_to_llvm_ir(program: &impl CodegenInput) -> Result<String, String> {
-    let typed_backend = if let Some((hir, semantics)) = program.checked_hir() {
-        crate::hir_validation::validate(hir, semantics).map_err(|diagnostics| {
-            diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })?;
-        Some((
-            collect_typed_layouts(hir, semantics)?,
-            collect_typed_signatures(hir, semantics)?,
-            collect_typed_implementations(hir, semantics)?,
-        ))
-    } else {
-        None
-    };
-    let program = program.legacy_codegen_program();
+pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<String, String> {
+    crate::hir::validate::validate(&program.hir, &program.semantics).map_err(|diagnostics| {
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let (structs, enums, traits) = collect_typed_layouts(&program.hir, &program.semantics)?;
+    let typed_signatures = collect_typed_signatures(&program.hir, &program.semantics)?;
+    let typed_implementations = collect_typed_implementations(&program.hir, &program.semantics)?;
+    let lowered_program = from_hir::lower_program(&program.hir, &program.semantics)?;
+    let program = &lowered_program;
     let statements = match program {
         Node::Program { statements } => statements,
         other => {
@@ -1361,20 +1113,6 @@ pub fn compile_to_llvm_ir(program: &impl CodegenInput) -> Result<String, String>
         }
     };
 
-    let (typed_layouts, typed_signatures, typed_implementations) = match typed_backend {
-        Some((layouts, signatures, implementations)) => {
-            (Some(layouts), Some(signatures), Some(implementations))
-        }
-        None => (None, None, None),
-    };
-    let (structs, enums, traits) = if let Some(layouts) = typed_layouts {
-        layouts
-    } else {
-        let structs = collect_struct_layouts(statements)?;
-        let enums = collect_enum_layouts(statements, &structs)?;
-        let traits = collect_trait_layouts(statements, &structs, &enums)?;
-        (structs, enums, traits)
-    };
     let mut signatures = HashMap::<String, FunctionSignature>::new();
     let mut functions = Vec::<FunctionPlan>::new();
     let mut trait_vtables = HashMap::<String, String>::new();
@@ -1492,7 +1230,7 @@ pub fn compile_to_llvm_ir(program: &impl CodegenInput) -> Result<String, String>
                     },
                 );
             }
-            Node::EOI => {}
+            Node::End => {}
             Node::TraitDeclaration { .. }
             | Node::ShapeDeclaration { .. }
             | Node::ImplDeclaration { .. } => {}
@@ -1565,50 +1303,13 @@ pub fn compile_to_llvm_ir(program: &impl CodegenInput) -> Result<String, String>
         }
     }
 
-    if let Some(typed_signatures) = typed_signatures {
-        signatures = typed_signatures;
-    }
+    signatures = typed_signatures;
 
     if !signatures.contains_key("main") {
         return Err("LLVM backend currently requires `function main(): ... {}`".to_string());
     }
 
-    let implementations = if let Some(implementations) = typed_implementations {
-        implementations
-    } else {
-        let mut implementations = Vec::new();
-        for statement in statements {
-            let Node::ImplDeclaration {
-                generic_params,
-                trait_types,
-                target_type,
-                ..
-            } = statement
-            else {
-                continue;
-            };
-            if !generic_params.is_empty() {
-                continue;
-            }
-            let Type::Custom(target_name) = target_type else {
-                return Err(format!(
-                    "runtime trait values currently require concrete nominal impl targets, found `{}`",
-                    ast::type_to_string(target_type)
-                ));
-            };
-            for trait_type in trait_types {
-                let Type::Custom(trait_name) = trait_type else {
-                    return Err(format!(
-                        "LLVM backend requires a concrete trait implementation, found `{}`",
-                        ast::type_to_string(trait_type)
-                    ));
-                };
-                implementations.push((trait_name.clone(), target_name.clone()));
-            }
-        }
-        implementations
-    };
-    for (trait_name, target_name) in implementations {
+    for (trait_name, target_name) in typed_implementations {
         add_trait_vtable(
             &trait_name,
             &target_name,
@@ -1681,7 +1382,9 @@ pub fn compile_to_llvm_ir(program: &impl CodegenInput) -> Result<String, String>
         function_irs.push(function_ir);
     }
 
-    let main_signature = signatures.get("main").expect("validated above");
+    let main_signature = signatures
+        .get("main")
+        .ok_or_else(|| "LLVM backend requires a `main` function".to_string())?;
     if !main_signature.parameters.is_empty() {
         return Err("LLVM backend requires `main` to take no parameters".to_string());
     }

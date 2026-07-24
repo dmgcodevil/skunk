@@ -58,9 +58,9 @@ pub enum TopLevelKind {
     Shape(ShapeDecl),
     Attach(AttachDecl),
     Conformance(ConformanceDecl),
-    /// Temporary compatibility form for a conformance whose methods were
-    /// already merged by the legacy parser. Direct syntax parsing produces a
-    /// `Conformance` instead; this variant disappears with the legacy bridge.
+    /// Normalized conformance record. Source `Conformance` declarations keep
+    /// their methods until syntax normalization merges those methods into the
+    /// target nominal declaration.
     Implementation(ImplementationDecl),
     Function(FunctionDecl),
     ExternFunction(ExternFunctionDecl),
@@ -86,9 +86,8 @@ pub struct StructDecl {
     pub name: Identifier,
     pub generic_parameters: Vec<GenericParameter>,
     pub fields: Vec<StructField>,
-    /// Methods may originate from source `attach` blocks after the temporary
-    /// legacy compatibility conversion. The direct parser keeps `attach`
-    /// declarations separate.
+    /// Methods originate from source `attach` and `conform` blocks after
+    /// source-level normalization.
     pub methods: Vec<FunctionDecl>,
 }
 

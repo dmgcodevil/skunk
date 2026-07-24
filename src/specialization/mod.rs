@@ -1,16 +1,20 @@
 //! Verifies and records the concrete program produced by generic expansion.
 //!
-//! Generic discovery currently happens before HIR while the compatibility
-//! specializer is retained. This phase is the stable post-HIR contract: every
-//! runtime declaration and local type must be concrete before code generation.
+//! Generic discovery happens before HIR. This phase is the stable post-HIR
+//! contract: every runtime declaration and local type must be concrete before
+//! code generation.
 
+use crate::analysis::model::SemanticModel;
+use crate::analysis::types::TypeKind;
 use crate::diagnostic::Diagnostic;
 use crate::hir;
 use crate::ids::{DefId, TypeId};
-use crate::semantic_types::TypeKind;
-use crate::semantics::SemanticModel;
 use crate::source_map::Span;
 use std::collections::HashSet;
+
+pub(crate) mod convert;
+pub(crate) mod expand;
+pub(crate) mod tree;
 
 #[derive(Debug)]
 pub struct SpecializationSet {
@@ -26,7 +30,7 @@ pub fn seal(
         .items
         .first()
         .map(|item| item.span)
-        .unwrap_or_else(|| Span::new(crate::ids::FileId::new(0), 0, 0).unwrap());
+        .unwrap_or_else(|| Span::empty(crate::ids::FileId::new(0)));
     let mut definitions = Vec::new();
     let mut roots = Vec::new();
 
@@ -166,16 +170,14 @@ impl ConcreteTypeChecker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::FileId;
 
     #[test]
     fn accepts_a_concrete_runtime_surface() {
         let source = "function id(value: int): int { return value; }";
-        let legacy = crate::ast::try_parse(source).unwrap();
-        let module = crate::syntax::from_legacy(&legacy, FileId::new(0), source.len()).unwrap();
-        let resolutions = crate::resolver::resolve(&module).unwrap();
-        let mut model = crate::semantics::analyze_declarations(&module, resolutions).unwrap();
-        let hir = crate::hir_lowering::lower(&module, &mut model).unwrap();
+        let module = crate::syntax::parser::parse_test_module(source);
+        let resolutions = crate::analysis::resolver::resolve(&module).unwrap();
+        let mut model = crate::analysis::model::analyze_declarations(&module, resolutions).unwrap();
+        let hir = crate::hir::lower::lower(&module, &mut model).unwrap();
 
         let specializations = seal(&hir, &model).unwrap();
         assert!(!specializations.definitions.is_empty());

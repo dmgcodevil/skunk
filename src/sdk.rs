@@ -6,7 +6,7 @@
 //! is reserved: `import std.math;` always resolves into the SDK, never into
 //! project files.
 
-use crate::compiler::{skunk_home, write_if_changed};
+use crate::backend::{skunk_home, write_if_changed};
 use std::fs;
 use std::path::PathBuf;
 

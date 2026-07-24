@@ -166,7 +166,10 @@ impl<'a> FunctionCompiler<'a> {
                     method_name
                 ));
             }
-            let (trait_index, trait_name, method_index, method) = found.pop().unwrap();
+            let (trait_index, trait_name, method_index, method) = found
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("unknown method `{method_name}` on trait intersection"))?;
             let first_args = arguments
                 .first()
                 .ok_or_else(|| "method call is missing its first argument group".to_string())?;

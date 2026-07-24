@@ -4,7 +4,7 @@
 //! not contain resolved declarations, inferred types, or backend-specific data.
 
 pub mod ast;
-mod legacy_bridge;
+pub mod loader;
+pub mod normalize;
 pub mod parser;
-
-pub use legacy_bridge::{from_legacy, to_legacy};
+pub(crate) mod pest;
