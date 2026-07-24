@@ -11,6 +11,7 @@ pub mod hir;
 pub mod ids;
 pub mod intrinsics;
 pub mod manifest;
+pub mod mir;
 pub mod pipeline;
 pub mod sdk;
 pub mod source_map;

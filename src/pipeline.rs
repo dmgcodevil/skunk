@@ -37,6 +37,17 @@ pub fn check_loaded(program: syntax::loader::LoadedProgram) -> Result<CheckedPro
     check_syntax(program.module, Some(program.sources))
 }
 
+/// Lowers a checked program into typed MIR and verifies its backend-facing
+/// invariants. MIR is additive while the existing LLVM backend is migrated;
+/// calling this function does not change native compilation behavior.
+pub fn lower_to_mir(program: &CheckedProgram) -> Result<crate::mir::Module, String> {
+    let mir = crate::mir::lower::lower(&program.hir, &program.semantics)
+        .map_err(|diagnostics| render_diagnostics(diagnostics, program.sources.as_ref()))?;
+    crate::mir::validate::validate(&mir, &program.semantics)
+        .map_err(|diagnostics| render_diagnostics(diagnostics, program.sources.as_ref()))?;
+    Ok(mir)
+}
+
 fn check_syntax(
     module: syntax::ast::Module,
     sources: Option<SourceMap>,

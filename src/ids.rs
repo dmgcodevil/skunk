@@ -27,6 +27,8 @@ define_id!(LocalId);
 define_id!(TypeId);
 define_id!(FieldId);
 define_id!(VariantId);
+define_id!(MirLocalId);
+define_id!(MirBlockId);
 
 /// Identity of a syntax node within a compilation.
 ///
