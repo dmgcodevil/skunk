@@ -26,10 +26,9 @@ Here is the shortest useful mental model:
 
 ```text
 source files
-  -> one merged program
-  -> parsed AST
-  -> prepared / monomorphized program
-  -> type-checked program
+  -> one source-oriented syntax module
+  -> normalized / specialized syntax
+  -> resolved and typed HIR
   -> LLVM IR
   -> native binary
 ```
@@ -37,10 +36,10 @@ source files
 ### Read next
 
 - [`src/main.rs`](../src/main.rs): `parse_cli`, `default_output_path`, `main`
-- [`src/source.rs`](../src/source.rs): `load_program`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `prepare_program`
-- [`src/type_checker.rs`](../src/type_checker.rs): `check`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_executable`, `compile_to_llvm_ir`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `load_program`
+- [`src/pipeline.rs`](../src/pipeline.rs): `check_source`, `check_loaded`
+- [`src/hir/lower.rs`](../src/hir/lower.rs): `lower`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_executable`, `compile_to_llvm_ir`
 
 ## Chapter 2: `main.rs` Is The Pipeline Coordinator
 
@@ -52,9 +51,9 @@ The important thing to notice is the order:
 
 1. Parse the CLI
 2. Load the program
-3. Prepare the program
-4. Type-check the program
-5. Compile it, then either run it or keep the executable
+3. Ask `pipeline` to normalize, specialize, resolve, type, and validate it
+4. Give the resulting `CheckedProgram` to the backend
+5. Either run the executable or keep it
 
 That order tells you what the rest of the repository expects. For example, the compiler backend assumes it receives a program that has already been loaded, normalized, and checked.
 
@@ -65,8 +64,9 @@ Big functions at the top of a compiler often tell you more about architecture th
 ### Read next
 
 - [`src/main.rs`](../src/main.rs): `main`
-- [`src/source.rs`](../src/source.rs): `load_program`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_executable`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `load_program`
+- [`src/pipeline.rs`](../src/pipeline.rs): `check_loaded`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_executable`
 
 ## Chapter 3: Parsing Means "Turn Text Into Structure"
 
@@ -74,51 +74,49 @@ Before the compiler can reason about a program, it needs to stop seeing the prog
 
 That happens in two layers.
 
-The first layer is the grammar in [`src/grammar.pest`](../src/grammar.pest). This file describes what valid Skunk source looks like.
+The first layer is the grammar in [`src/syntax/grammar.pest`](../src/syntax/grammar.pest). This file describes what valid Skunk source looks like.
 
-The second layer is AST construction in [`src/ast.rs`](../src/ast.rs). This file turns parsed grammar pieces into the compiler's own tree representation.
+The second layer is direct AST construction in [`src/syntax/parser.rs`](../src/syntax/parser.rs). Pest's generated `Rule` and `Pair` values stay inside this module; successful parsing produces the source-level structures declared in [`src/syntax/ast.rs`](../src/syntax/ast.rs).
 
 The main idea is simple:
 
 - the grammar recognizes source forms
-- the AST gives those forms names the compiler can work with
+- the syntax AST gives those forms names, stable node identities, and source spans
 
-For example, the compiler does not want to keep asking, "is this sequence of characters a struct initialization?" It wants a node like `Node::StructInitialization`.
+For example, the compiler does not want to keep asking, "is this sequence of characters a struct initialization?" It wants an `ExprKind::StructInit` expression.
 
 That is why ASTs matter. They replace text with structure.
 
 ### Read next
 
-- [`src/grammar.pest`](../src/grammar.pest)
-- [`src/ast.rs`](../src/ast.rs): `PestImpl::parse`, `create_ast`, `create_primary`, `create_access`, `create_struct_init`, `parse`
+- [`src/syntax/grammar.pest`](../src/syntax/grammar.pest)
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs): `parse_module`, `DirectParser::expression`, `DirectParser::primary`, `DirectParser::access`, `DirectParser::struct_init`
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs): `Module`, `TopLevelKind`, `StmtKind`, `ExprKind`, `TypeKind`
 
-## Chapter 4: The AST Is The Shared Language Of The Compiler
+## Chapter 4: AST And HIR Have Different Jobs
 
-The `Node` enum in [`src/ast.rs`](../src/ast.rs) is the compiler's common vocabulary.
+The syntax AST records what the programmer wrote. It contains names and spans, but no inferred semantic types or resolved declaration identities.
 
-Many parts of the compiler talk in terms of `Node` and `Type`, including:
+Typed HIR in [`src/hir/mod.rs`](../src/hir/mod.rs) records what the program means after resolution. It uses `DefId`, `LocalId`, `FieldId`, `VariantId`, and interned `TypeId` values instead of unresolved source names.
 
-- the parser
-- the source loader
-- the monomorphizer
-- the type checker
-- the LLVM backend
+Keeping the representations separate prevents backend details from leaking into syntax and prevents parser assumptions from becoming semantic invariants. The stable handoff is `pipeline::CheckedProgram`; the LLVM backend does not accept raw syntax nodes.
 
-This is powerful because it keeps the project easy to extend. A new language feature can often be added by introducing new AST cases and teaching a few later stages how to handle them.
+This makes a feature slightly more explicit to implement: syntax, resolution/type analysis, HIR lowering, and code generation each handle only the information appropriate to that phase.
 
-It also means the AST stays important for a long time. Skunk does not yet have a large stack of middle IR layers between the front end and LLVM.
-
-That is why understanding `Node` and `Type` pays off quickly. They are everywhere.
+That separation is intentional compiler architecture, not duplicated models of the same stage.
 
 ### Read next
 
-- [`src/ast.rs`](../src/ast.rs): `Node`, `Type`, `TraitMethodSignature`, `MatchPattern`, `type_to_string`
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs): source-level declarations, statements, expressions, and types
+- [`src/analysis/resolver.rs`](../src/analysis/resolver.rs): resolved identities
+- [`src/analysis/types.rs`](../src/analysis/types.rs): `TypeStore`, `TypeKind`
+- [`src/hir/mod.rs`](../src/hir/mod.rs): typed high-level IR
 
 ## Chapter 5: Loading Modules Is A Real Compiler Pass
 
 New compiler readers sometimes think the "real" compiler starts only after parsing. In practice, loading source files is already compiler work.
 
-That logic lives in [`src/source.rs`](../src/source.rs).
+That logic lives in [`src/syntax/loader.rs`](../src/syntax/loader.rs).
 
 `load_program` does more than read a single file. It:
 
@@ -127,25 +125,25 @@ That logic lives in [`src/source.rs`](../src/source.rs).
 - detects cyclic imports
 - checks module names
 - normalizes visibility and private names
-- returns one merged `Node::Program`
+- returns one merged syntax `Module` plus its `SourceMap`
 
 This is a very important simplification for later stages. Instead of every later pass needing to think about a graph of files, most of the pipeline gets to think about one program tree.
 
-The other important piece in this file is `ModuleNormalizer`. It rewrites private names from imported modules so they do not collide later.
+The other important piece in this file is `ModuleRenamer`. It rewrites private names from imported modules so they do not collide later.
 
 That means `source.rs` is where "many source files" becomes "one safe program to analyze."
 
 ### Read next
 
-- [`src/source.rs`](../src/source.rs): `load_program`
-- [`src/source.rs`](../src/source.rs): `ProgramLoader::load_file`, `ProgramLoader::module_path`
-- [`src/source.rs`](../src/source.rs): `ModuleNormalizer::new`, `ModuleNormalizer::normalize`, `rename_top_level`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `load_program`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `ProgramLoader::load_file`, `ProgramLoader::module_path`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `ModuleRenamer::new`, `ModuleRenamer::rename`
 
 ## Chapter 6: Monomorphization Makes Generics Concrete
 
 Generics are nice for programmers, but low-level code generation usually wants concrete types.
 
-That is why Skunk has a monomorphization pass in [`src/monomorphize.rs`](../src/monomorphize.rs).
+That is why Skunk has a monomorphization pass in [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs).
 
 The job of the monomorphizer is to take a program that still contains generic templates and produce the concrete versions that the rest of the pipeline needs.
 
@@ -155,19 +153,19 @@ A generic declaration is like a recipe.
 
 A monomorphized declaration is like the actual finished dish for one concrete set of type arguments.
 
-Inside `monomorphize.rs` you will see template-like internal structures for functions, structs, enums, traits, shapes, and impls. That is because the pass first collects abstract definitions, then decides which concrete instances need to exist.
+Inside `specialization/expand` you will see template-like internal structures for functions, structs, enums, traits, shapes, and impls. The pass first collects abstract definitions, then decides which concrete instances need to exist.
 
 This is one of the biggest "pipeline cleanup" stages in the compiler. It reduces later complexity by making the program more concrete before checking and code generation.
 
 ### Read next
 
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `prepare_program`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `Monomorphizer::new`, `Monomorphizer::prepare`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `apply_substitutions`, `specialized_struct_name`, `specialized_function_name`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `prepare_program`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `Monomorphizer::new`, `Monomorphizer::prepare`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `apply_substitutions`, `specialized_struct_name`, `specialized_function_name`
 
 ## Chapter 7: The Type Checker Is The Semantic Referee
 
-The type checker lives in [`src/type_checker.rs`](../src/type_checker.rs).
+The type checker lives in [`src/analysis/check.rs`](../src/analysis/check.rs).
 
 If the parser answers "What is written?", the type checker answers:
 
@@ -189,9 +187,9 @@ Type checking is not only about labels on variables. It is about proving that op
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): `check`
-- [`src/type_checker.rs`](../src/type_checker.rs): `resolve_type`, `resolve_access`, `is_assignable`
-- [`src/type_checker.rs`](../src/type_checker.rs): `GlobalScope`, `SymbolTables`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `check`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `resolve_type`, `resolve_access`, `is_assignable`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `GlobalScope`, `SymbolTables`
 
 ## Chapter 8: Global Scope And Local Scope Are Different Problems
 
@@ -218,8 +216,8 @@ This is worth understanding early because many compiler bugs happen when a syste
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): `GlobalScope::new`, `GlobalScope::add`
-- [`src/type_checker.rs`](../src/type_checker.rs): `SymbolTable`, `SymbolTables`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `GlobalScope::new`, `GlobalScope::add`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `SymbolTable`, `SymbolTables`
 
 ## Chapter 9: Access Resolution Is Where Many Language Rules Meet
 
@@ -241,12 +239,12 @@ So if you want to understand why the language feels the way it does to the user,
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): `resolve_access`
-- [`src/ast.rs`](../src/ast.rs): `create_access`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `resolve_access`
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs): `access`, `access_step`
 
 ## Chapter 10: The LLVM Backend Has Its Own Vocabulary
 
-The backend lives in [`src/compiler.rs`](../src/compiler.rs).
+The backend lives in [`src/backend/mod.rs`](../src/backend/mod.rs).
 
 This file is where the compiler shifts from language-level concepts to lower-level representation.
 
@@ -269,8 +267,8 @@ At the backend, the program is increasingly about memory layout, calling convent
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `LlvmType`, `llvm_type`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_llvm_ir`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `LlvmType`, `llvm_type`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_llvm_ir`
 
 ## Chapter 11: Layouts Turn Language Features Into Memory Shapes
 
@@ -296,8 +294,8 @@ Without layouts, the compiler might know that a struct exists, but it would not 
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `StructLayout`, `EnumLayout`, `TraitLayout`, `TraitMethodLayout`
-- [`src/compiler.rs`](../src/compiler.rs): `collect_struct_layouts`, `collect_enum_layouts`, `collect_trait_layouts`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `StructLayout`, `EnumLayout`, `TraitLayout`, `TraitMethodLayout`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `collect_typed_layouts`
 
 ## Chapter 12: Trait Objects Need Both Static Proof And Runtime Data
 
@@ -322,9 +320,9 @@ Traits are whole-pipeline features.
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): trait-related parts of `GlobalScope::add`, `is_assignable`
-- [`src/compiler.rs`](../src/compiler.rs): `collect_trait_layouts`
-- [`src/compiler.rs`](../src/compiler.rs): places that construct or coerce trait objects, especially `coerce_expr`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): trait-related parts of `GlobalScope::add`, `is_assignable`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `collect_typed_layouts`
+- [`src/backend/coercion.rs`](../src/backend/coercion.rs): places that construct or coerce trait objects, especially `coerce_expr`
 
 ## Chapter 13: Emitting LLVM IR Is Still Just Another Transformation
 
@@ -344,7 +342,7 @@ This means the final binary is a collaboration between:
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_llvm_ir`, `compile_to_executable`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_llvm_ir`, `compile_to_executable`
 - [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 - [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
 
@@ -356,7 +354,7 @@ Keeping one path means language semantics, command-line execution, and compiler 
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): native runtime tests
+- [`src/backend/mod.rs`](../src/backend/mod.rs): native runtime tests
 - [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 
 ## Chapter 15: How To Read The Codebase Without Drowning
@@ -384,9 +382,9 @@ That question is a much better guide than trying to "understand compilers in gen
 ### Read next
 
 - [`src/main.rs`](../src/main.rs)
-- [`src/ast.rs`](../src/ast.rs)
-- [`src/type_checker.rs`](../src/type_checker.rs)
-- [`src/compiler.rs`](../src/compiler.rs)
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs)
+- [`src/analysis/check.rs`](../src/analysis/check.rs)
+- [`src/backend/mod.rs`](../src/backend/mod.rs)
 
 ## Chapter 16: A Good Reading Order
 
@@ -395,15 +393,15 @@ Here is the reading order I recommend for this repository.
 First pass:
 
 1. [`src/main.rs`](../src/main.rs)
-2. [`src/source.rs`](../src/source.rs)
-3. [`src/ast.rs`](../src/ast.rs)
-4. [`src/type_checker.rs`](../src/type_checker.rs)
-5. [`src/compiler.rs`](../src/compiler.rs)
+2. [`src/syntax/loader.rs`](../src/syntax/loader.rs)
+3. [`src/syntax/ast.rs`](../src/syntax/ast.rs)
+4. [`src/analysis/check.rs`](../src/analysis/check.rs)
+5. [`src/backend/mod.rs`](../src/backend/mod.rs)
 
 Second pass:
 
-1. [`src/grammar.pest`](../src/grammar.pest)
-2. [`src/monomorphize.rs`](../src/monomorphize.rs)
+1. [`src/syntax/grammar.pest`](../src/syntax/grammar.pest)
+2. [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs)
 3. [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 4. [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
 
@@ -427,7 +425,7 @@ It helps to see that the mechanism is already in place. When the backend lowers
 a builtin, it emits an LLVM `declare` for the runtime symbol and a plain `call`.
 `clang` then compiles the generated `.ll` file together with the runtime C
 sources (see `compile_to_executable` in
-[`src/compiler.rs`](../src/compiler.rs)), and the system linker resolves the
+[`src/backend/mod.rs`](../src/backend/mod.rs)), and the system linker resolves the
 symbol. There is no FFI layer, no marshalling, no hidden cost: a call into C is
 an ordinary native call.
 
@@ -471,7 +469,7 @@ will be built on top of it and it cannot change afterwards:
 | `void`   | `void`     | `void`   |
 
 These follow the existing lowerings in `llvm_type` in
-[`src/compiler.rs`](../src/compiler.rs) (`Type::Int` is already `i32`,
+[`src/backend/mod.rs`](../src/backend/mod.rs) (`Type::Int` is already `i32`,
 `Type::Byte` is `i8`, and so on), so extern calls reuse the exact
 representations the backend produces everywhere else.
 
@@ -517,7 +515,7 @@ These map directly onto arguments appended to the existing `clang` invocation.
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_executable`, where the
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_executable`, where the
   clang invocation lives
 - [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c): the C side of the
   existing runtime linkage

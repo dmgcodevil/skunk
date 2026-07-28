@@ -900,7 +900,25 @@ pub fn compile_to_executable_with_options(
     output_path: &Path,
     options: &BuildOptions,
 ) -> Result<CompiledArtifact, String> {
-    let llvm_ir = compile_to_llvm_ir(program)?;
+    let mut logger = crate::pipeline::CompilerLogger::disabled();
+    compile_to_executable_with_options_and_logger(
+        program,
+        source_path,
+        output_path,
+        options,
+        &mut logger,
+    )
+}
+
+/// Compiles a checked program while reporting MIR and LLVM IR to `logger`.
+pub fn compile_to_executable_with_options_and_logger(
+    program: &crate::pipeline::CheckedProgram,
+    source_path: &Path,
+    output_path: &Path,
+    options: &BuildOptions,
+    logger: &mut crate::pipeline::CompilerLogger,
+) -> Result<CompiledArtifact, String> {
+    let llvm_ir = compile_to_llvm_ir_with_logger(program, logger)?;
     let llvm_ir_path = output_path.with_extension("ll");
     fs::write(&llvm_ir_path, llvm_ir).map_err(|err| {
         format!(
@@ -966,8 +984,17 @@ pub fn compile_to_executable_with_options(
 /// Lowers a checked Skunk program into textual LLVM IR without invoking the
 /// system linker.
 pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<String, String> {
+    let mut logger = crate::pipeline::CompilerLogger::disabled();
+    compile_to_llvm_ir_with_logger(program, &mut logger)
+}
+
+/// Lowers a checked Skunk program to LLVM IR while reporting MIR and LLVM IR.
+pub fn compile_to_llvm_ir_with_logger(
+    program: &crate::pipeline::CheckedProgram,
+    logger: &mut crate::pipeline::CompilerLogger,
+) -> Result<String, String> {
     let semantic_model = &program.semantics;
-    let mir = crate::pipeline::lower_to_mir(program)?;
+    let mir = crate::pipeline::lower_to_mir_with_logger(program, logger)?;
     let (structs, enums, traits) = collect_typed_layouts(&mir, &program.semantics)?;
     let signatures = collect_typed_signatures(&mir, &program.semantics)?;
     let typed_implementations = collect_typed_implementations(&mir, &program.semantics)?;
@@ -1368,5 +1395,6 @@ pub fn compile_to_llvm_ir(program: &crate::pipeline::CheckedProgram) -> Result<S
     let _ = write!(ir, "{}", c_main_body);
     let _ = writeln!(ir, "}}");
 
+    logger.text("LLVM lowering", "LLVM IR", &ir);
     Ok(ir)
 }

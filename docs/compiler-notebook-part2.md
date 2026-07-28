@@ -46,9 +46,10 @@ That is enough to exercise most of the major compiler stages in a readable way.
 
 ### Read next
 
-- [`src/ast.rs`](../src/ast.rs): `create_struct_init`, `create_access`
-- [`src/type_checker.rs`](../src/type_checker.rs): `resolve_access`, `resolve_type`
-- [`src/compiler.rs`](../src/compiler.rs): `collect_struct_layouts`, `compile_struct_literal`, `compile_expr_with_expected`
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs): `struct_init`, `access`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `resolve_access`, `resolve_type`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `collect_typed_layouts`
+- [`src/backend/lowering.rs`](../src/backend/lowering.rs): `compile_struct_literal`, `compile_expr_with_expected`
 
 ## Chapter 2: The Pipeline Diagram
 
@@ -61,7 +62,7 @@ source text
 grammar + parser
   |
   v
-AST (Node::Program)
+syntax AST (`syntax::Module`)
   |
   v
 source loading / normalization
@@ -70,7 +71,10 @@ source loading / normalization
 monomorphization / preparation
   |
   v
-type checking
+resolution + semantic types
+  |
+  v
+typed HIR + validation
   |
   v
 LLVM layout collection
@@ -90,9 +94,10 @@ For this tiny program, some stages do only a little work. That is fine. One of t
 ### Read next
 
 - [`src/main.rs`](../src/main.rs): `main`
-- [`src/source.rs`](../src/source.rs): `load_program`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `prepare_program`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_llvm_ir`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `load_program`
+- [`src/pipeline.rs`](../src/pipeline.rs): `check_loaded`
+- [`src/hir/lower.rs`](../src/hir/lower.rs): `lower`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_llvm_ir`
 
 ## Chapter 3: Parsing The Program
 
@@ -101,13 +106,13 @@ The parser sees a string of characters and turns it into a tree.
 For our example, the rough AST shape looks like this:
 
 ```text
-Program
-  StructDeclaration("Point")
+Module
+  TopLevel::Struct("Point")
     fields:
       x: int
       y: int
-  AttachDeclaration(target = Point)
-    FunctionDeclaration("sum")
+  TopLevel::Attach(target = Point)
+    FunctionDecl("sum")
       body:
         Return(
           BinaryOp(
@@ -116,7 +121,7 @@ Program
             MemberAccess(self.y)
           )
         )
-  FunctionDeclaration("main")
+  TopLevel::Function("main")
     body:
       VariableDeclaration("p", Point, StructInitialization(Point))
       Return(
@@ -127,7 +132,7 @@ Program
       )
 ```
 
-This tree is not a perfect printout of the real `Node` values, but it is a good mental approximation.
+This tree is not a perfect printout of the Rust structs and enums, but it is a good mental approximation.
 
 The two parser ideas to focus on are:
 
@@ -138,9 +143,9 @@ That is why `self.x + self.y` becomes a binary operation over two access express
 
 ### Read next
 
-- [`src/ast.rs`](../src/ast.rs): `PestImpl::parse`
-- [`src/ast.rs`](../src/ast.rs): `create_ast`
-- [`src/ast.rs`](../src/ast.rs): `create_primary`, `create_access`, `create_struct_init`
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs): `parse_module`, `DirectParser::expression`
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs): `DirectParser::primary`, `DirectParser::access`, `DirectParser::struct_init`
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs): `TopLevelKind`, `StmtKind`, `ExprKind`
 
 ## Chapter 4: Source Loading And Normalization
 
@@ -148,7 +153,7 @@ This example has no imports, so `source::load_program` has a quiet job here.
 
 It still matters, though.
 
-Even in this simple case, the source loader gives later stages one consistent `Node::Program` root. In bigger programs it would also resolve imports, detect cycles, and normalize private names.
+Even in this simple case, the source loader gives later stages one consistent syntax `Module` plus its `SourceMap`. In bigger programs it also resolves imports, detects cycles, and normalizes private names.
 
 One useful lesson here is that some passes are more visible on larger programs. That does not make them unimportant.
 
@@ -156,9 +161,9 @@ The source loader is still a foundational stage because every later pass depends
 
 ### Read next
 
-- [`src/source.rs`](../src/source.rs): `load_program`
-- [`src/source.rs`](../src/source.rs): `ProgramLoader::load_file`
-- [`src/source.rs`](../src/source.rs): `ModuleNormalizer::normalize`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `load_program`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `ProgramLoader::load_file`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `ModuleRenamer::rename`
 
 ## Chapter 5: Monomorphization On A Non-Generic Program
 
@@ -174,8 +179,8 @@ That is one reason learning with a simple example helps. You can see which stage
 
 ### Read next
 
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `prepare_program`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `Monomorphizer::new`, `Monomorphizer::prepare`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `prepare_program`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `Monomorphizer::new`, `Monomorphizer::prepare`
 
 ## Chapter 6: Type Checking The Struct And The Method
 
@@ -204,10 +209,10 @@ The important thing to feel here is that the type checker is not simply reading 
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): `check`
-- [`src/type_checker.rs`](../src/type_checker.rs): `resolve_type`
-- [`src/type_checker.rs`](../src/type_checker.rs): `resolve_access`
-- [`src/type_checker.rs`](../src/type_checker.rs): `is_assignable`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `check`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `resolve_type`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `resolve_access`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `is_assignable`
 
 ## Chapter 7: What The Type Checker Knows At This Point
 
@@ -228,8 +233,8 @@ That validated meaning is what the backend will rely on.
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): `GlobalScope::add`
-- [`src/type_checker.rs`](../src/type_checker.rs): `SymbolTables`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `GlobalScope::add`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `SymbolTables`
 
 ## Chapter 8: Building Layouts For The Backend
 
@@ -253,10 +258,9 @@ For this small program there are no enums and no trait objects, so `EnumLayout` 
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `LlvmType`
-- [`src/compiler.rs`](../src/compiler.rs): `llvm_type`
-- [`src/compiler.rs`](../src/compiler.rs): `collect_struct_layouts`
-- [`src/compiler.rs`](../src/compiler.rs): `collect_enum_layouts`, `collect_trait_layouts`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `LlvmType`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `llvm_type`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `collect_typed_layouts`
 
 ## Chapter 9: Lowering Expressions Into LLVM IR
 
@@ -283,10 +287,8 @@ This is where the backend starts to feel operational. It is no longer asking wha
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `compile_statement`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_expr_with_expected`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_struct_literal`
-- [`src/compiler.rs`](../src/compiler.rs): `coerce_expr`
+- [`src/backend/lowering.rs`](../src/backend/lowering.rs): `compile_statement`, `compile_expr_with_expected`, `compile_struct_literal`
+- [`src/backend/coercion.rs`](../src/backend/coercion.rs): `coerce_expr`
 
 ## Chapter 10: A Tiny Mental Model Of The Emitted IR
 
@@ -312,7 +314,7 @@ A very good beginner exercise is to compile this kind of tiny example, open the 
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_llvm_ir`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_llvm_ir`
 
 ## Chapter 11: Linking With Runtime Support
 
@@ -334,7 +336,7 @@ Compilers often rely on runtimes and system toolchains. That is normal. It is no
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_executable`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_executable`
 - [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 - [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
 
@@ -343,23 +345,23 @@ Compilers often rely on runtimes and system toolchains. That is normal. It is no
 If you want one page to keep in your head while reading code, use this:
 
 ```text
-main.rs
-  Coordinates the pipeline
+syntax/{grammar,parser,ast,loader}.rs
+  Parses and merges source-oriented modules
 
-source.rs
-  Turns many files into one program
-
-ast.rs
-  Turns syntax into compiler nodes
-
-monomorphize.rs
+specialization/expand/
   Makes generic definitions concrete when needed
 
-type_checker.rs
-  Proves the program is semantically legal
+analysis/{resolver,model,types}.rs
+  Resolves identities and interns semantic types
 
-compiler.rs
-  Turns the checked program into LLVM IR and a native binary
+hir/{mod,lower,validate}.rs
+  Builds and validates typed high-level IR
+
+pipeline.rs
+  Owns phase ordering and returns `CheckedProgram`
+
+backend/
+  Turns checked HIR into LLVM IR and a native binary
 
 runtime/*.c / *.m
   Provide support code the compiled program can call

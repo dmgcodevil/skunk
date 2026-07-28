@@ -6,8 +6,8 @@ This document captures the current working agreement for Skunk development.
 
 Skunk language behavior should be derived from these sources:
 
-1. [`src/grammar.pest`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/grammar.pest) for syntax
-2. Parser, type-checker, and native compiler tests in [`src/ast.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/ast.rs), [`src/type_checker.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/type_checker.rs), and [`src/compiler.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/compiler.rs) for executable behavior
+1. [`src/syntax/grammar.pest`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/syntax/grammar.pest) and [`src/syntax/parser.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/syntax/parser.rs) for syntax
+2. Semantic and native compiler tests in [`src/analysis/check.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/analysis/check.rs) and [`src/backend/tests.rs`](/Users/dmgcodevil/dev/skunk-llvm/skunk/src/backend/tests.rs) for executable behavior
 3. [`README.md`](/Users/dmgcodevil/dev/skunk-llvm/skunk/README.md) for language-facing examples and intent
 4. Focused design notes in [`docs/`](/Users/dmgcodevil/dev/skunk-llvm/skunk/docs) for agreed future language directions such as pointers and allocators
 

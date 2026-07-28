@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "Usage: skunk <file_path>\n       skunk run <file_path>\n       skunk compile <file_path> [output_path]\n       skunk test [file_path] [--filter <substring>]\n       skunk build\n       skunk new <project_name>\n       skunk --version\n       skunk versions\n       skunk use <version>";
+const USAGE: &str = "Usage: skunk [--debug] <file_path>\n       skunk [--debug] run <file_path>\n       skunk [--debug] compile <file_path> [output_path]\n       skunk [--debug] test [file_path] [--filter <substring>]\n       skunk [--debug] build\n       skunk new <project_name>\n       skunk --version\n       skunk versions\n       skunk use <version>";
 
 #[derive(Debug, PartialEq)]
 enum CommandKind {
@@ -31,6 +31,44 @@ enum CommandKind {
     Use {
         version: String,
     },
+}
+
+#[derive(Debug, PartialEq)]
+struct ParsedCli {
+    command: CommandKind,
+    debug: bool,
+}
+
+/// Extracts the global debug switch before parsing positional command
+/// arguments. The switch can appear anywhere, matching common CLI behavior.
+fn parse_cli_options(args: &[String]) -> Result<ParsedCli, String> {
+    let debug_count = args
+        .iter()
+        .skip(1)
+        .filter(|arg| arg.as_str() == "--debug")
+        .count();
+    if debug_count > 1 {
+        return Err("--debug may only be specified once".to_string());
+    }
+    let debug = debug_count == 1;
+    let filtered = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--debug")
+        .cloned()
+        .collect::<Vec<_>>();
+    let command = parse_cli(&filtered)?;
+    if debug
+        && !matches!(
+            &command,
+            CommandKind::Run { .. }
+                | CommandKind::Compile { .. }
+                | CommandKind::Test { .. }
+                | CommandKind::Build
+        )
+    {
+        return Err("--debug is only supported by run, compile, test, and build".to_string());
+    }
+    Ok(ParsedCli { command, debug })
 }
 
 /// Parses the command line into a high-level command.
@@ -142,16 +180,25 @@ fn temporary_run_output_path() -> PathBuf {
 }
 
 /// Loads and checks a complete program from disk.
-fn load_and_check(file_path: &Path) -> Result<pipeline::CheckedProgram, String> {
-    pipeline::check_loaded(source::load_program(file_path)?)
+fn load_and_check(
+    file_path: &Path,
+    logger: &mut pipeline::CompilerLogger,
+) -> Result<pipeline::CheckedProgram, String> {
+    pipeline::check_loaded_with_logger(source::load_program(file_path)?, logger)
 }
 
 /// Compiles and executes a program natively, then removes its temporary build artifacts.
 fn run_native(
     program: &pipeline::CheckedProgram,
     source_path: &Path,
+    logger: &mut pipeline::CompilerLogger,
 ) -> Result<ExitStatus, String> {
-    run_native_with_options(program, source_path, &backend::BuildOptions::default())
+    run_native_with_options(
+        program,
+        source_path,
+        &backend::BuildOptions::default(),
+        logger,
+    )
 }
 
 /// Compiles and executes a program with explicit linker and optimization
@@ -160,14 +207,16 @@ fn run_native_with_options(
     program: &pipeline::CheckedProgram,
     source_path: &Path,
     options: &backend::BuildOptions,
+    logger: &mut pipeline::CompilerLogger,
 ) -> Result<ExitStatus, String> {
     let output_path = temporary_run_output_path();
     let llvm_ir_path = output_path.with_extension("ll");
-    let artifact = match backend::compile_to_executable_with_options(
+    let artifact = match backend::compile_to_executable_with_options_and_logger(
         program,
         source_path,
         &output_path,
         options,
+        logger,
     ) {
         Ok(artifact) => artifact,
         Err(err) => {
@@ -230,22 +279,26 @@ fn resolve_test_configuration(
 
 /// Runs `skunk test`: rewrites test declarations into a native runner, builds
 /// it, executes it, and returns its exit status.
-fn run_tests(source: Option<String>, filter: Option<String>) -> Result<ExitStatus, String> {
+fn run_tests(
+    source: Option<String>,
+    filter: Option<String>,
+    logger: &mut pipeline::CompilerLogger,
+) -> Result<ExitStatus, String> {
     let (source_path, options) = resolve_test_configuration(source)?;
     let program = source::load_program(&source_path)?;
     let (test_program, test_count) = testing::build_test_program(program, filter.as_deref())?;
-    let test_program = pipeline::check_loaded(test_program)?;
+    let test_program = pipeline::check_loaded_with_logger(test_program, logger)?;
     println!(
         "running {} test{} from {}\n",
         test_count,
         if test_count == 1 { "" } else { "s" },
         source_path.display()
     );
-    run_native_with_options(&test_program, &source_path, &options)
+    run_native_with_options(&test_program, &source_path, &options, logger)
 }
 
 /// Runs `skunk build`: compiles the manifest entry into `target/<name>`.
-fn run_build() -> Result<PathBuf, String> {
+fn run_build(logger: &mut pipeline::CompilerLogger) -> Result<PathBuf, String> {
     let manifest_path = PathBuf::from(manifest::MANIFEST_FILE);
     if !manifest_path.exists() {
         return Err(format!(
@@ -255,17 +308,18 @@ fn run_build() -> Result<PathBuf, String> {
     }
     let manifest = manifest::load_manifest(&manifest_path)?;
     emit_manifest_warnings(&manifest);
-    let node = load_and_check(&manifest.entry)?;
+    let node = load_and_check(&manifest.entry, logger)?;
     let target_dir = PathBuf::from("target");
     fs::create_dir_all(&target_dir)
         .map_err(|err| format!("failed to create `{}`: {}", target_dir.display(), err))?;
     let output_path = target_dir.join(&manifest.name);
     let options = manifest_build_options(&manifest);
-    let artifact = backend::compile_to_executable_with_options(
+    let artifact = backend::compile_to_executable_with_options_and_logger(
         &node,
         &manifest.entry,
         &output_path,
         &options,
+        logger,
     )?;
     Ok(artifact.binary_path)
 }
@@ -412,25 +466,30 @@ fn main() -> io::Result<()> {
         eprintln!("{}", USAGE);
         std::process::exit(1);
     }
-    let command = match parse_cli(&args) {
+    let parsed = match parse_cli_options(&args) {
         Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("{}", err.red());
             std::process::exit(1);
         }
     };
+    let mut logger = if parsed.debug {
+        pipeline::CompilerLogger::console()
+    } else {
+        pipeline::CompilerLogger::disabled()
+    };
 
-    match command {
+    match parsed.command {
         CommandKind::Run { source } => {
             let source_path = Path::new(&source);
-            let node = match load_and_check(source_path) {
+            let node = match load_and_check(source_path, &mut logger) {
                 Ok(node) => node,
                 Err(err) => {
                     eprintln!("Error: {}", err.red());
                     std::process::exit(1);
                 }
             };
-            match run_native(&node, source_path) {
+            match run_native(&node, source_path, &mut logger) {
                 Ok(status) if status.success() => {}
                 Ok(status) => std::process::exit(status.code().unwrap_or(1)),
                 Err(err) => {
@@ -441,7 +500,7 @@ fn main() -> io::Result<()> {
         }
         CommandKind::Compile { source, output } => {
             let source_path = Path::new(&source);
-            let node = match load_and_check(source_path) {
+            let node = match load_and_check(source_path, &mut logger) {
                 Ok(node) => node,
                 Err(err) => {
                     eprintln!("Error: {}", err.red());
@@ -450,7 +509,13 @@ fn main() -> io::Result<()> {
             };
             let output_path = output.unwrap_or_else(|| default_output_path(source_path));
             let now = Instant::now();
-            match backend::compile_to_executable(&node, source_path, &output_path) {
+            match backend::compile_to_executable_with_options_and_logger(
+                &node,
+                source_path,
+                &output_path,
+                &backend::BuildOptions::default(),
+                &mut logger,
+            ) {
                 Ok(artifact) => {
                     let elapsed = now.elapsed();
                     println!(
@@ -466,14 +531,14 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        CommandKind::Test { source, filter } => match run_tests(source, filter) {
+        CommandKind::Test { source, filter } => match run_tests(source, filter, &mut logger) {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(err) => {
                 eprintln!("Test error: {}", err.red());
                 std::process::exit(1);
             }
         },
-        CommandKind::Build => match run_build() {
+        CommandKind::Build => match run_build(&mut logger) {
             Ok(binary_path) => {
                 println!("Built {}", binary_path.display());
             }
@@ -565,6 +630,40 @@ mod tests {
                 output: Some(PathBuf::from("out")),
             }
         );
+    }
+
+    #[test]
+    fn debug_flag_is_global_for_compiler_commands() {
+        let before_command =
+            parse_cli_options(&args(&["skunk", "--debug", "compile", "main.skunk", "out"]))
+                .unwrap();
+        let after_command =
+            parse_cli_options(&args(&["skunk", "run", "main.skunk", "--debug"])).unwrap();
+
+        assert!(before_command.debug);
+        assert_eq!(
+            before_command.command,
+            CommandKind::Compile {
+                source: "main.skunk".to_string(),
+                output: Some(PathBuf::from("out")),
+            }
+        );
+        assert!(after_command.debug);
+        assert_eq!(
+            after_command.command,
+            CommandKind::Run {
+                source: "main.skunk".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn debug_flag_rejects_duplicates_and_non_compiler_commands() {
+        assert!(parse_cli_options(&args(
+            &["skunk", "--debug", "run", "main.skunk", "--debug",]
+        ))
+        .is_err());
+        assert!(parse_cli_options(&args(&["skunk", "--debug", "--version"])).is_err());
     }
 
     #[test]

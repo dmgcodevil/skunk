@@ -9,7 +9,7 @@ Do not use Skunk to build critical, safety-sensitive, security-sensitive, or hig
 - Native compilation through LLVM/Clang is the primary execution path.
 - Native compilation is the only execution path, keeping runtime behavior aligned with generated binaries.
 - The language reference lives in [Skunk](https://dmgcodevil.github.io/skunk/)
-- Syntax and implemented behavior are defined by [`src/grammar.pest`](src/grammar.pest) and the test suite.
+- Syntax and implemented behavior are defined by [`src/syntax/grammar.pest`](src/syntax/grammar.pest) and the test suite.
 
 ## Install
 
@@ -46,12 +46,14 @@ The compiler is available as a Rust library (`src/lib.rs`) with a thin CLI in
 
 ```text
 Pest parse tree
-  -> syntax AST (source-oriented nodes and spans)
+  -> syntax AST (direct parser actions, source-oriented nodes and spans)
+  -> module loading and source normalization
+  -> generic expansion and source-level validation
   -> lexical resolution (DefId, LocalId, FieldId, VariantId)
   -> semantic type interning (TypeId)
   -> typed HIR
   -> HIR invariant validation and specialization seal
-  -> LLVM layouts/signatures/vtables
+  -> LLVM layouts, signatures, vtables, and function lowering
   -> native LLVM/Clang build
 ```
 
@@ -60,10 +62,9 @@ types, while HIR never contains unresolved identifiers or Pest values. Compiler
 clients can start with `pipeline::check_source`; the returned `CheckedProgram`
 owns HIR, semantic tables, specialization metadata, and its source map.
 
-The generic expander and function-body LLVM emitter still use a compatibility
-tree internally. That boundary is private to `pipeline`/`compiler`; new phases
-must consume syntax AST, semantic types, or HIR instead of adding dependencies
-on the legacy all-purpose `ast::Node`.
+Generic expansion uses a private, phase-specific tree before semantic analysis.
+The LLVM backend accepts only `CheckedProgram` and derives its internal lowering
+state from typed HIR; neither representation is part of the public compiler API.
 
 ## Use
 
@@ -88,6 +89,19 @@ cargo run -- path/to/main.skunk
 # Equivalent explicit form:
 cargo run -- run path/to/main.skunk
 ```
+
+To inspect the compiler pipeline, add the global `--debug` flag to `run`,
+`compile`, `test`, or `build`:
+
+```bash
+cargo run -- --debug compile path/to/main.skunk ./out
+```
+
+Debug logging is written to stderr and prints a labeled, pretty-formatted dump
+after every output-producing phase: loaded and normalized syntax ASTs, name
+resolution, generic specialization, the semantic model, typed HIR, MIR, and
+the final LLVM IR. Normal program output remains on stdout. The flag may also
+appear after the command, for example `skunk run main.skunk --debug`.
 
 ## Projects and Tests
 

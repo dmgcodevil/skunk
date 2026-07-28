@@ -44,8 +44,8 @@ Because beginner features should help you learn the compiler's architecture, not
 ### Read next
 
 - [`src/main.rs`](../src/main.rs)
-- [`src/grammar.pest`](../src/grammar.pest)
-- [`src/ast.rs`](../src/ast.rs)
+- [`src/syntax/grammar.pest`](../src/syntax/grammar.pest)
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs)
 
 ## Chapter 2: Think In Terms Of A Feature Path
 
@@ -69,19 +69,21 @@ feature idea
   -> where does it appear in source?
   -> how is it represented in AST?
   -> what semantic rules validate it?
+  -> how is it represented in typed HIR?
   -> how is it lowered or executed?
   -> what tests prove it works?
 ```
 
 ### Read next
 
-- [`src/ast.rs`](../src/ast.rs): `Node`, `Type`
-- [`src/type_checker.rs`](../src/type_checker.rs): `check`, `resolve_type`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_llvm_ir`
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs): `TopLevelKind`, `StmtKind`, `ExprKind`, `TypeKind`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `check`, `resolve_type`
+- [`src/hir/mod.rs`](../src/hir/mod.rs) and [`src/hir/lower.rs`](../src/hir/lower.rs)
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_llvm_ir`
 
 ## Chapter 3: Stage 1, Syntax
 
-If the feature changes what users can write, the first stop is usually [`src/grammar.pest`](../src/grammar.pest).
+If the feature changes what users can write, the first stop is usually [`src/syntax/grammar.pest`](../src/syntax/grammar.pest).
 
 This is where you decide:
 
@@ -89,15 +91,15 @@ This is where you decide:
 - how ambiguous it might be
 - whether it fits existing patterns
 
-Then the parser in [`src/ast.rs`](../src/ast.rs) needs to turn that syntax into compiler nodes.
+Then [`src/syntax/parser.rs`](../src/syntax/parser.rs) needs to turn that syntax into the source-oriented nodes declared in [`src/syntax/ast.rs`](../src/syntax/ast.rs).
 
 Important parser functions to know:
 
-- `PestImpl::parse`
-- `create_ast`
-- `create_primary`
-- `create_access`
-- `create_struct_init`
+- `parse_module`
+- `DirectParser::expression`
+- `DirectParser::primary`
+- `DirectParser::access`
+- `DirectParser::struct_init`
 
 The parser's job is not to decide whether something is semantically valid. Its job is to build a useful tree.
 
@@ -109,8 +111,8 @@ If the new feature can be desugared into an existing AST form early, do that whe
 
 ### Read next
 
-- [`src/grammar.pest`](../src/grammar.pest)
-- [`src/ast.rs`](../src/ast.rs): `create_ast`, `create_primary`, `create_access`, `create_struct_init`
+- [`src/syntax/grammar.pest`](../src/syntax/grammar.pest)
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs): `expression`, `primary`, `access`, `struct_init`
 
 ## Chapter 4: Stage 2, AST Design
 
@@ -138,14 +140,14 @@ This is one of the most important judgment calls in compiler engineering. Too ma
 
 ### Read next
 
-- [`src/ast.rs`](../src/ast.rs): `Node`
-- [`src/ast.rs`](../src/ast.rs): `Type`
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs): `TopLevelKind`, `StmtKind`, `ExprKind`
+- [`src/syntax/ast.rs`](../src/syntax/ast.rs): `TypeSyntax`, `TypeKind`
 
 ## Chapter 5: Stage 3, Source Loading And Normalization
 
 Many features do not need changes here.
 
-But if the feature affects modules, imports, exports, name visibility, or top-level declaration shapes, you may need to touch [`src/source.rs`](../src/source.rs).
+But if the feature affects modules, imports, exports, name visibility, or top-level declaration shapes, you may need to touch [`src/syntax/loader.rs`](../src/syntax/loader.rs).
 
 Common cases:
 
@@ -161,12 +163,12 @@ Not every feature touches every phase.
 
 ### Read next
 
-- [`src/source.rs`](../src/source.rs): `load_program`
-- [`src/source.rs`](../src/source.rs): `ModuleNormalizer::normalize`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `load_program`
+- [`src/syntax/loader.rs`](../src/syntax/loader.rs): `ModuleRenamer::rename`
 
 ## Chapter 6: Stage 4, Monomorphization
 
-If the feature interacts with generics, you should expect to read [`src/monomorphize.rs`](../src/monomorphize.rs).
+If the feature interacts with generics, you should expect to read [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs).
 
 Questions to ask:
 
@@ -189,9 +191,9 @@ Examples of features that probably do not:
 
 ### Read next
 
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `prepare_program`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `Monomorphizer::prepare`
-- [`src/monomorphize.rs`](../src/monomorphize.rs): `apply_substitutions`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `prepare_program`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `Monomorphizer::prepare`
+- [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs): `apply_substitutions`
 
 ## Chapter 7: Stage 5, Type Checking
 
@@ -220,10 +222,27 @@ When adding a new feature, write down the valid cases and invalid cases before e
 
 ### Read next
 
-- [`src/type_checker.rs`](../src/type_checker.rs): `check`
-- [`src/type_checker.rs`](../src/type_checker.rs): `resolve_type`, `resolve_access`, `is_assignable`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `check`
+- [`src/analysis/check.rs`](../src/analysis/check.rs): `resolve_type`, `resolve_access`, `is_assignable`
 
-## Chapter 8: Stage 6, Code Generation
+## Chapter 8: Stage 6, Typed HIR
+
+After names and types are known, [`src/hir/lower.rs`](../src/hir/lower.rs)
+converts source-oriented syntax into typed HIR. This is where names become
+stable identities and every expression receives a semantic `TypeId`.
+
+If a feature has new semantic behavior, add an explicit HIR form when that
+makes the meaning clearer than preserving source syntax. Update
+[`src/hir/validate.rs`](../src/hir/validate.rs) with invariants that later phases
+must be able to trust.
+
+### Read next
+
+- [`src/hir/mod.rs`](../src/hir/mod.rs): HIR data model
+- [`src/hir/lower.rs`](../src/hir/lower.rs): syntax-to-HIR lowering
+- [`src/hir/validate.rs`](../src/hir/validate.rs): backend-facing invariants
+
+## Chapter 9: Stage 7, Code Generation
 
 Once the type checker understands the feature, the backend may need to lower it into LLVM IR.
 
@@ -247,11 +266,12 @@ This is where language meaning becomes storage and instructions.
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `LlvmType`, `llvm_type`
-- [`src/compiler.rs`](../src/compiler.rs): `collect_struct_layouts`, `collect_enum_layouts`, `collect_trait_layouts`
-- [`src/compiler.rs`](../src/compiler.rs): `compile_statement`, `compile_expr_with_expected`, `compile_struct_literal`, `coerce_expr`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `LlvmType`, `llvm_type`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `collect_typed_layouts`, `compile_to_llvm_ir`
+- [`src/backend/lowering.rs`](../src/backend/lowering.rs): `compile_statement`, `compile_expr_with_expected`, `compile_struct_literal`
+- [`src/backend/coercion.rs`](../src/backend/coercion.rs): `coerce_expr`
 
-## Chapter 9: Stage 7, Runtime Support
+## Chapter 10: Stage 8, Runtime Support
 
 Some features cannot live purely inside the compiler.
 
@@ -272,11 +292,11 @@ When this happens, remember that the feature path is no longer just "parser to b
 
 ### Read next
 
-- [`src/compiler.rs`](../src/compiler.rs): `compile_to_executable`
+- [`src/backend/mod.rs`](../src/backend/mod.rs): `compile_to_executable`
 - [`runtime/skunk_runtime.c`](../runtime/skunk_runtime.c)
 - [`runtime/skunk_window_runtime.m`](../runtime/skunk_window_runtime.m)
 
-## Chapter 10: Tests Are The Feature Contract
+## Chapter 11: Tests Are The Feature Contract
 
 One of the best things about this repository is that tests already act as part of the language contract.
 
@@ -288,11 +308,12 @@ When you add a feature, think in terms of at least three kinds of tests:
 
 Where those usually live:
 
-- parser-oriented tests in [`src/ast.rs`](../src/ast.rs)
-- type-checking tests in [`src/type_checker.rs`](../src/type_checker.rs)
-- codegen/runtime tests in [`src/compiler.rs`](../src/compiler.rs)
-- source-loading tests in [`src/source.rs`](../src/source.rs)
-- monomorphization tests in [`src/monomorphize.rs`](../src/monomorphize.rs)
+- parser-oriented tests in [`src/syntax/parser.rs`](../src/syntax/parser.rs)
+- type-checking tests in [`src/analysis/check.rs`](../src/analysis/check.rs)
+- HIR invariant tests in [`src/hir/`](../src/hir)
+- codegen/runtime tests in [`src/backend/tests.rs`](../src/backend/tests.rs)
+- source-loading tests in [`src/syntax/loader.rs`](../src/syntax/loader.rs)
+- monomorphization tests in [`src/specialization/expand/mod.rs`](../src/specialization/expand/mod.rs)
 
 This is one of the best habits you can build:
 
@@ -300,11 +321,12 @@ Before you trust a feature, ask what proves it.
 
 ### Read next
 
-- [`src/ast.rs`](../src/ast.rs)
-- [`src/type_checker.rs`](../src/type_checker.rs)
-- [`src/compiler.rs`](../src/compiler.rs)
+- [`src/syntax/parser.rs`](../src/syntax/parser.rs)
+- [`src/analysis/check.rs`](../src/analysis/check.rs)
+- [`src/hir/`](../src/hir)
+- [`src/backend/tests.rs`](../src/backend/tests.rs)
 
-## Chapter 11: Docs And Examples Are Part Of The Feature
+## Chapter 12: Docs And Examples Are Part Of The Feature
 
 In a language project, docs are not decorative.
 
@@ -325,7 +347,7 @@ If a feature is hard to explain simply, that is often useful feedback about the 
 - [`docs/index.html`](./index.html)
 - [`examples/`](../examples)
 
-## Chapter 12: A Practical Implementation Checklist
+## Chapter 13: A Practical Implementation Checklist
 
 When you start a new feature, use this checklist.
 
@@ -336,14 +358,15 @@ When you start a new feature, use this checklist.
 5. Update source loading only if the feature affects module-level behavior.
 6. Update monomorphization if generics are involved.
 7. Update type checking so valid and invalid cases are explicit.
-8. Update backend lowering if the feature affects runtime behavior.
-9. Update runtime code if native support is required.
-10. Add parser, type-checker, and compiler/runtime tests.
-11. Update docs and examples.
+8. Update HIR lowering and validation if the feature has new semantic behavior.
+9. Update backend lowering if the feature affects runtime behavior.
+10. Update runtime code if native support is required.
+11. Add parser, analysis, HIR, and compiler/runtime tests.
+12. Update docs and examples.
 
 That is the real "end-to-end" path for a feature in this codebase.
 
-## Chapter 13: Worked Example, Adding A Small Feature
+## Chapter 14: Worked Example, Adding A Small Feature
 
 Let’s say you want to add a tiny syntax sugar feature like struct literal field shorthand:
 
@@ -377,7 +400,7 @@ This is a great example because it teaches a deep lesson:
 
 The earlier you can reduce a feature into existing forms, the less work later stages need.
 
-## Chapter 14: Worked Example, Adding A Runtime Feature
+## Chapter 15: Worked Example, Adding A Runtime Feature
 
 Now compare that with a runtime feature like:
 
@@ -397,7 +420,7 @@ This comparison is helpful because it teaches you to classify features.
 
 Not every feature is equally "language-level" versus "runtime-level."
 
-## Chapter 15: How To Avoid Common Beginner Mistakes
+## Chapter 16: How To Avoid Common Beginner Mistakes
 
 Here are the mistakes that most often waste time:
 
@@ -412,7 +435,7 @@ A good rule is:
 
 Make the feature visible in the earliest stage that needs to know about it, and no earlier.
 
-## Chapter 16: A Final Mental Model
+## Chapter 17: A Final Mental Model
 
 If you only remember one thing from this part, remember this:
 
@@ -425,6 +448,8 @@ The parser says, "I can recognize this."
 The AST says, "I can represent this."
 
 The type checker says, "I know what this means."
+
+The HIR says, "I carry resolved identities and semantic types."
 
 The backend says, "I know how to lower this."
 
