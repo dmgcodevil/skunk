@@ -1,0 +1,4767 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Inside the Skunk Compiler</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  const raw = document.getElementById('src').textContent;
+  marked.use({ mangle: false, headerIds: true });
+  document.getElementById('out').innerHTML = marked.parse(raw);
+  // marked emits mermaid blocks as <pre><code class="language-mermaid">
+  document.querySelectorAll('code.language-mermaid').forEach(el => {
+    const d = document.createElement('div');
+    d.className = 'mermaid';
+    d.textContent = el.textContent;
+    el.parentElement.replaceWith(d);
+  });
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+  mermaid.run();
+</script>
+<style>
+  :root { --ink:#132238; --muted:#54657A; --rule:#D6DEE5; --code:#F1F4F6; }
+  body { max-width: 46rem; margin: 3rem auto; padding: 0 1.5rem;
+         font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         color: var(--ink); }
+  h1 { font-size: 2rem; margin-top: 3rem; padding-top: 1.5rem;
+       border-top: 3px solid var(--rule); }
+  h1:first-of-type { border-top: 0; }
+  h2 { font-size: 1.35rem; margin-top: 2.25rem; }
+  h3 { font-size: 1.1rem; margin-top: 1.75rem; }
+  code { background: var(--code); padding: .12em .35em; border-radius: 3px;
+         font-size: .88em; }
+  pre { background: var(--code); padding: 1rem; border-radius: 6px;
+        overflow-x: auto; border-left: 3px solid #40C98A; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1.25rem 0;
+          font-size: .92em; }
+  th, td { border: 1px solid var(--rule); padding: .5rem .7rem; text-align: left; }
+  th { background: #EAF3F7; }
+  blockquote { border-left: 4px solid #D9822B; background: #FFF9F2;
+               margin: 1.25rem 0; padding: .75rem 1rem; color: var(--muted); }
+  .mermaid { margin: 1.75rem 0; text-align: center; }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+  @media print {
+    body { max-width: none; margin: 0; }
+    h1 { page-break-before: always; }
+    h1:first-of-type { page-break-before: avoid; }
+    pre, table, .mermaid { page-break-inside: avoid; }
+  }
+</style>
+<div id="out"></div>
+<script type="text/plain" id="src">
+---
+title: "Inside the Skunk Compiler"
+subtitle: "An Architecture Guide for New Contributors"
+author: "Skunk Project"
+date: "July 2026"
+---
+
+# Inside the Skunk Compiler
+
+## An Architecture Guide for New Contributors
+
+---
+
+# Preface
+
+## Who this book is for
+
+You are comfortable in Rust. You can read a `match` over an enum, you know what
+`Box<T>` and a lifetime are, and you are not frightened by a trait object.
+
+You have never built a compiler.
+
+That combination is exactly what this book assumes. Every compiler concept —
+what an AST is, why anyone would want three of them, what "monomorphization"
+means, why a control-flow graph exists — is built from zero. Every Rust idiom is
+assumed.
+
+By the end you should be able to open any file in `src/`, know why it exists,
+know what it is allowed to assume about its input, and know what the next phase
+will assume about its output. That last property is the one that matters. Most
+bugs in a compiler are not clever algorithmic mistakes; they are one phase
+quietly violating an assumption the next phase depends on.
+
+## What this book is not
+
+It is not a language manual. It will not teach you to *write* Skunk beyond the
+small amount needed to read the examples. For that, see the language reference
+at <https://dmgcodevil.github.io/skunk/> and the grammar itself in
+`src/syntax/grammar.pest`.
+
+It is not a compiler-theory textbook. There is no proof that the type system is
+sound, no dragon-book coverage of LR parsing, no register allocation. Skunk
+delegates the genuinely hard machine-level problems to LLVM, and this book
+follows suit.
+
+## How to read it
+
+The book is arranged in the order data flows through the compiler, which is also
+roughly the order of increasing difficulty.
+
+```mermaid
+flowchart TD
+    P0["<b>Part 0 — Orientation</b><br/>Ch 1–2 · What a compiler is · The Skunk pipeline"]
+    P1["<b>Part I — Foundations</b><br/>Ch 3–5 · Identity · Diagnostics · Tooling"]
+    P2["<b>Part II — The Front End</b><br/>Ch 6–9 · Grammar · AST · Normalization · Modules"]
+    P3["<b>Part III — Generics</b><br/>Ch 10–12 · Monomorphization · The specialization tree"]
+    P4["<b>Part IV — Semantics</b><br/>Ch 13–17 · Resolution · Types · Checking · HIR"]
+    P5["<b>Part V — The Middle End</b><br/>Ch 18–20 · MIR · Lowering · Validation"]
+    P6["<b>Part VI — The Back End</b><br/>Ch 21–24 · LLVM · Layouts · Codegen · Runtime"]
+    P7["<b>Part VII — Practice</b><br/>Ch 25–29 · Adding features · Debugging · Testing"]
+
+    P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
+
+    style P0 fill:#E9F8F1,stroke:#40C98A
+    style P7 fill:#EAF3F7,stroke:#1F6F8B
+```
+
+Three reading paths:
+
+**Front to back.** Best if you have the time. Each part assumes the previous one.
+
+**The narrow path.** Chapters 1, 2, 3, 13, 16, 18, and 25. This is the minimum
+to understand the shape of the compiler and make a small change safely.
+
+**The bug-fixing path.** Chapter 2 to locate the phase, Chapter 26 for the
+debugging playbook, then the chapter covering that phase.
+
+## Conventions
+
+Code quoted from the repository is labelled with its file path. Quotes are
+faithful but not always byte-exact: multi-line declarations are sometimes
+collapsed onto one line for compactness, and explanatory `//` comments are
+occasionally added. `// ...` marks an elision, and `— sketch` marks code that is
+*proposed* rather than present in the repository.
+
+> **A note on the traced representations.** Several chapters show what our
+> running example looks like at each phase. These were derived by hand from the
+> data-structure definitions, not captured from a compiler run. They are
+> faithful in *shape* and field names, but if you need byte-exact output, run
+> `skunk --debug` yourself (Chapter 5) — and if you find a discrepancy, the
+> compiler is right and this book is wrong.
+
+Sections marked like this describe parts of the codebase that are mid-refactor:
+
+> **⚠ Seam.** This is transitional. Here is why it looks like this, and where it
+> is going.
+
+You will meet several of these. They are not apologies — they are the honest
+map. A book that described an idealised architecture would leave you lost the
+first time you opened `src/analysis/check.rs`.
+
+---
+
+# Part 0 — Orientation
+
+---
+
+# Chapter 1: What a Compiler Actually Does
+
+## The problem
+
+You have this text in a file:
+
+```skunk
+counter: Counter = Counter::new(41);
+print(counter.bump(1));
+```
+
+You want a file the CPU can execute. Between those two things sits a very large
+gap, and the whole discipline of compiler construction is the art of crossing it
+in small, individually-checkable steps.
+
+Why small steps? Because the two ends speak incompatible languages.
+
+Source text is written for humans. It is *ambiguous by design*: the name
+`counter` means "whatever `counter` refers to here", and figuring out what that
+is requires knowing the surrounding scopes. It is *implicit*: `41` is an integer,
+but which width? It is *structured for reading*: `a + b * c` means something
+specific about precedence that the characters themselves do not state.
+
+Machine code is written for silicon. Nothing is ambiguous. There are no names,
+only addresses and registers. There are no types, only bit widths. There is no
+nesting, only jumps.
+
+A compiler is a machine for removing ambiguity, one kind at a time.
+
+## Removing ambiguity in stages
+
+Here is the central idea of this whole book. Each phase of a compiler takes a
+representation that is ambiguous in some specific way and produces one that is
+not.
+
+```mermaid
+flowchart LR
+    A["<b>Text</b><br/><i>ambiguous about<br/>structure</i>"]
+    B["<b>Tree</b><br/><i>ambiguous about<br/>identity</i>"]
+    C["<b>Resolved tree</b><br/><i>ambiguous about<br/>meaning</i>"]
+    D["<b>Typed tree</b><br/><i>ambiguous about<br/>order &amp; storage</i>"]
+    E["<b>Control-flow graph</b><br/><i>ambiguous about<br/>machine layout</i>"]
+    F["<b>Machine code</b><br/><i>unambiguous</i>"]
+
+    A -->|parse| B
+    B -->|resolve| C
+    C -->|type-check| D
+    D -->|lower| E
+    E -->|emit| F
+
+    style A fill:#FFF4E6,stroke:#D9822B
+    style F fill:#E9F8F1,stroke:#40C98A
+```
+
+Read that diagram again, because the entire architecture of Skunk is an
+elaboration of it. Every phase you will meet is an arrow on that line, and every
+intermediate representation is a box.
+
+Let us make each step concrete using the two lines above.
+
+### Parsing removes structural ambiguity
+
+The text `counter.bump(1)` is a sequence of characters. Is `.` an operator? Is
+`bump(1)` a call whose result is then somehow combined with `counter`? A human
+reading Skunk knows the answer, but the *characters* do not say.
+
+Parsing produces a tree that commits to one reading:
+
+```mermaid
+flowchart TD
+    Call["<b>Call</b>"]
+    Field["<b>Field access</b><br/>name = bump"]
+    Name["<b>Name</b><br/>counter"]
+    Lit["<b>Literal</b><br/>1"]
+
+    Call --> Field
+    Call --> Lit
+    Field --> Name
+
+    style Call fill:#EAF3F7,stroke:#1F6F8B
+```
+
+After parsing, structure is settled forever. No later phase re-reads the text to
+decide what groups with what.
+
+### Resolution removes ambiguity about identity
+
+The tree says `counter`, but *which* `counter`? A local variable? A global? A
+function? If there are two nested scopes both declaring `counter`, which one?
+
+Resolution walks the scopes and answers, replacing every name with a stable
+identifier. After resolution, `counter` is no longer a string — it is
+`LocalId(3)`, and there is exactly one thing that can be.
+
+This is the phase that makes everything downstream tractable. Once names are
+gone, no later phase needs to know what a scope is.
+
+### Type checking removes ambiguity about meaning
+
+Now we know *which* `counter`. But is `counter.bump(1)` even legal? Does
+`Counter` have a `bump` method? Does it take one argument? Is that argument
+allowed to be an integer? What does the whole expression evaluate to?
+
+Type checking answers all of these and rejects the program if the answers do not
+line up. Its output is the same tree with a type attached to every expression.
+
+### Lowering removes ambiguity about order and storage
+
+Consider `f(a) + g(b)`. The typed tree says "add the result of `f(a)` to the
+result of `g(b)`". It does *not* say whether `f` runs before `g`. It does not say
+where the intermediate results live.
+
+For a language with side effects this matters enormously. So we lower the tree
+into a form where evaluation order is explicit, every intermediate value has a
+named home, and control flow is jumps rather than nesting.
+
+That form is a **control-flow graph**: a set of straight-line blocks connected by
+explicit branches. We will meet Skunk's version, MIR, in Part V.
+
+### Code generation removes ambiguity about the machine
+
+Finally: how many bytes is a `Counter`? Where do its fields sit? What
+instruction adds two 32-bit integers? How does a method call actually transfer
+control?
+
+Skunk answers the layout questions itself and then hands the instruction
+selection and register allocation to LLVM, which is very good at it.
+
+## Why not do it all at once?
+
+You could, in principle, write one enormous function that reads text and writes
+machine code. People have. It goes badly for three reasons.
+
+**Testability.** With phases, you can feed a program to the parser and check the
+tree. Without them, the only test is "did the whole thing produce the right
+binary", and when it does not, you have no idea which of nine concerns broke.
+
+**Reasoning.** Each phase gets to *assume* things. The type checker never worries
+about operator precedence, because parsing settled it. Code generation never
+worries about which `counter` was meant, because resolution settled it. Every
+settled question is one less thing in your head.
+
+**Locality of change.** Adding a new operator touches the grammar and the parser.
+It should not require thinking about LLVM. Phases turn a change that could touch
+everything into a change that touches three files.
+
+The cost is real: more code, more data structures, more conversions between
+them. Skunk has roughly 35,000 lines of Rust for a language you could describe
+in an afternoon. That ratio is normal.
+
+## The vocabulary you now own
+
+Four terms will recur constantly. Fix them now.
+
+**Phase** (or *pass*): one step of the pipeline. A function from one
+representation to another.
+
+**Intermediate representation** (IR): a data structure holding the program
+between phases. Skunk has four — the syntax AST, the specialization tree, HIR,
+and MIR — plus LLVM IR at the end.
+
+**Lowering**: converting from a higher-level IR to a lower-level one. "Higher"
+means closer to source; "lower" means closer to the machine. You lower HIR to
+MIR. You never raise.
+
+**Invariant**: something guaranteed true of an IR. "HIR contains no unresolved
+names" is an invariant. Phases are allowed to rely on the invariants of their
+input, which is exactly why violating one is so damaging — the violation
+surfaces somewhere else entirely.
+
+---
+
+# Chapter 2: The Skunk Pipeline
+
+## The whole compiler on one page
+
+This is the diagram to come back to. Everything else in the book is a zoom into
+one of these boxes.
+
+```mermaid
+flowchart TD
+    subgraph FE["FRONT END — source-shaped"]
+        direction TB
+        SRC["Source files<br/><code>*.skunk</code>"]
+        PEST["Pest parse tree<br/><code>syntax/grammar.pest</code>"]
+        AST["<b>Syntax AST</b><br/><code>syntax::ast::Module</code><br/><i>names, NodeId, Span</i>"]
+        NORM["Normalized AST<br/><code>syntax::normalize</code>"]
+        LOAD["Loaded program<br/><code>syntax::loader</code>"]
+    end
+
+    subgraph GEN["GENERICS — templates become concrete"]
+        direction TB
+        TREE["<b>Specialization tree</b><br/><code>specialization::tree::Node</code>"]
+        EXPAND["Expanded tree<br/><code>specialization::expand</code>"]
+        CHECK["Legacy type check<br/><code>analysis::check</code>"]
+    end
+
+    subgraph SEM["SEMANTICS — identity and types"]
+        direction TB
+        RESOLVE["Resolutions<br/><code>analysis::resolver</code><br/><i>DefId, LocalId, FieldId</i>"]
+        MODEL["<b>SemanticModel</b><br/><code>analysis::model</code><br/><i>interned TypeId</i>"]
+        HIR["<b>HIR</b><br/><code>hir::Module</code><br/><i>typed + resolved</i>"]
+        SEAL["Specialization seal<br/><code>specialization::seal</code>"]
+    end
+
+    subgraph MID["MIDDLE END — explicit control flow"]
+        MIR["<b>MIR</b><br/><code>mir::Module</code><br/><i>CFG, places, operands</i>"]
+    end
+
+    subgraph BE["BACK END — machine shapes"]
+        direction TB
+        LAYOUT["Layouts + signatures<br/><code>backend</code>"]
+        LLVM["LLVM IR text"]
+        BIN["Native executable<br/><i>via clang</i>"]
+    end
+
+    SRC --> PEST --> AST --> NORM --> LOAD
+    LOAD --> TREE --> EXPAND --> CHECK
+    CHECK --> RESOLVE --> MODEL --> HIR --> SEAL
+    SEAL --> MIR --> LAYOUT --> LLVM --> BIN
+
+    style AST fill:#EAF3F7,stroke:#1F6F8B
+    style HIR fill:#E9F8F1,stroke:#40C98A
+    style MIR fill:#E9F8F1,stroke:#40C98A
+    style MODEL fill:#E9F8F1,stroke:#40C98A
+    style TREE fill:#FFF4E6,stroke:#D9822B
+    style CHECK fill:#FFF4E6,stroke:#D9822B
+```
+
+Boxes in orange are transitional — Chapter 11 and Chapter 15 explain why. Boxes
+in green are the stable core.
+
+## Where this lives in code
+
+The whole sequence is written out, in order, in one function:
+`check_syntax` in `src/pipeline.rs`. If you ever lose your bearings, read that
+function. It is the compiler's table of contents.
+
+```rust
+// src/pipeline.rs — abridged
+fn check_syntax(
+    module: syntax::ast::Module,
+    sources: Option<SourceMap>,
+    logger: &mut CompilerLogger,
+) -> Result<CheckedProgram, String> {
+    let module = syntax::normalize::normalize(module)?;
+    let initial_resolutions = resolver::resolve(&module)?;
+    let expansion_input = convert::to_tree(&module);
+    let prepared = expand::prepare_program(&expansion_input)?;
+    check::check(&prepared)?;
+    let prepared_syntax = convert::from_tree(&prepared, file, source_len)?;
+    let prepared_resolutions = resolver::resolve(&prepared_syntax)?;
+    let mut semantic_model =
+        model::analyze_declarations(&prepared_syntax, prepared_resolutions)?;
+    let hir = lower::lower(&prepared_syntax, &mut semantic_model)?;
+    validate::validate(&hir, &semantic_model)?;
+    let specializations = specialization::seal(&hir, &semantic_model)?;
+    Ok(CheckedProgram { hir, semantics: semantic_model, specializations, sources })
+}
+```
+
+Two things in that listing will look strange, and both are important enough to
+flag immediately.
+
+**`resolver::resolve` is called twice.** Once before generic expansion, once
+after. Expansion rewrites declarations — `Box[T]` becomes `Box_int` — so the
+names in the tree afterwards are not the names that went in. The first
+resolution catches errors early against source the user actually wrote; the
+second builds the tables the rest of the compiler uses.
+
+**`convert::to_tree` and `convert::from_tree` round-trip the AST.** The syntax
+AST is converted into a different tree, expanded, then converted back. Chapter 11
+is devoted to why, and to the fact that this is the single largest piece of
+architectural debt in the compiler.
+
+## The public boundary
+
+Everything above produces one value:
+
+```rust
+// src/pipeline.rs
+pub struct CheckedProgram {
+    pub hir: crate::hir::Module,
+    pub semantics: model::SemanticModel,
+    pub specializations: specialization::SpecializationSet,
+    pub sources: Option<SourceMap>,
+}
+```
+
+This is the contract between the front end and everything else. Tests use it.
+The backend consumes it. Future tooling — a language server, a formatter — would
+start here.
+
+Read the four fields as answers to four questions:
+
+| Field | Answers |
+|---|---|
+| `hir` | What does the program *do*? |
+| `semantics` | What do these IDs and types *mean*? |
+| `specializations` | Which concrete instantiations must exist at runtime? |
+| `sources` | Where in the original files did this come from? |
+
+`hir` alone is not enough to understand a program. It is full of `TypeId(17)` and
+`DefId(4)`, which are meaningless without `semantics` to interpret them. The two
+travel together. This pattern — a tree of IDs plus a side table that explains
+them — is pervasive, and Chapter 3 explains why it is worth the inconvenience.
+
+## Our running example
+
+One program threads through the entire book. It is deliberately tiny:
+
+```skunk
+// counter.skunk
+struct Counter {
+    value: int;
+}
+
+attach Counter {
+    function new(start: int): Counter {
+        return Counter { value: start };
+    }
+
+    function bump(mut self, amount: int): int {
+        self.value = self.value + amount;
+        return self.value;
+    }
+}
+
+function main(): void {
+    counter: Counter = Counter::new(41);
+    print(counter.bump(1));
+}
+```
+
+It prints `42`.
+
+Small as it is, it exercises a surprising amount of the compiler: a nominal type
+with a field, an `attach` block (Skunk's way of adding methods to a type), a
+static constructor, a method taking `mut self`, field assignment, arithmetic, a
+local declaration, and a call whose result is printed.
+
+Later chapters add a generic `Box[T]` and a `Writer` trait when we need to
+discuss monomorphization and dynamic dispatch, but `Counter` is the spine.
+
+## What each phase does to our example
+
+A preview. Do not try to absorb the details — just watch the program get
+progressively less like text and more like a machine.
+
+**After parsing** it is a tree of `TopLevel` entries: one `Struct`, one `Attach`
+holding two `FunctionDecl`s, one `Function` named `main`.
+
+**After normalization** the `attach` block is gone. Its two methods have been
+moved *into* the `StructDecl` as `methods`. Later phases only ever see "a struct
+with methods", never "a struct, and separately some methods for it".
+
+**After resolution** every name has an ID. `Counter` is `DefId(0)`, `value` is
+`FieldId(0)`, the local `counter` in `main` is `LocalId(0)`.
+
+**After type analysis** every expression carries a `TypeId`. `counter.bump(1)`
+is `TypeId` for `int`. The `TypeStore` has interned `Counter` as a nominal type.
+
+**After HIR lowering** the method call is no longer "look up the name `bump`" but
+`MethodCall { method: MethodTarget::Definition(DefId(2)), .. }` — the target is
+decided.
+
+**After MIR lowering** the body of `main` is basic blocks. The temporary holding
+`Counter::new(41)`'s result has its own `MirLocalId`. `self.value + amount`
+became a `Binary` rvalue assigned into a temporary.
+
+**After code generation** it is LLVM IR: `%struct.Counter = type { i32 }`, a
+function `@skunk_Counter_bump`, and a `main` that calls it and passes the result
+to `printf`.
+
+## The debugging consequence
+
+Because each phase has a defined output, you can always ask *where* something
+first went wrong. This turns compiler debugging from guesswork into bisection.
+
+```mermaid
+flowchart TD
+    Q{"Program misbehaves"}
+    Q --> P{"Does it parse<br/>to the right tree?"}
+    P -->|no| FIX1["Grammar or parser<br/>Ch 6"]
+    P -->|yes| R{"Are names bound<br/>to the right things?"}
+    R -->|no| FIX2["Resolver<br/>Ch 13"]
+    R -->|yes| T{"Are the types right?"}
+    T -->|no| FIX3["Checker / model / HIR<br/>Ch 14–16"]
+    T -->|yes| M{"Is the MIR<br/>control flow right?"}
+    M -->|no| FIX4["MIR lowering<br/>Ch 19"]
+    M -->|yes| FIX5["Backend<br/>Ch 22–23"]
+
+    style FIX5 fill:#FFF4E6,stroke:#D9822B
+```
+
+The rule that follows: **never debug generated LLVM IR for a name-resolution
+bug.** Stop at the earliest representation whose output is wrong. Chapter 5 shows
+you how to print each one.
+
+---
+
+# Part I — Foundations
+
+---
+
+# Chapter 3: Identity, or Why Everything Is an Integer
+
+## The problem with names
+
+Here is a tempting way to write a compiler. Keep the names. When the type checker
+needs to know about `Counter`, look up the string `"Counter"` in a `HashMap`.
+
+Skunk's legacy checker does exactly this, and Chapter 15 is largely a catalogue
+of the consequences. The short version:
+
+**Strings are ambiguous.** Two different `Counter` types in two modules are the
+same string. Shadowed locals are the same string. A method and a field can share
+a name.
+
+**Strings are slow.** Hashing and comparing them, everywhere, forever.
+
+**Strings do not prove anything.** If a function takes a `&str`, the type system
+cannot tell you whether it wants a type name, a field name, or a variable name.
+Pass the wrong one and you get a runtime lookup failure, not a compile error.
+
+The fix is to replace names with integers as early as possible — and, crucially,
+to give each *kind* of thing its own integer type.
+
+## The ID family
+
+```rust
+// src/ids.rs
+macro_rules! define_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(u32);
+
+        impl $name {
+            pub const fn new(raw: u32) -> Self { Self(raw) }
+            pub const fn index(self) -> usize { self.0 as usize }
+        }
+    };
+}
+
+define_id!(FileId);
+define_id!(DefId);
+define_id!(LocalId);
+define_id!(TypeId);
+define_id!(FieldId);
+define_id!(VariantId);
+define_id!(MirLocalId);
+define_id!(MirBlockId);
+```
+
+Every one of these is a `u32` at runtime — free to copy, free to compare, free to
+hash. But they are *different Rust types*, so passing a `FieldId` where a `DefId`
+is expected is a compile error. This is the newtype pattern doing exactly the job
+it exists for.
+
+Here is what each one identifies:
+
+| ID | Identifies | Allocated by |
+|---|---|---|
+| `FileId` | A source file | `SourceMap` |
+| `NodeId` | A syntax node | `NodeIdAllocator`, during parsing |
+| `DefId` | A declaration — type, function, global, generic parameter | `resolver` |
+| `LocalId` | A local variable or parameter binding | `resolver` |
+| `FieldId` | A field of a struct | `resolver` |
+| `VariantId` | A variant of an enum | `resolver` |
+| `TypeId` | A complete semantic type | `TypeStore` |
+| `MirLocalId` | A MIR local slot | `mir::lower` |
+| `MirBlockId` | A MIR basic block | `mir::lower` |
+
+Learn this table. Almost every function signature in the middle of the compiler
+is built from it, and knowing which ID a function takes tells you what phase it
+belongs to.
+
+## The side-table pattern
+
+If IDs replace names, where does the information go? Into side tables.
+
+```mermaid
+flowchart LR
+    subgraph IR["The IR — small and uniform"]
+        E["Expr {<br/>&nbsp;&nbsp;ty: TypeId(9)<br/>&nbsp;&nbsp;kind: Field {<br/>&nbsp;&nbsp;&nbsp;&nbsp;field: FieldId(0)<br/>&nbsp;&nbsp;}<br/>}"]
+    end
+
+    subgraph MODEL["SemanticModel — the dictionary"]
+        FT["field_types<br/>FieldId(0) → TypeId(9)"]
+        FO["field_owners<br/>FieldId(0) → DefId(0)"]
+        TS["TypeStore<br/>TypeId(9) → Builtin(Int)"]
+    end
+
+    E -.->|"look up"| FT
+    E -.->|"look up"| FO
+    E -.->|"look up"| TS
+
+    style IR fill:#E9F8F1,stroke:#40C98A
+    style MODEL fill:#EAF3F7,stroke:#1F6F8B
+```
+
+The `SemanticModel` is that dictionary:
+
+```rust
+// src/analysis/model.rs
+pub struct SemanticModel {
+    pub resolutions: Resolutions,
+    pub types: TypeStore,
+    pub definition_types: HashMap<DefId, TypeId>,
+    pub syntax_types: HashMap<NodeId, TypeId>,
+    pub local_types: HashMap<LocalId, TypeId>,
+    pub field_types: HashMap<FieldId, TypeId>,
+    pub field_owners: HashMap<FieldId, DefId>,
+    pub variant_payloads: HashMap<VariantId, Vec<TypeId>>,
+    pub variant_owners: HashMap<VariantId, DefId>,
+}
+```
+
+This is why `CheckedProgram` carries `hir` and `semantics` together. The HIR is
+the sentence; the `SemanticModel` is the dictionary. Neither is useful alone.
+
+The practical consequence when you are writing compiler code: if you have a
+`FieldId` and want to know its type, you do not follow a pointer — you ask the
+model. Nearly every function in the semantic layers therefore takes a
+`&SemanticModel`.
+
+## `NodeId` and the file-packing trick
+
+`NodeId` is the odd one out. It is a `u64`, not a `u32`:
+
+```rust
+// src/ids.rs
+pub struct NodeId(u64);
+
+impl NodeId {
+    pub const fn in_file(file: FileId, raw: u32) -> Self {
+        Self(((file.index() as u64) << 32) | raw as u64)
+    }
+
+    pub const fn file(self) -> FileId { FileId::new((self.0 >> 32) as u32) }
+    pub const fn local_index(self) -> u32 { self.0 as u32 }
+}
+```
+
+The high 32 bits are the file, the low 32 bits are the node's index within it.
+
+Why bother? Because parsing is per-file. If node IDs were a single global
+counter, every parser would need access to shared mutable state, and parsing two
+files in parallel would require a lock. By packing the file into the ID, each
+file's parser gets its own private counter starting at zero, and the results
+never collide.
+
+This is a small decision that quietly buys future parallelism. There are several
+like it in the codebase, and noticing them is a good way to build a feel for the
+design.
+
+## `TypeId` and interning
+
+`TypeId` is allocated differently from the others, and the difference matters.
+
+The other IDs are *allocated* — the resolver walks declarations and hands out
+`DefId(0)`, `DefId(1)`, and so on. `TypeId`s are *interned*: identical types get
+the same ID automatically.
+
+```rust
+// src/analysis/types.rs
+impl TypeStore {
+    pub fn intern(&mut self, kind: TypeKind) -> TypeId {
+        if let Some(existing) = self.interned.get(&kind) {
+            return *existing;
+        }
+        let id = TypeId::new(self.kinds.len() as u32);
+        self.kinds.push(kind.clone());
+        self.interned.insert(kind, id);
+        id
+    }
+}
+```
+
+The payoff is that **type equality becomes integer equality**. To ask "are these
+two expressions the same type?", compare two `u32`s. No structural walk, no
+recursion, no risk of two subtly different comparison functions disagreeing.
+
+This is worth dwelling on, because it is the single most leveraged design
+decision in the semantic layer. Consider `Box[Box[int]]`. Structurally comparing
+two of those means recursing three levels. Interned, it is one `==`.
+
+The store's own test states the property:
+
+```rust
+// src/analysis/types.rs
+#[test]
+fn interns_equal_types_once_and_separates_instantiations() {
+    let mut types = TypeStore::default();
+    let int = types.builtin(BuiltinType::Int);
+    let string = types.builtin(BuiltinType::String);
+    let definition = DefId::new(7);
+
+    let box_int_a = types.nominal(definition, vec![int]);
+    let box_int_b = types.nominal(definition, vec![int]);
+    let box_string = types.nominal(definition, vec![string]);
+
+    assert_eq!(box_int_a, box_int_b);   // same type, same id
+    assert_ne!(box_int_a, box_string);  // different instantiation, different id
+}
+```
+
+Note the separation in that test: `Box[int]` and `Box[string]` share a `DefId`
+(one declaration) but have different `TypeId`s (two types). Keeping declaration
+identity and type identity apart is what makes generics expressible at all.
+
+`TypeStore::default()` pre-interns the error type, the never type, all twelve
+builtins, and all intrinsic types — so `TypeId(0)` is always `Error` and the
+common types get low, stable IDs.
+
+## The error type
+
+`TypeKind::Error` deserves a note. When type checking fails, the checker still
+needs to return *something* so it can continue and report more than one error per
+run. `Error` is that something: a type that is compatible with everything and
+suppresses downstream complaints.
+
+This is why `TypeStore::error()` is hard-coded to `TypeId::new(0)` — it is
+interned first, always, so it is available before anything else exists.
+
+---
+
+# Chapter 4: Source Locations and Diagnostics
+
+## Why locations are hard
+
+An error message without a location is nearly useless:
+
+```
+error: type mismatch
+```
+
+Versus:
+
+```
+counter.skunk:12:18: error: type mismatch
+```
+
+The difficulty is that by the time an error is detected, you are ten phases away
+from the text. The type checker is looking at `TypeId(9)` and `TypeId(4)`. Where
+did they come from? Some expression. Where was that expression written? You need
+to have carried that information the whole way.
+
+Skunk carries it as a `Span`.
+
+## `SourceMap` and `Span`
+
+```rust
+// src/source_map.rs
+pub struct Span {
+    pub file: FileId,
+    pub start: u32,
+    pub end: u32,
+}
+```
+
+Twelve bytes, `Copy`, no allocation. A span is a byte range in a file, and the
+`FileId` says which file.
+
+Notice what it does *not* contain: line and column numbers. Those are computed on
+demand by the `SourceMap`, which owns the actual text:
+
+```rust
+// src/source_map.rs — usage
+if let Some(file) = sources.file(span.file) {
+    if let Some(location) = file.line_column(span.start) {
+        // location.line, location.column
+    }
+}
+```
+
+This is the right trade. Line and column are needed only when rendering an error
+— rare. Byte offsets are needed on every AST node — constant. Storing the cheap
+thing and computing the expensive thing lazily is why `Span` can be `Copy`.
+
+> **⚠ Seam.** There is a *second*, incompatible span type in the codebase:
+> `specialization::tree::Span`. It stores `start`, `end`, `line`, and — this is
+> not a typo — `input: String`, a full copy of the entire source text, on every
+> span. Chapter 11 explains how it got there. When you write new code, always use
+> `source_map::Span`.
+
+## Diagnostics
+
+```rust
+// src/diagnostic.rs
+pub struct Diagnostic {
+    pub severity: Severity,
+    pub code: Option<&'static str>,
+    pub message: String,
+    pub primary: Option<Box<Label>>,
+    pub secondary: Vec<Label>,
+    pub notes: Vec<String>,
+}
+```
+
+A diagnostic has one primary location (where the error is), any number of
+secondary locations (related places worth showing), and free-form notes.
+
+It is built with a fluent API:
+
+```rust
+Diagnostic::error(format!("duplicate declaration of `{name}`"))
+    .with_code("E2001")
+    .at(entry.span)
+    .label(previous.span, "previous declaration is here")
+```
+
+That is real code from `src/analysis/resolver.rs`, and it produces:
+
+```
+counter.skunk:12:1: error[E2001]: duplicate declaration of `Counter`
+  = counter.skunk:3:1: previous declaration is here
+```
+
+The `secondary` label is what makes the message actionable. "Duplicate
+declaration" tells you there is a problem; "previous declaration is here" tells
+you where to look.
+
+## Structured, not formatted
+
+The important property of `Diagnostic` is that it is **data, not a string**.
+Severity, code, and locations are separate fields. Rendering happens once, at the
+boundary, in `Diagnostic::render`.
+
+This matters for things that do not exist yet but should: a language server
+wants spans as structured ranges, not parsed out of text. A `--json` output mode
+wants fields. A test wants to assert on the code without matching on wording.
+
+> **⚠ Seam.** Roughly 162 places in the compiler return `Result<_, String>`
+> instead of `Diagnostic` — the entire legacy checker and the entire backend.
+> Those errors have no code, no structured span, and in many cases no location at
+> all. The machinery in `diagnostic.rs` is good and underused. When you touch one
+> of those call sites, converting it is a welcome improvement.
+
+## Rules for new diagnostics
+
+When you add an error to the compiler:
+
+1. **Always attach a span.** An error without `.at(span)` renders without a
+   location, and users cannot act on it.
+2. **Point at the narrowest thing that is wrong.** For an argument type mismatch,
+   span the argument, not the whole call.
+3. **Add a secondary label for the other half.** Mismatches have two sides; show
+   both.
+4. **Use `note` for the fix,** not for restating the problem.
+5. **Never format `{:?}` into a user-facing message.** Rust's `Debug` output for
+   an internal enum is not something a user of your language should ever see.
+   (This rule is currently broken in about fifteen places. Do not add more.)
+
+---
+
+# Chapter 5: Building, Running, and Seeing Inside
+
+## Getting a compiler
+
+```bash
+cargo build
+```
+
+Skunk needs `clang` at runtime to link executables — it generates LLVM IR as
+text and shells out. On macOS, `xcode-select --install`; on Linux, your
+distribution's `clang` package.
+
+## The commands
+
+```bash
+# compile to a named binary
+cargo run -- compile counter.skunk ./counter && ./counter
+
+# compile and run via a temporary binary
+cargo run -- run counter.skunk
+cargo run -- counter.skunk          # `run` is the default
+
+# run the language-level test blocks in a file
+cargo run -- test counter.skunk
+cargo run -- test counter.skunk --filter bump
+
+# build a project using skunk.toml
+cargo run -- build
+```
+
+## The single most useful flag
+
+```bash
+cargo run -- --debug compile counter.skunk ./counter
+```
+
+`--debug` prints every intermediate representation to stderr, in order, labelled
+and numbered. This is your microscope, and learning to read its output is the
+fastest way to build a mental model of the compiler.
+
+The mechanism is deliberately simple:
+
+```rust
+// src/pipeline.rs
+pub struct CompilerLogger {
+    enabled: bool,
+    next_stage: usize,
+}
+
+impl CompilerLogger {
+    pub(crate) fn debug(&mut self, phase: &str, representation: &str, value: &dyn Debug) {
+        if !self.enabled { return; }
+        eprintln!("\n[skunk debug {:02}] {} ({})", self.next_stage, phase, representation);
+        eprintln!("{value:#?}");
+        self.next_stage += 1;
+    }
+}
+```
+
+It is `{:#?}` on the actual data structures. That is all. Which means: if you add
+a field to an IR node, it shows up in `--debug` for free.
+
+The stages you will see, in order:
+
+| # | Phase | Representation |
+|---|---|---|
+| 01 | source loading | syntax AST |
+| 02 | syntax normalization | syntax AST |
+| 03 | pre-expansion name resolution | resolution tables |
+| 04 | specialization conversion | generic expansion tree |
+| 05 | generic specialization | specialized expansion tree |
+| 06 | specialization conversion | specialized syntax AST |
+| 07 | post-expansion name resolution | resolution tables |
+| 08 | semantic analysis | semantic model |
+| 09 | HIR lowering | typed HIR |
+| 10 | specialization seal | specialization metadata |
+| 11 | MIR lowering | MIR |
+| 12 | LLVM lowering | LLVM IR |
+
+Output goes to stderr, so it never contaminates the compiled program's stdout.
+That is deliberate — you can debug a program while still piping its output.
+
+A practical habit: pipe it to a file and search.
+
+```bash
+cargo run -- --debug compile counter.skunk ./counter 2> trace.txt
+grep -n "skunk debug" trace.txt        # the stage index
+sed -n '/debug 09/,/debug 10/p' trace.txt   # just the HIR
+```
+
+## The test suite
+
+```bash
+cargo test                    # everything
+cargo test --lib backend      # the backend suite
+cargo test intrinsic          # anything matching
+```
+
+There are two very different kinds of test in the tree, and knowing which you are
+looking at saves confusion.
+
+**Unit tests** live next to the code, test one function, and run fast.
+`src/analysis/types.rs` has a good example.
+
+**Native integration tests** live in `src/backend/tests.rs` — 104 of them — and
+each one compiles a complete Skunk program to a real binary, runs it, and asserts
+on its stdout:
+
+```rust
+// src/backend/tests.rs — the shape
+let stdout = compile_and_run(r#"
+    struct Counter { value: int; }
+    // ...
+    function main(): void { print(use_counter(counter)); }
+"#).unwrap();
+
+assert_eq!(stdout, "41\n");
+```
+
+These are slow but they are the real safety net. When you change anything in the
+middle of the compiler, these are what tell you the program still means what it
+meant.
+
+Chapter 27 covers testing strategy — including where the coverage is thin, which
+is worth knowing before you rely on it.
+
+## Reading the codebase without drowning
+
+35,000 lines is a lot to face cold. A suggested order:
+
+```mermaid
+flowchart TD
+    A["<code>src/pipeline.rs</code><br/>212 lines — the table of contents"]
+    B["<code>src/ids.rs</code><br/>81 lines — the vocabulary"]
+    C["<code>src/syntax/ast.rs</code><br/>464 lines — what a program is"]
+    D["<code>src/hir/mod.rs</code><br/>294 lines — what a typed program is"]
+    E["<code>src/mir/mod.rs</code><br/>349 lines — what a flat program is"]
+    F["<code>src/analysis/model.rs</code><br/>661 lines — the dictionary"]
+    G["Pick a phase and go deep"]
+
+    A --> B --> C --> D --> E --> F --> G
+
+    style A fill:#E9F8F1,stroke:#40C98A
+```
+
+That is about 2,000 lines and gives you the entire skeleton. Every one of those
+files is a data-structure definition or a coordinator — no dense algorithms.
+
+The files to *avoid* on day one: `src/analysis/check.rs` (4,200 lines, one
+859-line function), `src/specialization/convert.rs` (1,729 lines of mechanical
+translation), and `src/specialization/expand/transform.rs` (2,462 lines). All
+three are covered later in this book, with warnings attached.
+
+---
+
+# Part II — The Front End
+
+---
+
+# Chapter 6: Grammar and Parsing
+
+## Two ways to write a parser
+
+You can write a parser by hand — a function per grammar rule, calling each other
+recursively. Or you can write down the grammar declaratively and have a library
+generate the parser.
+
+Skunk does both, in sequence, and the reason is worth understanding.
+
+```mermaid
+flowchart LR
+    TXT["Source text"]
+    PEST["<b>Pest</b><br/>generated from<br/><code>grammar.pest</code>"]
+    PAIRS["Pest <code>Pairs</code><br/><i>untyped tree</i>"]
+    PARSER["<b>parser.rs</b><br/>hand-written<br/>tree walk"]
+    AST["<code>syntax::ast::Module</code><br/><i>typed AST</i>"]
+
+    TXT --> PEST --> PAIRS --> PARSER --> AST
+
+    style PEST fill:#EAF3F7,stroke:#1F6F8B
+    style AST fill:#E9F8F1,stroke:#40C98A
+```
+
+Pest handles the tedious, error-prone part: tokenising, backtracking, operator
+sequencing. It produces a generic tree of `Pair`s — every node is "a rule that
+matched, with a string slice and some children". That tree is untyped: you
+navigate it by calling `.into_inner()` and hoping you know what you will find.
+
+`parser.rs` then walks that generic tree and builds the real, typed AST. This is
+where `Pair` becomes `Expr`, where `NodeId`s get allocated, and where spans get
+attached.
+
+Keeping the two separate means the grammar file stays readable as a
+specification, while the messy work of building a well-typed tree lives in
+ordinary Rust you can debug.
+
+## Reading the grammar
+
+`src/syntax/grammar.pest` is 178 lines and is the definitive statement of Skunk's
+syntax. Pest uses PEG notation:
+
+| Notation | Meaning |
+|---|---|
+| `~` | followed by |
+| `\|` | ordered choice — first match wins |
+| `*` `+` `?` | zero-or-more, one-or-more, optional |
+| `@{ }` | atomic — no implicit whitespace inside |
+| `_{ }` | silent — matches but produces no tree node |
+| `!` | negative lookahead |
+
+The entry point:
+
+```pest
+program   = { SOI ~ statement* ~ EOI }
+statement = { module | import | export_decl | extern_func_decl | test_decl
+            | type_alias_decl | var_decl_stmt | struct_destructure_stmt
+            | func_decl | struct_decl | enum_decl | trait_decl | shape_decl
+            | attach_decl | conform_decl | control_flow | io | defer_stmt
+            | sk_return | unsafe_block | assignment ~ ";" | expression ~ ";" | block }
+```
+
+**Ordered choice is the thing to internalise.** In `a | b`, if `a` matches, `b`
+is never tried — even if `b` would have matched more text. This is what makes
+PEGs unambiguous, and it is also the number one source of grammar bugs. If you
+add a rule to `statement` and put it after `expression ~ ";"`, it will never
+fire, because most things parse as an expression first.
+
+**Rule of thumb: more specific alternatives go earlier.** Look at how `literal`
+is ordered:
+
+```pest
+literal = { FLOAT_LITERAL | DOUBLE_LITERAL | LONG_LITERAL | INTEGER
+          | STRING_LITERAL | BOOLEAN_LITERAL | CHAR_LITERAL }
+```
+
+`FLOAT_LITERAL` is `digits.digits` followed by `f`. `DOUBLE_LITERAL` is
+`digits.digits`. `INTEGER` is just `digits`. If `INTEGER` came first, `3.5`
+would parse as the integer `3` followed by junk. The ordering is load-bearing.
+
+## Expressions and precedence
+
+Here is something that will surprise you if you have seen other grammars:
+
+```pest
+expression = { primary ~ (operation ~ primary)* }
+```
+
+That is a *flat* list. `a + b * c` parses to `[a, +, b, *, c]` with no structure.
+The grammar does not encode precedence at all.
+
+Precedence is applied afterwards, in `parser.rs`, using a Pratt parser (Pest
+provides `PrattParser` for exactly this). This is a common and good design: it
+keeps the grammar file simple, and it means changing precedence is a table edit
+rather than a grammar restructuring.
+
+If you are adding an operator, you touch two places: the `operation` rule in the
+grammar, and the precedence table in `parser.rs`. Forgetting the second gives you
+an operator that parses but associates wrongly.
+
+## Types in the grammar
+
+Skunk's type syntax is richer than most, and the grammar shows it:
+
+```pest
+pointer_prefix   = { "*" }
+reference_prefix = { "&" ~ mut_kw? }
+type_prefix      = { pointer_prefix | reference_prefix | "[" ~ expression? ~ "]" }
+prefixed_type    = { type_prefix+ ~ const_kw? ~ (base_type | function_type) }
+
+legacy_array_type = { base_type ~ legacy_array_dim+ }   // int[3]
+legacy_slice_type = { base_type ~ ("[" ~ "]")+ }        // int[]
+
+intersection_type = { type_atom ~ ("&" ~ type_atom)+ }
+union_type        = { union_member ~ ("|" ~ union_member)+ }
+_type             = { union_type | intersection_type | type_atom }
+```
+
+Two things to notice.
+
+**There are two array syntaxes.** `int[3]` is legacy; `[3]int` is preferred. Both
+parse. When you add type-related features, remember both paths exist.
+
+**Union and intersection types are first class.** `Writer & Resettable` is an
+intersection — a value satisfying both traits. `int | string` is a union. These
+appear all the way down to the backend, where an intersection becomes a fat
+pointer with one vtable per trait.
+
+## Access chains
+
+This rule repays careful reading, because it shapes a lot of the compiler:
+
+```pest
+member_access  = { "." ~ (func_call | IDENTIFIER) }
+deref_access   = { "." ~ "*" }
+access_step    = { deref_access | slice_access | array_access | member_access }
+chained_access = { (func_call | IDENTIFIER) ~ access_step+ }
+access         = { chained_access | IDENTIFIER }
+```
+
+An access is a *base* followed by a *sequence of steps*. So `a.b[0].c()` is not
+nested — it is `a` plus three steps.
+
+This flat-sequence shape survives into the checker, where `resolve_access` walks
+the steps one at a time, carrying the current type forward. It is why so many
+error messages talk about "access step", and why `resolve_access` is one of the
+larger functions in `check.rs`.
+
+## Adding syntax safely
+
+The checklist, in order:
+
+1. Add the rule to `grammar.pest`, minding alternative ordering.
+2. Add the AST node to `syntax/ast.rs`.
+3. Handle the new `Pair` in `syntax/parser.rs`, allocating a `NodeId` and
+   attaching a `Span`.
+4. Follow it through every later phase — the compiler will tell you where,
+   because every `match` over the AST is exhaustive.
+
+That last point is the payoff of Rust's exhaustiveness checking. Add a variant to
+`ExprKind` and `cargo build` gives you a to-do list of every place that needs to
+learn about it. Resist the temptation to add a `_ => {}` arm to silence it; you
+are throwing away the compiler's best feature.
+
+---
+
+# Chapter 7: The Syntax AST
+
+## One shape for a program
+
+`src/syntax/ast.rs` defines what a Skunk program *is*, structurally, before
+anything is known about meaning.
+
+```rust
+// src/syntax/ast.rs
+pub struct Module {
+    pub id: NodeId,
+    pub span: Span,
+    pub name: Option<Path>,
+    pub entries: Vec<TopLevel>,
+}
+
+pub struct TopLevel {
+    pub id: NodeId,
+    pub span: Span,
+    pub visibility: Visibility,
+    pub kind: TopLevelKind,
+}
+```
+
+Every node follows the same pattern: an identity (`NodeId`), a location (`Span`),
+and a `kind` enum carrying the actual content. Once you have seen it three times
+you can predict the shape of any node in the file.
+
+```mermaid
+classDiagram
+    class Module {
+        +NodeId id
+        +Span span
+        +Option~Path~ name
+        +Vec~TopLevel~ entries
+    }
+    class TopLevel {
+        +NodeId id
+        +Span span
+        +Visibility visibility
+        +TopLevelKind kind
+    }
+    class TopLevelKind {
+        <<enumeration>>
+        Import
+        TypeAlias
+        Struct
+        Enum
+        Trait
+        Shape
+        Attach
+        Conformance
+        Implementation
+        Function
+        ExternFunction
+        Global
+        Test
+        Statement
+    }
+    class StructDecl {
+        +Identifier name
+        +Vec~GenericParameter~ generic_parameters
+        +Vec~StructField~ fields
+        +Vec~FunctionDecl~ methods
+    }
+
+    Module "1" --> "*" TopLevel
+    TopLevel --> TopLevelKind
+    TopLevelKind --> StructDecl
+```
+
+## Expressions
+
+```rust
+// src/syntax/ast.rs
+pub struct Expr {
+    pub id: NodeId,
+    pub span: Span,
+    pub kind: ExprKind,
+}
+
+pub enum ExprKind {
+    Literal(Literal),
+    Name(Path),
+    Unary { operator: UnaryOperator, operand: Box<Expr> },
+    Binary { left: Box<Expr>, operator: BinaryOperator, right: Box<Expr> },
+    Call {
+        callee: Box<Expr>,
+        type_arguments: Vec<TypeSyntax>,
+        argument_groups: Vec<Vec<Expr>>,
+    },
+    Field { receiver: Box<Expr>, name: Identifier },
+    Index { receiver: Box<Expr>, coordinates: Vec<Expr> },
+    Slice { receiver: Box<Expr>, start: Option<Box<Expr>>, end: Option<Box<Expr>> },
+    StructInit { ty: TypeSyntax, fields: Vec<(Identifier, Expr)> },
+    StaticCall { ty: TypeSyntax, name: Identifier, arguments: Vec<Expr> },
+    Array(Vec<Expr>),
+    Lambda(LambdaExpr),
+    Block(Block),
+}
+```
+
+Note `argument_groups: Vec<Vec<Expr>>` rather than `Vec<Expr>`. Skunk allows
+`make(1)(2)` — repeated argument groups. Keeping the groups explicit means the
+AST records what was written rather than pre-interpreting it as currying. The
+comment in the source says exactly this, and it is a good example of an AST's
+job: *record the source faithfully, interpret later.*
+
+## `TypeSyntax` is not a type
+
+This is the distinction that trips up newcomers most often.
+
+```rust
+// src/syntax/ast.rs
+pub struct TypeSyntax {
+    pub id: NodeId,
+    pub span: Span,
+    pub kind: TypeSyntaxKind,
+}
+
+pub enum TypeSyntaxKind {
+    Builtin(BuiltinType),
+    Named { path: Path, arguments: Vec<TypeSyntax> },
+    Const(Box<TypeSyntax>),
+    Array { element: Box<TypeSyntax>, dimensions: Vec<Expr> },
+    Reference { target: Box<TypeSyntax>, mutable: bool },
+    Pointer(Box<TypeSyntax>),
+    Slice(Box<TypeSyntax>),
+    Union(Vec<TypeSyntax>),
+    Intersection(Vec<TypeSyntax>),
+    Function { parameters: Vec<TypeSyntax>, result: Box<TypeSyntax> },
+    SelfType { mutable: bool },
+}
+```
+
+`TypeSyntax` is *what the user wrote in a type position*. It contains a `Path` —
+a name — that has not been resolved to anything. `Named { path: ["Counter"] }`
+does not know whether `Counter` exists.
+
+`TypeId` is *a semantic type*. It is interned, it points at a resolved `DefId`,
+and it is guaranteed to denote something real.
+
+```mermaid
+flowchart LR
+    subgraph SYN["Syntax phase"]
+        TS["TypeSyntax<br/><code>Named { path: Counter }</code><br/><i>a name, unverified</i>"]
+    end
+    subgraph SEM["Semantic phase"]
+        TI["TypeId(14)<br/><code>Nominal { definition: DefId(0), args: [] }</code><br/><i>a real type</i>"]
+    end
+    TS -->|"resolver + model"| TI
+
+    style SYN fill:#EAF3F7,stroke:#1F6F8B
+    style SEM fill:#E9F8F1,stroke:#40C98A
+```
+
+Notice `Array { dimensions: Vec<Expr> }` — array sizes are *expressions* in the
+syntax, because `int[N]` might refer to a constant. They become `Vec<u64>` in the
+semantic `TypeKind::Array` once evaluated. That is a phase boundary doing its
+job.
+
+## The invariant
+
+> **Syntax AST invariant:** nodes contain source names and never contain semantic
+> types. No `TypeId`, no `DefId`, no `LocalId`.
+
+This is enforced by construction — `ast.rs` does not import those types. It means
+the AST is meaningful without any side tables, which is what makes it a good
+input for tooling like formatters that do not want to run the whole compiler.
+
+## Our example as an AST
+
+```text
+Module
+└── entries
+    ├── TopLevel { kind: Struct(StructDecl {
+    │       name: "Counter",
+    │       generic_parameters: [],
+    │       fields: [ StructField { name: "value", ty: Builtin(Int) } ],
+    │       methods: []                     ← still empty; see Chapter 8
+    │   })}
+    ├── TopLevel { kind: Attach(AttachDecl {
+    │       target: Named { path: ["Counter"] },
+    │       methods: [ FunctionDecl "new", FunctionDecl "bump" ]
+    │   })}
+    └── TopLevel { kind: Function(FunctionDecl {
+            name: "main",
+            body: Block { statements: [ Local(..), Print(..) ] }
+        })}
+```
+
+The `Counter` struct and its methods are *separate top-level entries*. That is
+faithful to what the user wrote. Chapter 8 is about why the compiler refuses to
+keep it that way.
+
+---
+
+# Chapter 8: Normalization
+
+## One idea
+
+Skunk lets you write methods in two places:
+
+```skunk
+attach Counter {                    // inherent methods
+    function new(start: int): Counter { ... }
+}
+
+conform Writer for Counter {        // trait implementation
+    function write(mut self, v: int): int { ... }
+}
+```
+
+Both attach behaviour to `Counter`. If every downstream phase had to handle
+"methods declared inside the struct", "methods in an `attach`", and "methods in a
+`conform`" separately, that is three code paths in the resolver, three in the
+checker, three in HIR lowering. Each is an opportunity to handle one case and
+forget the others.
+
+Normalization collapses them to one.
+
+```mermaid
+flowchart TD
+    subgraph BEFORE["Before — three entries"]
+        S1["StructDecl Counter<br/>methods: []"]
+        A1["AttachDecl → Counter<br/>methods: [new, bump]"]
+        C1["ConformanceDecl Writer for Counter<br/>methods: [write]"]
+    end
+
+    subgraph AFTER["After — two entries"]
+        S2["StructDecl Counter<br/>methods: [new, bump, write]"]
+        I2["ImplementationDecl<br/>Writer for Counter<br/><i>no methods — a record</i>"]
+    end
+
+    BEFORE ==>|normalize| AFTER
+
+    style BEFORE fill:#FFF4E6,stroke:#D9822B
+    style AFTER fill:#E9F8F1,stroke:#40C98A
+```
+
+Methods move into the nominal declaration. The `conform` block leaves behind an
+`ImplementationDecl` — a *record* that the conformance exists, with no methods.
+That record is what the checker consults to answer "does `Counter` implement
+`Writer`?", and what the backend uses to decide which vtables to emit.
+
+`AttachDecl` disappears entirely. It carried no information beyond its methods.
+
+## The code
+
+```rust
+// src/syntax/normalize.rs
+for mut entry in module.entries {
+    match &mut entry.kind {
+        TopLevelKind::Struct(declaration) => {
+            declaration
+                .methods
+                .extend(methods.remove(&declaration.name).unwrap_or_default());
+            output.push(entry);
+        }
+        TopLevelKind::Enum(declaration) => {
+            declaration
+                .methods
+                .extend(methods.remove(&declaration.name).unwrap_or_default());
+            output.push(entry);
+        }
+        TopLevelKind::Attach(_) => {}                       // dropped
+        TopLevelKind::Conformance(declaration) => {
+            entry.kind = TopLevelKind::Implementation(ImplementationDecl {
+                generic_parameters: std::mem::take(&mut declaration.generic_parameters),
+                traits: std::mem::take(&mut declaration.traits),
+                target: declaration.target.clone(),
+            });
+            output.push(entry);
+        }
+        _ => output.push(entry),
+    }
+}
+```
+
+Straightforward once you know the intent. The `methods` map was built in an
+earlier loop, keyed by target type name.
+
+## Validation that happens here
+
+Normalization is also the first phase that rejects programs, and it is a good
+place to see the diagnostic style in practice. It checks:
+
+| Check | Code |
+|---|---|
+| `attach`/`conform` target is a nominal type | `E1100` |
+| the target type actually exists | `E1101` |
+| `conform` targets a struct specifically | `E1102` |
+| `conform` methods declare `self` first | `E1103` |
+| no duplicate method name on one type | `E1104` |
+| a static attached function does not collide with an enum variant | `E1105` |
+
+These are *source-level* checks — they need no types, only names and shapes.
+That is the criterion for belonging in this phase.
+
+There is also a small inference convenience. Writing
+
+```skunk
+conform Writer[T] for Box[T] { ... }
+```
+
+normally requires declaring `T`. If the target's arguments exactly match the
+declaring type's parameters, normalization infers the binder for you.
+
+## The invariant
+
+> **After normalization:** no `Attach` or `Conformance` entries remain. Every
+> method lives in the `methods` vector of its owning `Struct` or `Enum`. Trait
+> conformance is recorded as `Implementation`.
+
+Every later phase depends on this. If you add a third way to declare methods,
+this is where it must be collapsed — not in the resolver, and definitely not in
+the backend.
+
+---
+
+# Chapter 9: Modules, Imports, and Private Names
+
+## The model
+
+Skunk's module system is deliberately simple. One file is one module. `import`
+pulls in another file. `export` marks a declaration as visible outside its file.
+
+```skunk
+// mylib/math.skunk
+module mylib.math;
+
+export function add(a: int, b: int): int { return a + b; }
+
+function helper(x: int): int { return x * 2; }   // private
+```
+
+```skunk
+// main.skunk
+import mylib.math;
+
+function main(): void { print(add(1, 2)); }
+```
+
+## Loading
+
+`src/syntax/loader.rs` walks the import graph, parses each file into its own
+`Module`, and merges everything into one `Module` that the rest of the compiler
+sees.
+
+```mermaid
+flowchart TD
+    E["main.skunk<br/><i>entry</i>"]
+    A["mylib/math.skunk"]
+    B["mylib/util.skunk"]
+    M["<b>One merged Module</b><br/>all entries, one SourceMap"]
+
+    E -->|import| A
+    E -->|import| B
+    A -->|import| B
+
+    E --> M
+    A --> M
+    B --> M
+
+    style M fill:#E9F8F1,stroke:#40C98A
+```
+
+Two sets guard the walk:
+
+```rust
+// src/syntax/loader.rs
+struct ProgramLoader {
+    module_root: PathBuf,
+    sources: SourceMap,
+    visited: HashSet<PathBuf>,     // already merged — skip
+    loading: HashSet<PathBuf>,     // on the current path — a cycle
+}
+```
+
+`visited` makes the diamond above work: `util.skunk` is imported twice but merged
+once. `loading` catches import cycles and reports them instead of recursing
+forever.
+
+Paths are canonicalised before being used as keys, so `./util.skunk` and
+`../mylib/util.skunk` are recognised as the same file.
+
+## Why private names get mangled
+
+Here is the problem. After merging, every declaration from every file sits in one
+flat `Vec<TopLevel>`. Two files can each have a private `helper`. In one flat
+list, that is a duplicate-declaration error — but the user did nothing wrong.
+
+The loader's answer is to rename private declarations so they cannot collide:
+
+```rust
+// src/syntax/loader.rs
+fn mangle(module_name: &str, name: &str) -> String {
+    // ...
+    format!("__{module}_{name}")
+}
+```
+
+`helper` in `mylib.math` becomes `__mylib_math_helper`. Exported names are left
+alone — they are meant to be globally visible, and colliding exports *are* a real
+error.
+
+The loader's own test pins the behaviour:
+
+```rust
+// src/syntax/loader.rs
+#[test]
+fn loads_imports_and_mangles_private_names_in_syntax() {
+    // ...
+    assert!(names.contains(&"__mylib_math_helper"));
+}
+```
+
+Renaming a declaration is only half the work — every *reference* to it inside the
+same module must be renamed too, which is what the bulk of `loader.rs` does.
+
+## Consequences you will notice
+
+**Error messages can show mangled names.** If you see `__mylib_math_helper` in a
+diagnostic, that is a private function from `mylib.math`. This is a wart; a
+better implementation would keep the original name for display.
+
+**The merged module is flat.** There is no module hierarchy after loading. Later
+phases never think about modules at all, which is a real simplification — at the
+cost of the mangled names leaking.
+
+> **⚠ Seam.** Name mangling by string rewriting is fragile. A proper fix would
+> give each module its own namespace in the resolver, so `DefId`s do the
+> disambiguating and names stay pristine. That is a natural companion to the
+> `check.rs` retirement discussed in Chapter 29.
+
+---
+
+# Part III — Generics
+
+---
+
+# Chapter 10: How Generics Become Machine Code
+
+## The problem
+
+```skunk
+struct Box[T] {
+    item: T;
+}
+
+function unwrap[T](b: Box[T]): T {
+    return b.item;
+}
+```
+
+A CPU has no notion of `T`. It can load 4 bytes or 8 bytes; it cannot load "however
+many bytes a `T` happens to be". So `Box[T]` cannot exist at runtime. Something
+has to make it concrete.
+
+There are two classic answers.
+
+**Boxing (type erasure).** Represent every `T` as a pointer. One machine-level
+`Box` handles all types, because everything is pointer-sized. This is what Java
+does. It is compact — one copy of the code — but every value gets heap-allocated
+and every access goes through an indirection.
+
+**Monomorphization.** For each concrete type actually used, generate a separate
+copy of the code with `T` substituted. `Box[int]` and `Box[string]` become two
+distinct structs with two distinct `unwrap` functions. This is what C++ templates
+and Rust do. It is fast — no indirection, full inlining — at the cost of code
+size.
+
+Skunk monomorphizes.
+
+```mermaid
+flowchart TD
+    subgraph SRC["What you write"]
+        G["<code>struct Box[T] { item: T; }</code><br/><code>function unwrap[T](b: Box[T]): T</code>"]
+        U1["<code>Box[int]</code> used in main"]
+        U2["<code>Box[string]</code> used in main"]
+    end
+
+    subgraph OUT["What the compiler generates"]
+        M1["<code>struct Box_int { item: int; }</code><br/><code>function unwrap_int(b: Box_int): int</code>"]
+        M2["<code>struct Box_string { item: string; }</code><br/><code>function unwrap_string(b: Box_string): string</code>"]
+    end
+
+    G --> M1
+    G --> M2
+    U1 -.->|drives| M1
+    U2 -.->|drives| M2
+
+    style SRC fill:#EAF3F7,stroke:#1F6F8B
+    style OUT fill:#E9F8F1,stroke:#40C98A
+```
+
+## The three jobs
+
+Monomorphization is really three problems wearing a trenchcoat.
+
+**Discovery.** Which instantiations does the program actually use? You cannot
+generate all of them — there are infinitely many. You must walk the program from
+its entry points and collect the ones reached. And discovery is recursive: if
+`Box[int]` is used, and `Box[T]::get` calls `Wrapper[T]::of`, then
+`Wrapper[int]` is now also needed.
+
+**Substitution.** Given `Box[T]` and `T = int`, produce `Box[int]` — rewriting
+every occurrence of `T` in fields, parameters, return types, and the bodies of
+methods.
+
+**Naming.** The two copies need distinct names, deterministically generated, so
+that separate parts of the compiler independently agree on what to call
+`Box[int]`.
+
+## When to do it
+
+This is the design decision with the biggest downstream consequences.
+
+**Before type checking** (what Skunk does, and what C++ does): substitute first,
+then check the resulting concrete code. Simple to implement — the checker never
+sees a type variable. But errors are reported against generated code, which is
+why C++ template errors are famously bad, and a generic function with no uses is
+never checked at all.
+
+**After type checking** (what Rust does): check the generic code once, abstractly,
+proving it correct for *every* `T` satisfying its bounds. Then instantiate. Much
+better errors, catches mistakes in unused generics — but the checker must reason
+about type variables and bounds, which is substantially more machinery.
+
+Skunk expands before checking, and Chapter 11 covers the machinery — and its
+cost.
+
+## Bounds
+
+Substituting blindly is not enough. Consider:
+
+```skunk
+function save[T: Writer](w: *T, value: int): int {
+    return w.write(value);
+}
+```
+
+`w.write(value)` is only valid if `T` has a `write` method. The bound `T: Writer`
+is the promise that it does, and it does two jobs: it lets the compiler verify
+the generic body, and it lets a call site be rejected when the argument does not
+qualify.
+
+Skunk's grammar supports three flavours:
+
+```pest
+capability_bounds = { ":" ~ trait_bound ~ ("&" ~ trait_bound)* }   // T: Writer & Resettable
+lower_type_bound  = { ">:" ~ _type }                               // T >: Base
+upper_type_bound  = { "<:" ~ _type }                               // T <: Derived
+where_clause      = { "where" ~ where_predicate ~ ("," ~ where_predicate)* }
+```
+
+Capability bounds (`T: Writer`) are the common case. The `&` form is an
+intersection — `T` must satisfy every listed trait.
+
+## Shapes versus traits
+
+Skunk has a second, subtler mechanism:
+
+```skunk
+shape WriterLike {
+    function write(mut self, value: int): int;
+}
+```
+
+A `trait` requires an explicit `conform` declaration. A `shape` is *structural* —
+any type with a matching `write` method satisfies `WriterLike`, whether or not
+anybody said so.
+
+The runtime consequence is the important part: a trait can be used as a trait
+object (`writer: Writer = ...`), which needs a vtable. A shape cannot — it exists
+only as a compile-time constraint on generic parameters, and vanishes entirely
+after monomorphization. You will see this reflected in MIR, where `Shape` is a
+declaration kind carrying signatures but no runtime layout:
+
+```rust
+// src/mir/mod.rs
+/// Shapes participate in compile-time structural constraints but have no
+/// runtime layout. Keeping their signatures here makes MIR self-describing.
+Shape { definition: DefId, methods: Vec<TraitMethodDeclaration> },
+```
+
+---
+
+# Chapter 11: The Specialization Tree
+
+> This chapter documents the largest piece of architectural debt in the
+> compiler. It is written to be useful rather than diplomatic, because you will
+> have to work in this code and you should know what you are walking into.
+
+## What happens
+
+Between the syntax AST and semantic analysis, the program is converted into a
+*different* tree, expanded, then converted back.
+
+```mermaid
+flowchart LR
+    A1["<code>syntax::ast::Module</code><br/><i>NodeId, Span, TypeSyntax</i>"]
+    T1["<code>specialization::tree::Node</code><br/><i>strings, structural Type</i>"]
+    T2["expanded<br/><code>tree::Node</code>"]
+    A2["<code>syntax::ast::Module</code><br/><i>concrete, regenerated</i>"]
+
+    A1 -->|"convert::to_tree<br/>1,729 lines"| T1
+    T1 -->|"expand::prepare_program"| T2
+    T2 -->|"analysis::check"| T2
+    T2 -->|"convert::from_tree"| A2
+
+    style T1 fill:#FFF4E6,stroke:#D9822B
+    style T2 fill:#FFF4E6,stroke:#D9822B
+```
+
+`src/specialization/convert.rs` implements both directions and is 1,729 lines of
+mechanical translation.
+
+## Why it exists
+
+The honest history: `tree::Node` is the compiler's *original* AST. The typed
+`syntax::ast` module, the resolver, `SemanticModel`, HIR, and MIR were all built
+later, as a better foundation. The specialization machinery — and the type
+checker that runs on it — were never migrated.
+
+So the round trip is not a design. It is the boundary between the old compiler
+and the new one, and the conversion functions are the airlock between them.
+
+## What the tree looks like
+
+```rust
+// src/specialization/tree.rs
+pub enum Node {
+    Program { statements: Vec<Node> },
+    StructDeclaration {
+        name: String,
+        fields: Vec<(String, Type)>,
+        functions: Vec<Node>,
+    },
+    GenericStructDeclaration {
+        name: String,
+        generic_params: Vec<String>,
+        generic_bounds: HashMap<String, Vec<String>>,
+        subtype_bounds: HashMap<String, SubtypeBounds>,
+        // ...
+    },
+    // ... 44 variants total
+}
+```
+
+Everything is a `String`. Generic parameters are strings, bounds are maps from
+string to string. This is exactly the design Chapter 3 argued against — and it is
+why substitution here is string rewriting rather than ID remapping.
+
+## Two problems you must know about
+
+### Only 8 of 44 variants carry a location
+
+```rust
+// src/specialization/tree.rs
+pub struct Metadata {
+    pub span: Span,
+}
+```
+
+Grep for `metadata: Metadata` in `tree.rs` and you get eight hits, out of 44
+`Node` variants.
+
+The consequence is visible in error messages. Where a node happens to carry
+metadata, the checker formats a location into the message by hand:
+
+```rust
+// src/analysis/check.rs
+Err(format!(
+    "error {}:{}: Window::create expects width, height, and title",
+    metadata.span.line, metadata.span.start
+))
+```
+
+Where it does not — roughly two thirds of error sites — there is simply no
+location available at any price. This is the root cause of Skunk's weakest
+diagnostics.
+
+### `Span` contains a copy of the source
+
+```rust
+// src/specialization/tree.rs
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub line: usize,
+    pub input: String,   // the entire source text — per span
+}
+```
+
+Every span carries a full copy of the file it came from. This is a significant
+contributor to the compiler's memory use and to its 611 `.clone()` calls.
+
+**Do not extend this type.** If you need to add location information anywhere,
+use `source_map::Span` — twelve bytes, `Copy`, and what `Diagnostic` already
+consumes.
+
+## Expansion
+
+`src/specialization/expand/` is where the actual work happens.
+
+```rust
+// src/specialization/expand/mod.rs
+fn prepare(&mut self) -> Result<Node, String> {
+    self.validate_traits()?;
+    self.validate_impls()?;
+    let mut output = Vec::<Node>::new();
+    output.extend(self.root_traits.clone());
+    output.extend(self.root_concrete_impls.clone());
+    for statement in self.root_statements.clone() {
+        // transform each declaration, discovering instantiations as it goes
+    }
+    // ...
+}
+```
+
+The expander holds indexes of generic templates (`concrete_structs`,
+`concrete_enums`, generated-node tables) and a set of "stacks" —
+`function_stack`, `struct_stack`, `enum_stack`, `trait_stack` — which guard
+against infinite recursion when a generic instantiates itself.
+
+**Determinism matters enormously here.** The order in which specializations are
+emitted must be stable, because it determines generated names, which determine
+LLVM symbol names. A `HashMap` iteration order leaking into that pipeline would
+make builds non-reproducible. The `GeneratedNodes` tables exist to keep emission
+ordered.
+
+## Working in this code
+
+Practical advice:
+
+- **Change `convert.rs` in both directions at once.** `to_tree` and `from_tree`
+  must stay inverse. A field added to one and not the other loses information
+  silently.
+- **Use `--debug` stages 04, 05, and 06.** They show the tree going in, the
+  expanded tree, and the AST coming back out. Diffing 04 against 06 for a
+  non-generic program is a good sanity check — it should round-trip cleanly.
+- **Expect no spans.** When you add an error here, it will probably have no
+  location. Write the message so it is still actionable.
+- **Do not add features here if you can avoid it.** Anything expressible after
+  the semantic boundary belongs there instead.
+
+## Where it is going
+
+The intended future is to expand generics *after* type analysis, on typed HIR.
+Then `tree.rs`, `convert.rs`, and the legacy checker all disappear together —
+roughly 4,000 lines — and generics become an operation on well-typed data
+instead of a string rewrite.
+
+That is a large change and it is not scheduled. Chapter 29 lays out the
+sequencing.
+
+---
+
+# Chapter 12: Inference and Substitution
+
+## Inferring type arguments
+
+You can write the arguments explicitly:
+
+```skunk
+print(unwrap(Option[int]::None()));
+```
+
+But usually you do not have to:
+
+```skunk
+counter: Counter = Counter::new(41);
+print(save(console, 4));            // T inferred from `console`
+```
+
+Inference in Skunk is *unification against the expected shape*. Given a call to
+`save[T](writer: *T, value: int)` with an argument of type `*ConsoleWriter`, the
+expander matches the parameter pattern `*T` against `*ConsoleWriter`, binds
+`T = ConsoleWriter`, and proceeds.
+
+This is deliberately much weaker than Hindley–Milner. It is local — one call at a
+time, no constraint set propagated across statements. When the arguments do not
+determine a parameter, you must annotate:
+
+```skunk
+explicit: Result[int, AppError] = Result[int, AppError]::Ok(7);
+```
+
+`Result::Ok(7)` cannot infer `E` from `7` alone, so the annotation is required.
+
+## Contextual inference for enum constructors
+
+There is one place inference reaches backwards from the expected type:
+
+```skunk
+function success(value: int): Result[int, AppError] {
+    return Result::Ok(value);        // E inferred from the return type
+}
+```
+
+The expected type of a `return` is the function's declared result, so
+`Result::Ok(value)` can take `[int, AppError]` from context. This applies to
+returns, typed initialisers, assignments, struct fields, array elements, and
+arguments to concrete functions.
+
+## Substitution
+
+Once bindings are known, substitution walks the template and replaces parameters.
+Because the specialization tree is string-based, this is a rewrite of names and
+`Type` values:
+
+```text
+GenericStructDeclaration                StructDeclaration
+  name: "Box"                             name: "Box_int"
+  generic_params: ["T"]          ──►      fields: [("item", Int)]
+  fields: [("item", Custom("T"))]         functions: [ ...substituted... ]
+```
+
+Method bodies are substituted too — every `T` in a parameter, local declaration,
+static call, or struct initialiser inside `Box[T]`'s methods becomes `int`.
+
+## Bound checking
+
+Before substituting, the expander verifies the argument satisfies the bounds:
+
+```skunk
+function save[T: WriterLike](writer: *T, value: int): int { ... }
+```
+
+Calling `save` with a type lacking a `write` method must fail *here*, with a
+message about the bound — not later, with a confusing error inside generated
+code. This is the main defence against C++-style template error messages, and it
+is why `validate_traits` and `validate_impls` run at the start of `prepare`.
+
+Supertraits are collected transitively, so `trait Writer: Readable` means
+satisfying `Writer` also satisfies `Readable`. Cycles in that graph are detected
+and reported rather than hanging.
+
+## The output contract
+
+After expansion the program contains **no generic declarations at all**. Every
+struct, enum, trait, and function is concrete. That is what allows
+`analysis::check` and everything after it to ignore type variables completely.
+
+The contract is verified much later, at the end of the semantic phase, by
+`specialization::seal` — Chapter 17. Sealing walks the finished HIR and proves
+that no runtime-facing type still mentions a generic parameter. If expansion
+missed something, that is where it is caught, with a real span attached.
+
+---
+
+# Part IV — Semantics
+
+---
+
+# Chapter 13: Name Resolution
+
+## The job
+
+Resolution answers one question, everywhere: **what does this name refer to?**
+
+It does not answer "is this well typed". Those are genuinely separate problems,
+and keeping them apart is what lets both stay comprehensible. Resolution is
+purely lexical — it needs to know about scopes, not about types.
+
+```rust
+// src/analysis/resolver.rs
+//! Name resolution and lexical scope construction.
+//!
+//! Resolution assigns stable identities without performing type checking. It
+//! is the only phase that turns source-level names into `DefId`/`LocalId`.
+```
+
+"The only phase" is the important clause. If you find yourself doing a name
+lookup somewhere else in the compiler, you are almost certainly doing something
+wrong.
+
+## Two namespaces
+
+Skunk keeps types and values in separate namespaces:
+
+```rust
+// src/analysis/resolver.rs
+struct Resolver {
+    resolutions: Resolutions,
+    value_definitions: HashMap<String, DefId>,
+    type_definitions: HashMap<String, DefId>,
+    value_scopes: Vec<HashMap<String, LocalId>>,
+    type_scopes: Vec<HashMap<String, DefId>>,
+    diagnostics: Vec<Diagnostic>,
+}
+```
+
+So a struct `Counter` and a function `Counter` can coexist — the compiler always
+knows from context which namespace it is looking in. A type annotation looks in
+the type namespace; an expression looks in the value namespace.
+
+The `Vec<HashMap<...>>` is a scope stack. Entering a block pushes; leaving pops.
+Lookup walks from the innermost frame outwards, which is what gives you shadowing
+for free.
+
+```mermaid
+flowchart TD
+    subgraph STACK["value_scopes — innermost last"]
+        S0["global<br/>counter → DefId(5)"]
+        S1["fn main<br/>counter → LocalId(0)"]
+        S2["inner block<br/>amount → LocalId(1)"]
+    end
+
+    Q["lookup 'counter'"] --> S2
+    S2 -->|"miss"| S1
+    S1 -->|"hit → LocalId(0)"| R["ValueResolution::Local(LocalId(0))"]
+
+    style R fill:#E9F8F1,stroke:#40C98A
+```
+
+## Two passes
+
+```rust
+// src/analysis/resolver.rs
+pub fn resolve(module: &Module) -> Result<Resolutions, Vec<Diagnostic>> {
+    let mut resolver = Resolver::default();
+    resolver.collect_top_level(module);
+    resolver.resolve_module(module);
+    // ...
+}
+```
+
+`collect_top_level` runs first and registers every top-level declaration. Only
+then does `resolve_module` walk bodies.
+
+This ordering is what makes forward references work. `main` can call a function
+declared below it, because by the time bodies are resolved, every top-level name
+is already known. Without the split, declaration order would matter — a
+C-style requirement that nobody enjoys.
+
+## The output
+
+```rust
+// src/analysis/resolver.rs
+pub struct Resolutions {
+    pub definitions: Vec<Definition>,
+    pub locals: Vec<LocalDefinition>,
+    pub item_definitions: HashMap<NodeId, DefId>,
+    pub function_definitions: HashMap<NodeId, DefId>,
+    pub generic_definitions: HashMap<NodeId, DefId>,
+    pub field_definitions: HashMap<NodeId, FieldId>,
+    pub variant_definitions: HashMap<NodeId, VariantId>,
+    pub supertrait_definitions: HashMap<NodeId, Vec<DefId>>,
+    pub local_bindings: HashMap<NodeId, Vec<LocalId>>,
+    pub values: HashMap<NodeId, ValueResolution>,
+    pub types: HashMap<NodeId, TypeResolution>,
+}
+```
+
+Read this as two groups.
+
+**`definitions` and `locals` are the arrays.** `DefId(n)` indexes into
+`definitions`; `LocalId(n)` indexes into `locals`. This is why the IDs have an
+`index()` method — they are array subscripts.
+
+**Everything else maps `NodeId` → resolution.** For any syntax node, you can ask
+what it resolved to. `values` handles expression positions; `types` handles type
+positions.
+
+The two resolution enums are worth memorising:
+
+```rust
+pub enum ValueResolution {
+    Definition(DefId),   // a function, global, or similar
+    Local(LocalId),      // a parameter or local variable
+}
+
+pub enum TypeResolution {
+    Definition(DefId),        // struct, enum, trait, alias
+    GenericParameter(DefId),  // T in Box[T]
+    Builtin(BuiltinType),     // int, string, ...
+    Intrinsic(IntrinsicType), // Window, Memory, ...
+    SelfType,                 // Self
+}
+```
+
+Note that generic parameters get `DefId`s too. `T` is a declaration — it has a
+scope and can be referred to — even though it disappears after expansion.
+
+## Errors from this phase
+
+Resolution reports the errors that need no types:
+
+- a name that does not exist
+- a duplicate declaration
+- a use before declaration in a local scope
+
+The duplicate-declaration diagnostic is the one quoted in Chapter 4, and it is a
+good model to copy:
+
+```rust
+Diagnostic::error(format!("duplicate declaration of `{name}`"))
+    .with_code("E2001")
+    .at(entry.span)
+    .label(previous.span, "previous declaration is here")
+```
+
+There is one deliberate exception: repeated `extern` declarations are allowed,
+because C headers get included more than once. Signature compatibility is left as
+a semantic concern.
+
+---
+
+# Chapter 14: Building the Semantic Model
+
+## From names to types
+
+The resolver produced identities. `analysis::model` turns those identities into
+*types*.
+
+```rust
+// src/analysis/model.rs
+pub fn analyze_declarations(
+    module: &Module,
+    resolutions: Resolutions,
+) -> Result<SemanticModel, Vec<Diagnostic>> {
+    let mut analyzer = Analyzer { /* ... */ };
+    analyzer.collect_nominal_types();
+    analyzer.collect_aliases();
+    analyzer.collect_signatures_and_bindings();
+    // ...
+}
+```
+
+Three passes, and the order is forced by the dependencies between them.
+
+```mermaid
+flowchart TD
+    A["<b>1. collect_nominal_types</b><br/>Every struct/enum/trait gets a TypeId.<br/><i>Bodies not yet examined.</i>"]
+    B["<b>2. collect_aliases</b><br/>Resolve <code>type Foo = Bar</code>.<br/><i>Needs step 1 for targets.</i>"]
+    C["<b>3. collect_signatures_and_bindings</b><br/>Field types, parameter types,<br/>return types, local types.<br/><i>Needs 1 and 2.</i>"]
+
+    A --> B --> C
+
+    style A fill:#EAF3F7,stroke:#1F6F8B
+    style C fill:#E9F8F1,stroke:#40C98A
+```
+
+Why can't it be one pass? Because of mutual reference:
+
+```skunk
+struct Node {
+    next: *Node;          // needs Node's TypeId while defining Node
+}
+```
+
+By registering all nominal *identities* before looking at any field, the second
+reference resolves fine. This two-phase shape — declare everything, then fill in
+bodies — recurs throughout compiler construction.
+
+## `TypeKind`
+
+```rust
+// src/analysis/types.rs
+pub enum TypeKind {
+    Error,
+    Never,
+    Builtin(BuiltinType),
+    Intrinsic(IntrinsicType),
+    GenericParameter(DefId),
+    Nominal { definition: DefId, arguments: Vec<TypeId> },
+    Const(TypeId),
+    Array { element: TypeId, dimensions: Vec<u64> },
+    Reference { target: TypeId, mutable: bool },
+    Pointer(TypeId),
+    Slice(TypeId),
+    Union(Vec<TypeId>),
+    Intersection(Vec<TypeId>),
+    Function { parameters: Vec<TypeId>, result: TypeId },
+}
+```
+
+Compare this against `TypeSyntaxKind` from Chapter 7. They look similar, and the
+differences are exactly the work this phase does:
+
+| `TypeSyntaxKind` | `TypeKind` | What changed |
+|---|---|---|
+| `Named { path, arguments }` | `Nominal { definition: DefId, arguments: Vec<TypeId> }` | Name → resolved declaration |
+| `Array { dimensions: Vec<Expr> }` | `Array { dimensions: Vec<u64> }` | Expression → evaluated constant |
+| `SelfType { mutable }` | *(resolved to the owner)* | `Self` → the actual type |
+| *(no equivalent)* | `Error`, `Never` | Compiler-internal types |
+
+Every recursive position also changed from `Box<TypeSyntax>` to `TypeId`. That is
+interning: a type is a flat integer, not a tree.
+
+## `Never` and divergence
+
+`TypeKind::Never` is the type of an expression that does not produce a value —
+one that always returns, panics, or loops forever.
+
+It matters because of code like this:
+
+```skunk
+function f(x: int): int {
+    if (x > 0) { return 1; }
+    return 0;
+}
+```
+
+The `if` branch does not fall through. Something has to represent "control does
+not continue here", and `Never` is it. Being a subtype of everything, it can
+appear wherever a value is expected without complaint.
+
+HIR has a related concept at statement level:
+
+```rust
+// src/hir/mod.rs
+pub enum Flow {
+    FallsThrough,
+    Returns,
+    Diverges,
+}
+```
+
+Every `Block`, `If`, `Match`, and `For` carries a `Flow`. This is what makes
+"missing return statement" checkable, and what tells MIR lowering whether to emit
+a fall-through edge after a construct.
+
+---
+
+# Chapter 15: The Legacy Type Checker
+
+> **⚠ Seam.** This chapter documents `src/analysis/check.rs` — 3,847 lines,
+> containing one 859-line function. It is the oldest surviving component and the
+> one scheduled for retirement. You need to understand it because it currently
+> owns most of Skunk's type rules.
+
+## What it does
+
+`check.rs` type-checks the *expanded specialization tree* — after
+monomorphization, before the semantic model is built.
+
+```rust
+// src/analysis/check.rs
+/// Type-checks a fully loaded and monomorphized program.
+///
+/// Successful completion means the program is semantically valid enough for the
+/// LLVM backend to consume.
+pub fn check(node: &Node) -> Result<(), String> {
+    let mut var_tables = SymbolTables::new();
+    var_tables.add(SymbolTable::new());
+    let mut global_scope = GlobalScope::new();
+    let Node::Program { statements } = node else {
+        return Err("type-checking input must have a program root".to_string());
+    };
+    for statement in statements {
+        global_scope.add(statement);
+    }
+    match resolve_type(&global_scope, &mut var_tables, node, None) {
+        Err(e) => Err(e.to_string()),
+        Ok(_) => Ok(()),
+    }
+}
+```
+
+Note the return type: `Result<(), String>`. No `Diagnostic`, no code, no span.
+
+## How it is built
+
+Two structures do the work.
+
+**`GlobalScope`** indexes top-level declarations by name — structs, enums,
+traits, functions, globals. Built once at the start.
+
+**`SymbolTables`** is a stack of `SymbolTable`, each a name → `Symbol` map. It
+also tracks unsafe-block nesting:
+
+```rust
+// src/analysis/check.rs
+impl SymbolTables {
+    fn enter_unsafe(&mut self) { /* ... */ }
+    fn exit_unsafe(&mut self) { /* ... */ }
+    fn is_unsafe(&self) -> bool { /* ... */ }
+}
+```
+
+Everything is keyed by `String`. This is the design Chapter 3 argued against, and
+here you can see the consequences directly: a `SymbolTable` cannot distinguish
+two same-named things from different scopes except by stack position, and nothing
+in the type system prevents passing a field name where a type name is wanted.
+
+## `resolve_type`
+
+One function does the bulk of the work. It is 859 lines and is a single `match`
+over `Node`:
+
+```rust
+// src/analysis/check.rs
+fn resolve_type(
+    global_scope: &GlobalScope,
+    symbol_tables: &mut SymbolTables,
+    node: &Node,
+    expected_type_opt: Option<&Type>,
+) -> Result<ResolveResult, String> {
+    match node {
+        Node::Program { statements } => { /* ... */ }
+        Node::StructInitialization { _type, .. } => { /* ... */ }
+        // ... every node variant
+    }
+}
+```
+
+The `expected_type_opt` parameter is how bidirectional checking is threaded
+through. When checking `x: byte = 1`, the expected type `byte` is passed down so
+the literal `1` can be given the right width rather than defaulting to `int`.
+This is a genuinely good idea implemented in an awkward place.
+
+`ResolveResult` carries the type plus a `returned` flag used for reachability:
+
+```rust
+// src/analysis/check.rs
+struct ResolveResult {
+    sk_type: Type,
+    returned: bool,
+}
+```
+
+## Access resolution
+
+The second-largest function, `resolve_access`, handles chains like
+`a.b[0].c()`. Remember from Chapter 6 that an access is a base plus a flat
+sequence of steps. `resolve_access` walks them, carrying the current type:
+
+```mermaid
+flowchart LR
+    B["base: <code>counter</code><br/>type = Counter"]
+    S1["step: <code>.value</code><br/>type = int"]
+    S2["step: <code>+ 1</code>"]
+
+    B -->|"field lookup on Counter"| S1 --> S2
+
+    style B fill:#EAF3F7,stroke:#1F6F8B
+```
+
+At each step it must handle every possible receiver: struct, enum, trait object,
+intersection, array, slice, pointer, reference, `Allocator`, `Arena`, `Window`.
+That breadth is why the function is large, and why "unsupported access step" is a
+recurring error message.
+
+## What was recently fixed here
+
+Until recently, this file also contained 49 hand-written intrinsic method checks
+— every one of `Window::create expects width, height, and title`,
+`Memory::copy expects dst, src, and byte count`, and so on, spelled out
+individually with its own arity check and per-argument type test.
+
+They have been replaced by a declarative table. Chapter 28 covers the design in
+detail, because it is a good model for how the rest of this file should be
+dismantled. The result: 414 lines deleted, error sites down from 179 to 113,
+`resolve_type` down from 1,248 lines to 859.
+
+## Working in this file
+
+- **`--debug` stage 05** shows the tree it is checking. Start there.
+- **Errors have no spans.** Write messages that identify the construct by name,
+  since you cannot point at it.
+- **Do not add rules here if you can avoid it.** New checks that can be expressed
+  on HIR belong in `hir/validate.rs` or in the model, where they get spans for
+  free.
+- **The permissive fall-through is deliberate.** Static calls on primitives,
+  `Allocator`, and pointers currently accept *any* method name and return the
+  receiver type. This is a known hole, preserved intentionally so that tightening
+  it can be a separate, testable change.
+
+---
+
+# Chapter 16: HIR
+
+## What HIR is for
+
+HIR is the first representation that is both **fully resolved** and **fully
+typed**. It is still shaped like source — there are still `if` statements and
+blocks and nested expressions — but every name is an ID and every expression has
+a type.
+
+```rust
+// src/hir/mod.rs
+//! Typed high-level intermediate representation.
+//!
+//! HIR contains resolved identities and semantic `TypeId`s only. It never
+//! embeds syntax AST nodes or unresolved source names.
+```
+
+That doc comment is the invariant. HIR is where the front end's promises are
+cashed in.
+
+## AST versus HIR
+
+Set the two side by side:
+
+```mermaid
+flowchart TD
+    subgraph AST["syntax::ast::Expr"]
+        A1["kind: Field {<br/>&nbsp;&nbsp;receiver: Expr,<br/>&nbsp;&nbsp;name: <b>String</b><br/>}"]
+        A2["<i>no type</i>"]
+    end
+
+    subgraph HIR["hir::Expr"]
+        H1["kind: Field {<br/>&nbsp;&nbsp;receiver: Expr,<br/>&nbsp;&nbsp;field: <b>FieldId</b><br/>}"]
+        H2["ty: <b>TypeId</b>"]
+    end
+
+    AST ==>|"hir::lower"| HIR
+
+    style AST fill:#EAF3F7,stroke:#1F6F8B
+    style HIR fill:#E9F8F1,stroke:#40C98A
+```
+
+```rust
+// src/hir/mod.rs
+pub struct Expr {
+    pub source: NodeId,   // where in the AST this came from
+    pub span: Span,       // where in the source
+    pub ty: TypeId,       // what type it is
+    pub kind: ExprKind,
+}
+```
+
+Three pieces of metadata on every expression. `source` and `span` are what let a
+diagnostic raised in MIR lowering still point at the user's code.
+
+## Dispatch is decided here
+
+The single most valuable thing HIR does is resolve method calls:
+
+```rust
+// src/hir/mod.rs
+pub enum MethodTarget {
+    Definition(DefId),                     // static dispatch — call this function
+    Dynamic { owner: TypeId, method: DefId }, // dynamic dispatch — vtable lookup
+    Intrinsic { owner: TypeId, name: String }, // compiler-provided
+}
+
+pub enum StaticTarget {
+    Definition(DefId),
+    Variant(VariantId),                    // enum constructor
+    Intrinsic { owner: TypeId, name: String },
+}
+```
+
+By the time something is HIR, `counter.bump(1)` is not "look up `bump`" — it is
+`MethodTarget::Definition(DefId(2))`. The decision between static and dynamic
+dispatch has already been made and recorded.
+
+This is why the backend never performs method lookup. It cannot get dispatch
+wrong, because it is not asked to make the choice.
+
+## Field access versus length
+
+A small detail that shows the value of an explicit IR:
+
+```rust
+// src/hir/mod.rs
+Field { receiver: Box<Expr>, field: FieldId },
+Length { receiver: Box<Expr> },
+```
+
+In source, `xs.len` and `point.x` look identical — both are `.` followed by a
+name. In HIR they are different node kinds, because `len` on an array is not a
+field lookup; it is a distinct operation with distinct lowering. Resolving that
+ambiguity once, here, means MIR and the backend never re-derive it.
+
+## Flow
+
+```rust
+// src/hir/mod.rs
+pub enum Flow { FallsThrough, Returns, Diverges }
+
+pub struct Block {
+    pub source: NodeId,
+    pub span: Span,
+    pub statements: Vec<Stmt>,
+    pub flow: Flow,
+}
+```
+
+Every block records whether control can reach its end. `If`, `Match`, and `For`
+carry it too. MIR lowering reads this to decide whether to emit an edge out of a
+construct, and the checker uses it for "missing return statement".
+
+## Our example in HIR
+
+```text
+Item { kind: Struct(Struct {
+    fields:  [ Field { id: FieldId(0), name: "value", ty: TypeId(4)/*int*/ } ],
+    methods: [ Function new, Function bump ],
+})}
+
+Item { kind: Function(Function {          // main
+    definition: Some(DefId(3)),
+    result: TypeId(2)/*void*/,
+    body: Block {
+        flow: FallsThrough,
+        statements: [
+            Stmt::Local {
+                local: LocalId(0),
+                ty: TypeId(14)/*Counter*/,
+                initializer: Some(Expr {
+                    ty: TypeId(14),
+                    kind: StaticCall {
+                        target: StaticTarget::Definition(DefId(1)),   // Counter::new
+                        arguments: [ Expr { ty: TypeId(4), kind: Literal(Integer(41)) } ],
+                    },
+                }),
+            },
+            Stmt::Print(Expr {
+                ty: TypeId(4)/*int*/,
+                kind: MethodCall {
+                    receiver: Expr { ty: TypeId(14), kind: Value(Local(LocalId(0))) },
+                    method: MethodTarget::Definition(DefId(2)),        // Counter::bump
+                    argument_groups: [[ Expr { ty: TypeId(4), kind: Literal(Integer(1)) } ]],
+                },
+            }),
+        ],
+    },
+})}
+```
+
+Every name is gone. Every expression has a type. Dispatch is decided.
+
+---
+
+# Chapter 17: HIR Validation and Sealing
+
+## Two gates before the middle end
+
+```mermaid
+flowchart LR
+    H["hir::Module"]
+    V["<b>hir::validate</b><br/><i>Are the IDs sane?</i>"]
+    S["<b>specialization::seal</b><br/><i>Is everything concrete?</i>"]
+    M["Ready for MIR"]
+
+    H --> V --> S --> M
+
+    style V fill:#EAF3F7,stroke:#1F6F8B
+    style S fill:#EAF3F7,stroke:#1F6F8B
+    style M fill:#E9F8F1,stroke:#40C98A
+```
+
+## Validation
+
+```rust
+// src/hir/validate.rs
+//! Structural invariants for the typed HIR boundary.
+//!
+//! HIR is the last source-oriented representation. Code generation may rely on
+//! these invariants instead of repeating bounds checks or accepting sentinel
+//! IDs left behind by an incomplete lowering rule.
+```
+
+The validator walks the whole tree and checks that every ID actually points at
+something: `FieldId`s exist in the model, `TypeId`s are in range, `LocalId`s were
+declared, spans are well-formed.
+
+This might look like paranoia — surely lowering produced valid IDs? The point is
+that it converts a *class* of bug into an immediate, localised failure. Without
+it, an incorrect `FieldId` from a buggy lowering rule surfaces as a
+`HashMap` miss in the backend, or worse, as silently wrong generated code. With
+it, you get a diagnostic naming the construct.
+
+This is a pattern worth adopting when you add an IR: write the validator at the
+same time as the data structure.
+
+## Sealing
+
+```rust
+// src/specialization/mod.rs
+//! Verifies and records the concrete program produced by generic expansion.
+//!
+//! Generic discovery happens before HIR. This phase is the stable post-HIR
+//! contract: every runtime declaration and local type must be concrete before
+//! code generation.
+
+pub fn seal(
+    module: &hir::Module,
+    model: &SemanticModel,
+) -> Result<SpecializationSet, Vec<Diagnostic>> { /* ... */ }
+```
+
+Sealing is the *proof* that Chapter 12's contract held. It walks every
+declaration and every local type, and verifies none of them still mentions a
+`TypeKind::GenericParameter`.
+
+The architectural value is the separation of concerns. Expansion runs early, on
+an untyped string tree, with poor diagnostics. Sealing runs late, on typed HIR,
+with real spans. If expansion misses an instantiation, the failure is reported
+here — with a location — instead of becoming a mysterious backend crash.
+
+The output records what must exist at runtime:
+
+```rust
+// src/specialization/mod.rs
+pub struct SpecializationSet {
+    pub definitions: Vec<DefId>,
+    pub types: Vec<TypeId>,
+}
+```
+
+Both vectors are sorted and deduplicated, which keeps downstream iteration
+deterministic — the same concern that shaped expansion in Chapter 11.
+
+---
+
+# Part V — The Middle End
+
+---
+
+# Chapter 18: Why MIR Exists
+
+## What HIR still hides
+
+HIR is typed and resolved, but it is still *shaped like source*, and source shape
+hides three things the machine needs.
+
+**Evaluation order.** `f(a) + g(b)` does not say whether `f` runs first.
+
+**Storage.** Where does the result of `f(a)` live while `g(b)` runs?
+
+**Control flow.** An `if` with an `else` inside a `for` with an early `return` is
+a nest of Rust enums. A CPU sees only conditional jumps.
+
+MIR makes all three explicit.
+
+```rust
+// src/mir/mod.rs
+//! Typed, control-flow-oriented mid-level intermediate representation.
+//!
+//! HIR preserves structured language constructs. MIR makes evaluation order,
+//! temporary values, and control-flow edges explicit before LLVM lowering.
+//! It is deliberately non-SSA: the LLVM backend remains responsible for SSA
+//! temporaries while MIR provides a small, typed contract independent of LLVM.
+```
+
+That last sentence is a real design decision, stated plainly. Full SSA
+construction is work; LLVM already does it well. MIR stops one level short and
+lets LLVM finish.
+
+## Basic blocks
+
+A **basic block** is a straight-line sequence of statements with exactly one
+entry at the top and exactly one terminator at the bottom. No jumps in the
+middle, no falling off the end.
+
+```rust
+// src/mir/mod.rs
+pub struct BasicBlock {
+    pub id: MirBlockId,
+    pub statements: Vec<Statement>,
+    pub terminator: Terminator,
+}
+
+pub enum TerminatorKind {
+    Goto { target: MirBlockId },
+    If { condition: Operand, then_target: MirBlockId, else_target: MirBlockId },
+    SwitchEnum {
+        discriminator: Operand,
+        targets: Vec<(VariantId, MirBlockId)>,
+        otherwise: MirBlockId,
+    },
+    Return(Option<Operand>),
+    Unreachable,
+}
+```
+
+A function is then a *graph*: blocks as nodes, terminators as edges.
+
+Here is what a `for` loop becomes:
+
+```mermaid
+flowchart TD
+    ENTRY["<b>bb0 — entry</b><br/>i = 0<br/>goto bb1"]
+    COND["<b>bb1 — condition</b><br/>t0 = i &lt; 10<br/>if t0 → bb2 else bb4"]
+    BODY["<b>bb2 — body</b><br/>print(i)<br/>goto bb3"]
+    UPDATE["<b>bb3 — update</b><br/>i = i + 1<br/>goto bb1"]
+    EXIT["<b>bb4 — exit</b><br/>return"]
+
+    ENTRY --> COND
+    COND -->|true| BODY
+    COND -->|false| EXIT
+    BODY --> UPDATE
+    UPDATE --> COND
+
+    style ENTRY fill:#E9F8F1,stroke:#40C98A
+    style EXIT fill:#EAF3F7,stroke:#1F6F8B
+```
+
+The nesting is gone. The loop is a cycle in a graph. This is exactly the shape
+`lower_for` builds — go back and read it in `src/mir/lower/control_flow.rs` now
+that the picture is in your head; it allocates precisely these four blocks.
+
+## Places, operands, rvalues
+
+MIR draws a three-way distinction that is worth internalising, because it removes
+a whole category of confusion.
+
+```mermaid
+flowchart TD
+    P["<b>Place</b><br/><i>a location you can address</i><br/><code>counter.value</code><br/><code>xs[3]</code><br/><code>*ptr</code>"]
+    O["<b>Operand</b><br/><i>a value you can consume</i><br/><code>copy counter.value</code><br/><code>const 41</code>"]
+    R["<b>Rvalue</b><br/><i>a computation producing a value</i><br/><code>a + b</code><br/><code>&amp;mut x</code><br/><code>Counter { value: 41 }</code>"]
+
+    P -->|"Copy(place)"| O
+    O -->|"used in"| R
+    R -->|"assigned to"| P
+
+    style P fill:#EAF3F7,stroke:#1F6F8B
+    style R fill:#E9F8F1,stroke:#40C98A
+```
+
+```rust
+// src/mir/mod.rs
+pub struct Place {
+    pub base: PlaceBase,
+    pub projections: Vec<Projection>,
+}
+
+pub enum PlaceBase {
+    Local(MirLocalId),
+    Definition(DefId),      // a global
+}
+
+pub enum ProjectionKind {
+    Dereference,
+    Field(FieldId),
+    Index(Vec<Operand>),
+    VariantField { variant: VariantId, index: u32 },
+}
+```
+
+A place is a base plus projections. `(*p).items[i].x` is: base `p`, then
+`Dereference`, then `Field(items)`, then `Index([i])`, then `Field(x)`.
+
+Crucially, each projection records the type *after* it is applied:
+
+```rust
+pub struct Projection {
+    /// The type of the place immediately after this projection is applied.
+    pub ty: TypeId,
+    pub kind: ProjectionKind,
+}
+```
+
+So the backend computing an address never has to re-derive intermediate types. It
+walks the projections and the types are handed to it. That is a lot of potential
+bugs designed away.
+
+## Calls carry their dispatch
+
+```rust
+// src/mir/mod.rs
+/// A resolved call site. Dispatch remains explicit so code generation never
+/// has to repeat method lookup or distinguish enum constructors by name.
+pub enum CallTarget {
+    Operand(Operand),                                   // calling a function value
+    Method { receiver: Operand, method: MethodCallee },
+    Static(StaticCallee),
+}
+```
+
+The comment says it: code generation never repeats method lookup. Dispatch was
+decided in HIR and is carried forward verbatim.
+
+## Explicit coercion
+
+```rust
+// src/mir/mod.rs
+pub enum RvalueKind {
+    Use(Operand),
+    /// A semantic conversion approved by the front end. Keeping it explicit
+    /// prevents code generation from guessing at assignment boundaries.
+    Coerce(Operand),
+    // ...
+}
+```
+
+Assigning an `int` to a `long`, or a `*Counter` to a `Writer` trait object,
+requires a representation change. `Coerce` marks exactly where. Without it, the
+backend would have to compare source and destination types at every assignment
+and guess whether a conversion was intended — and a guess that differs from the
+front end's is a miscompilation.
+
+---
+
+# Chapter 19: MIR Lowering
+
+## The shape of the code
+
+```rust
+// src/mir/lower/mod.rs
+pub fn lower(module: &hir::Module, model: &SemanticModel) -> Result<Module, Vec<Diagnostic>> {
+    let mut functions = Vec::new();
+    let mut diagnostics = Vec::new();
+    let declarations = declaration::lower_module(module, model, &mut functions, &mut diagnostics);
+
+    if diagnostics.is_empty() {
+        Ok(Module { declarations, functions })
+    } else {
+        Err(diagnostics)
+    }
+}
+```
+
+Split across four modules by concern:
+
+| Module | Responsibility |
+|---|---|
+| `declaration.rs` | Types, globals, extern functions; collecting function bodies |
+| `expression.rs` | Expressions → operands and rvalues, allocating temporaries |
+| `control_flow.rs` | `if`, `match`, `for` → blocks and terminators |
+| `captures.rs` | Closure environments |
+
+## Building blocks incrementally
+
+The lowerer needs to create a block before it knows the block's terminator — you
+emit the body of an `if` before you know where control goes afterwards. So blocks
+are built in draft form:
+
+```rust
+// src/mir/lower/mod.rs
+struct DraftBlock {
+    id: MirBlockId,
+    statements: Vec<Statement>,
+    terminator: Option<Terminator>,   // filled in later
+    reachable: bool,
+}
+```
+
+`terminator: Option<_>` is the incremental part; `reachable` tracks dead code
+after a `return`.
+
+Read `lower_for` with this in mind:
+
+```rust
+// src/mir/lower/control_flow.rs — abridged
+pub(super) fn lower_for(&mut self, loop_statement: &'a hir::For, source: NodeId, span: Span) {
+    if let Some(initializer) = loop_statement.initializer.as_deref() {
+        self.lower_statement(initializer);
+    }
+    if !self.current_is_open_and_reachable() { return; }
+
+    let Some(condition_target) = self.new_block(span) else { return; };
+    let Some(body_target)      = self.new_block(loop_statement.body.span) else { return; };
+    let Some(update_target)    = self.new_block(span) else { return; };
+    let Some(exit_target)      = self.new_block(span) else { return; };
+
+    self.terminate(Terminator { source, span,
+        kind: TerminatorKind::Goto { target: condition_target } });
+
+    self.current = condition_target;
+    if let Some(condition) = &loop_statement.condition {
+        let Some(condition) = self.lower_expression(condition) else { return; };
+        self.terminate(Terminator { source, span, kind: TerminatorKind::If {
+            condition, then_target: body_target, else_target: exit_target } });
+    } else {
+        self.terminate(Terminator { source, span,
+            kind: TerminatorKind::Goto { target: body_target } });
+    }
+
+    self.current = body_target;
+    self.lower_block(&loop_statement.body);
+    self.goto_if_open(update_target, source, span);
+    // ...
+}
+```
+
+Four blocks allocated up front, then filled. `self.current` is the cursor.
+`goto_if_open` only emits an edge if the block has not already been terminated —
+which is how a `return` inside a loop body does not produce unreachable
+fall-through.
+
+The `let Some(..) = .. else { return; }` pattern appears constantly: an error was
+already recorded as a diagnostic, so lowering abandons this construct and
+continues elsewhere, collecting more errors rather than stopping at the first.
+
+## Temporaries
+
+```rust
+// src/mir/mod.rs
+pub enum LocalKind { Capture, Parameter, User, Temporary }
+
+pub struct Local {
+    pub id: MirLocalId,
+    pub source: Option<LocalId>,   // None for temporaries
+    pub ty: TypeId,
+    pub mutable: bool,
+    pub kind: LocalKind,
+}
+```
+
+`self.value + amount` needs somewhere to put the sum. Lowering allocates a
+`Temporary` local, assigns the `Binary` rvalue into it, and uses it as an
+operand.
+
+`source: Option<LocalId>` is the link back to the user's variable, present for
+`User` and `Parameter` locals and absent for temporaries. That is what would let
+a future debugger map a MIR slot to a name.
+
+## Closures
+
+```rust
+// src/mir/mod.rs
+pub enum RvalueKind {
+    Closure { function: NodeId, captures: Vec<Place> },
+    // ...
+}
+
+pub struct Function {
+    pub captures: Vec<MirLocalId>,   // environment, in field order
+    pub parameters: Vec<MirLocalId>,
+    // ...
+}
+```
+
+A closure becomes two things: a separate `Function` whose `captures` are extra
+leading locals, and a `Closure` rvalue at the creation site listing the places to
+capture from. The backend turns that into a `{ ptr, ptr }` pair — code pointer
+plus environment pointer — which is why `LlvmType::Function` lowers to exactly
+that shape.
+
+## Our example in MIR
+
+```text
+fn skunk_Counter_bump(_0: *Counter, _1: int) -> int {
+    let _2: int;                     // Temporary
+    bb0:
+        _2 = Binary {
+            left:     Copy((*_0).value),
+            operator: Add,
+            right:    Copy(_1),
+        }
+        Assign { destination: (*_0).value, value: Use(Copy(_2)) }
+        Return(Some(Copy((*_0).value)))
+}
+
+fn skunk_main() -> void {
+    let _0: Counter;                 // User    — `counter`
+    let _1: int;                     // Temporary
+    bb0:
+        Call {
+            destination: Some(_0),
+            target: Static(Definition(DefId(1))),      // Counter::new
+            argument_groups: [[ Constant(Literal(Integer(41))) ]],
+        }
+        Call {
+            destination: Some(_1),
+            target: Method {
+                receiver: Copy(_0),
+                method:   Definition(DefId(2)),        // Counter::bump
+            },
+            argument_groups: [[ Constant(Literal(Integer(1))) ]],
+        }
+        Print(Copy(_1))
+        Return(None)
+}
+```
+
+Every intermediate has a slot. Evaluation order is a statement sequence. Control
+flow is explicit.
+
+---
+
+# Chapter 20: MIR Validation
+
+## The contract with the backend
+
+```rust
+// src/mir/validate/mod.rs
+//! Structural and typing invariants for MIR.
+//!
+//! LLVM lowering may rely on these checks: IDs are in range, every block has
+//! one terminator, control-flow targets exist, projected places are well typed,
+//! aggregates and calls match their semantic shapes, conditions are boolean,
+//! and return values match their function signature.
+```
+
+That comment is a list of things the backend is entitled to assume. Every item is
+one fewer defensive check in code generation.
+
+## What is checked
+
+| Check | Why it matters |
+|---|---|
+| Local and block IDs are in range | An out-of-range index would panic in the backend |
+| Every block has exactly one terminator | A block that falls off the end has no meaning |
+| Branch targets exist | A dangling `MirBlockId` is a broken CFG |
+| Projections are type-correct | `Field(f)` on a non-struct is nonsense |
+| Aggregates match their declarations | Struct literals must supply the declared fields |
+| Call arguments match signatures | Wrong arity would produce invalid LLVM |
+| `If` conditions are boolean | LLVM's `br` needs an `i1` |
+| Returns match the function result | Otherwise the ABI breaks |
+
+## Why validate what you just built
+
+Lowering produced this MIR; surely it is correct?
+
+The argument is the same as for HIR validation, and it is about *where failures
+surface*. A wrong `FieldId` from a new lowering rule, unchecked, becomes a
+`HashMap` miss deep in `mir_codegen`, or invalid LLVM IR that `clang` rejects
+with a message about a construct the Skunk programmer never wrote. Validated, it
+becomes a diagnostic naming the construct, with a span.
+
+Validation is also *executable documentation*. The clearest statement of MIR's
+invariants is the validator, and if you are unsure whether some MIR shape is
+legal, reading `src/mir/validate/` answers it faster than any prose.
+
+## In practice
+
+When you add a MIR construct:
+
+1. Add the variant.
+2. Add its lowering rule.
+3. **Add its validation rule.**
+4. Add backend support.
+
+Skipping step 3 is the most common way to introduce a bug that takes a day to
+find. The validator is split into `declaration.rs`, `value.rs`, and
+`coercion.rs`, mirroring the lowering modules, so there is an obvious home for
+each new rule.
+
+---
+
+# Part VI — The Back End
+
+---
+
+# Chapter 21: Just Enough LLVM
+
+## What LLVM is
+
+LLVM is a compiler back end you can hand a program to. You give it LLVM IR — a
+typed, portable, assembly-like language — and it gives you optimised machine code
+for whatever CPU you asked for.
+
+This is an enormous amount of work you do not have to do: instruction selection,
+register allocation, scheduling, peephole optimisation, and a separate backend
+per architecture. Skunk's entire backend is about 3,600 lines because LLVM
+handles all of that.
+
+## Skunk emits IR as text
+
+There are two ways to produce LLVM IR: call the LLVM C API through bindings like
+`inkwell`, or write out the textual form and hand it to `clang`.
+
+Skunk writes text.
+
+```rust
+// src/backend/emitter.rs
+self.emit_line(format!(
+    "call i32 (ptr, ...) @printf(ptr {}, i32 {})",
+    self.string_ptr(&format),
+    value.value
+));
+```
+
+That is `format!` producing a line of LLVM assembly, appended to a buffer.
+
+**The upside** is no native dependency, no version-matching against a system
+LLVM, trivially inspectable output, and a much simpler build. For a language
+experiment this is a very reasonable trade.
+
+**The downside** is that mistakes are caught by `clang` at parse time rather than
+by a type-checked builder API, and the error points at generated text rather than
+at the code that generated it.
+
+> **⚠ Seam.** Emitting text also means there is no abstraction boundary to
+> substitute a different backend behind. Adding a second target — Cranelift,
+> WebAssembly — would mean rewriting `backend/` rather than implementing an
+> interface. Chapter 29 discusses this.
+
+## The IR you need to read
+
+Enough to follow `emitter.rs`.
+
+**Types.** `i1` (bool), `i8`, `i16`, `i32`, `i64`, `float`, `double`, `ptr` (an
+opaque pointer — modern LLVM does not type pointers), `{ ... }` (a struct),
+`[N x T]` (an array).
+
+**Values.** `%name` is local to a function, `@name` is global. `%0`, `%1` are
+unnamed temporaries.
+
+**SSA.** Every value is assigned exactly once. That is why the emitter has a
+`temp_counter` and hands out a fresh `%N` for each intermediate — you cannot
+overwrite one.
+
+**Memory.** `alloca` reserves stack space and yields a pointer. `store` writes,
+`load` reads. Skunk gives every local an `alloca` and lets LLVM's `mem2reg` pass
+promote them into registers, which is the standard approach — it means the
+front end never has to construct SSA φ-nodes itself.
+
+**Control.** `br label %target` jumps; `br i1 %c, label %a, label %b` branches.
+Blocks are named by labels. This maps almost one-to-one onto MIR terminators,
+which is not a coincidence.
+
+**Calls.** `call i32 @f(i32 %x)`.
+
+**Addresses.** `getelementptr` computes a field or element address without
+loading it. You will see it constantly in `place.rs`, because it is exactly what
+a MIR `Place` projection lowers to.
+
+A short worked example — Skunk on the left, IR on the right in spirit:
+
+```llvm
+; function bump(mut self, amount: int): int
+define i32 @skunk_Counter_bump(ptr %self, i32 %amount) {
+entry:
+  %value.ptr = getelementptr inbounds %struct.Counter, ptr %self, i32 0, i32 0
+  %old       = load i32, ptr %value.ptr
+  %sum       = add i32 %old, %amount
+  store i32 %sum, ptr %value.ptr
+  ret i32 %sum
+}
+```
+
+Read that against the MIR at the end of Chapter 19 and the correspondence is
+direct: the place projection became `getelementptr`, the binary rvalue became
+`add`, the assignment became `store`.
+
+---
+
+# Chapter 22: Layouts
+
+## The question
+
+`struct Counter { value: int; }` — how many bytes, and what is at which offset?
+
+Layout is where language concepts become memory. It is the backend's first job,
+performed before any function body is emitted, because you cannot generate code
+that touches a value without knowing its shape.
+
+## `LlvmType`
+
+```rust
+// src/backend/mod.rs
+enum LlvmType {
+    I8, I16, I32, I64, F32, F64, Char16, I1, PtrI8,
+    Allocator, Arena, Window,
+    TraitObject(String),
+    TraitIntersection(Vec<String>),
+    Union(Vec<LlvmType>),
+    Struct(String),
+    Enum(String),
+    Reference { target_type: Box<LlvmType>, mutable: bool },
+    Pointer { target_type: Box<LlvmType> },
+    Function { parameters: Vec<LlvmType>, return_type: Box<LlvmType> },
+    Slice { elem_type: Box<LlvmType> },
+    Array { elem_type: Box<LlvmType>, len: usize },
+    Void,
+}
+```
+
+And its rendering:
+
+```rust
+// src/backend/mod.rs
+impl LlvmType {
+    fn ir(&self) -> String {
+        match self {
+            LlvmType::I32 => "i32".to_string(),
+            LlvmType::Reference { .. } => "ptr".to_string(),
+            LlvmType::Pointer { .. }   => "ptr".to_string(),
+            LlvmType::Function { .. }  => "{ ptr, ptr }".to_string(),
+            LlvmType::Slice { .. }     => "{ ptr, i32 }".to_string(),
+            LlvmType::Union(_)         => "{ i32, ptr }".to_string(),
+            LlvmType::Struct(name)     => format!("%struct.{}", sanitize_name(name)),
+            LlvmType::Enum(name)       => format!("%enum.{}", sanitize_name(name)),
+            LlvmType::Array { elem_type, len } => format!("[{} x {}]", len, elem_type.ir()),
+            // ...
+        }
+    }
+}
+```
+
+Read the interesting cases as design decisions.
+
+## Structs
+
+```rust
+// src/backend/mod.rs
+let _ = writeln!(ir, "%struct.{} = type {{ {} }}",
+    sanitize_name(&layout.name), field_types);
+```
+
+```mermaid
+flowchart LR
+    subgraph S["%struct.Counter = type { i32 }"]
+        F0["<b>value: i32</b><br/>offset 0"]
+    end
+
+    subgraph P["struct Point = type { i32, i32 }"]
+        P0["<b>x: i32</b><br/>offset 0"]
+        P1["<b>y: i32</b><br/>offset 4"]
+    end
+
+    style S fill:#E9F8F1,stroke:#40C98A
+```
+
+Fields in declaration order. Offsets are LLVM's problem; the backend never
+computes one by hand, it emits `getelementptr` with a field index and lets LLVM
+apply the target's alignment rules.
+
+## Enums
+
+```rust
+// src/backend/mod.rs
+for layout in enums.values() {
+    let mut field_types = vec!["i32".to_string()];        // the tag
+    for variant in &layout.variants {
+        for payload_type in &variant.payload_types {
+            field_types.push(payload_type.ir());          // every payload, flattened
+        }
+    }
+    let _ = writeln!(ir, "%enum.{} = type {{ {} }}",
+        sanitize_name(&layout.name), field_types.join(", "));
+}
+```
+
+This one deserves attention because it is deliberately naive.
+
+```mermaid
+flowchart TD
+    subgraph SRC["enum Shape { Circle(int); Rect(int, int); }"]
+        X[" "]
+    end
+
+    subgraph LAYOUT["%enum.Shape = type { i32, i32, i32, i32 }"]
+        T["<b>tag: i32</b><br/>0 = Circle, 1 = Rect"]
+        C["<b>Circle payload</b><br/>i32"]
+        R1["<b>Rect payload .0</b><br/>i32"]
+        R2["<b>Rect payload .1</b><br/>i32"]
+    end
+
+    SRC ==> LAYOUT
+
+    style LAYOUT fill:#FFF4E6,stroke:#D9822B
+```
+
+A tag followed by **every variant's payload concatenated** — not overlapped. A
+real implementation would union the payloads, sizing the enum to its largest
+variant. Skunk's version wastes space proportional to the number of variants.
+
+It is simple and correct, and it is an obvious optimisation opportunity if you
+are looking for a self-contained backend project.
+
+## Slices
+
+```rust
+LlvmType::Slice { .. } => "{ ptr, i32 }".to_string(),
+```
+
+A fat pointer: data pointer plus length. This is why `xs.len` is a `Length` node
+in HIR rather than a field access — it reads the second word of the pair, not a
+struct field.
+
+## Trait objects and vtables
+
+Dynamic dispatch needs runtime type information. Skunk uses the standard vtable
+arrangement.
+
+```mermaid
+flowchart LR
+    subgraph TO["trait object value<br/>%trait.Writer = { ptr, ptr }"]
+        D["<b>data</b><br/>→ the Counter"]
+        V["<b>vtable</b><br/>→ method table"]
+    end
+
+    subgraph VT["@skunk_vtable_Writer_Counter"]
+        M0["<b>slot 0</b> → @skunk_Counter_write"]
+        M1["<b>slot 1</b> → @skunk_Counter_flush"]
+    end
+
+    subgraph OBJ["the Counter"]
+        F["value: i32"]
+    end
+
+    V --> VT
+    D --> OBJ
+
+    style TO fill:#EAF3F7,stroke:#1F6F8B
+    style VT fill:#E9F8F1,stroke:#40C98A
+```
+
+The vtable is emitted as a constant global:
+
+```rust
+// src/backend/mod.rs
+globals.push(format!(
+    "@{} = private unnamed_addr constant %vtable.{} {{ {} }}",
+    vtable_symbol,
+    sanitize_name(trait_name),
+    entries.join(", ")
+));
+```
+
+One vtable per (trait, implementing type) pair, named
+`skunk_vtable_<Trait>_<Type>`. Method order in the vtable is the trait's
+declaration order, and calling through it is a `getelementptr` to the slot, a
+`load` of the function pointer, and an indirect `call` — which is exactly what
+`calls.rs` emits.
+
+Supertraits are flattened into the layout by `build_typed_trait_layout`, which
+also detects cycles in the supertrait graph and reports them rather than
+recursing forever.
+
+## Intersections
+
+`T: Writer & Resettable` produces a value satisfying two traits, and needs two
+vtables:
+
+```rust
+LlvmType::TraitIntersection(traits) => format!(
+    "{{ {} }}",
+    std::iter::repeat_n("ptr", traits.len() + 1)
+        .collect::<Vec<_>>()
+        .join(", ")
+),
+```
+
+`n + 1` pointers: the data pointer plus one vtable per trait. Coercing an
+intersection down to one of its traits — narrowing `Writer & Resettable` to
+`Writer` — is a projection that picks the data pointer and the right vtable
+slot. That is what `coercion.rs` is doing around line 303.
+
+## Closures
+
+```rust
+LlvmType::Function { .. } => "{ ptr, ptr }".to_string(),
+```
+
+Code pointer plus environment pointer. The environment is a generated struct
+`%env.N` holding the captured values, allocated at closure creation and passed as
+a hidden first parameter. `closure.rs` emits the `getelementptr` chains that
+read captures out of it.
+
+> **⚠ Seam.** All layout tables are keyed by `String`:
+> `HashMap<String, StructLayout>`. The front end went to considerable trouble to
+> replace names with `TypeId`, and the backend converts back at the boundary.
+> This also makes `sanitize_name` — which maps every non-alphanumeric character
+> to `_` — a collision risk: `Foo[Bar]` and `Foo_Bar_` produce the same symbol.
+
+---
+
+# Chapter 23: Code Generation
+
+## Structure
+
+```
+src/backend/
+├── mod.rs           layouts, signatures, module assembly, the clang driver
+├── emitter.rs       low-level IR emission helpers
+├── coercion.rs      representation conversions
+└── mir_codegen/
+    ├── mod.rs       statement dispatch
+    ├── value.rs     rvalues and operands
+    ├── place.rs     address computation, bounds checks
+    ├── calls.rs     static, dynamic, and intrinsic calls
+    ├── closure.rs   environments
+    ├── intrinsics.rs compiler-provided operations
+    └── support.rs   shared helpers
+```
+
+The split mirrors MIR's own vocabulary — places, values, calls — which makes
+"where does this belong?" usually answerable.
+
+## Module assembly
+
+`mod.rs` writes the module in a fixed order, and the order is forced by LLVM: a
+thing must be declared before it is used.
+
+```mermaid
+flowchart TD
+    A["1 · struct types<br/><code>%struct.Counter = type { i32 }</code>"]
+    B["2 · enum types<br/><code>%enum.Shape = type { i32, ... }</code>"]
+    C["3 · vtable globals<br/><code>@skunk_vtable_Writer_Counter</code>"]
+    D["4 · program globals"]
+    E["5 · extra type decls<br/><i>closure environments</i>"]
+    F["6 · string constants"]
+    G["7 · function bodies"]
+    H["8 · <code>define i32 @main()</code>"]
+
+    A --> B --> C --> D --> E --> F --> G --> H
+
+    style H fill:#E9F8F1,stroke:#40C98A
+```
+
+The C `main` is emitted last, wrapping the Skunk entry point so the program can
+be linked as an ordinary executable.
+
+## The function compiler
+
+```rust
+// src/backend/emitter.rs
+impl<'a> FunctionCompiler<'a> {
+    pub(super) fn new(
+        function_name: &'a str,
+        return_type: LlvmType,
+        dependencies: FunctionCompilerDependencies<'a>,
+    ) -> Self {
+        Self {
+            // ...
+            lines: Vec::new(),
+            temp_counter: 0,
+            label_counter: 0,
+        }
+    }
+}
+```
+
+`lines` accumulates the body; `temp_counter` hands out `%0`, `%1`, `%2` — the
+SSA requirement from Chapter 21 in practice.
+
+## Places become addresses
+
+A MIR `Place` — base plus projections — becomes a chain of `getelementptr`:
+
+```rust
+// src/backend/mir_codegen/place.rs
+self.emit_line(format!(
+    "{} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
+    result, aggregate_type, base_ptr, field_index
+));
+```
+
+Because each MIR `Projection` already records the type after it is applied
+(Chapter 18), this loop never has to compute an intermediate type. It walks and
+emits.
+
+## Bounds checks
+
+```rust
+// src/backend/mir_codegen/place.rs
+self.emit_index_bounds_check(&index, &length)?;
+```
+
+Every index projection emits a comparison and a conditional branch to a call into
+the runtime:
+
+```c
+// runtime/skunk_runtime.c
+void skunk_panic_index_out_of_bounds(int64_t index, int64_t length) {
+    fprintf(stderr, "panic: index %lld out of bounds for length %lld\n",
+            (long long)index, (long long)length);
+    fflush(stderr);
+    abort();
+}
+```
+
+Note the division of labour: the *check* is generated code, the *reporting* is a
+runtime function. Emitting the whole message inline at every index site would
+bloat the IR enormously.
+
+## Dynamic dispatch
+
+```rust
+// src/backend/mir_codegen/calls.rs
+self.emit_line(format!(
+    "{} = getelementptr inbounds %vtable.{}, ptr {}, i32 0, i32 {}",
+    slot_ptr, trait_name, vtable_ptr, method_index
+));
+```
+
+Extract the vtable pointer from the trait object, `getelementptr` to the method's
+slot, load the function pointer, call it indirectly. Three instructions and no
+name lookup — because HIR already decided this was `MethodTarget::Dynamic`.
+
+## Coercions
+
+`coercion.rs` implements the representation changes that MIR marked with
+`RvalueKind::Coerce`:
+
+| From | To | What happens |
+|---|---|---|
+| `i32` | `i64` | `sext` |
+| `i32` | `double` | `sitofp` |
+| `*Counter` | `Writer` | build `{ data, vtable }` |
+| `Writer & Resettable` | `Writer` | project data + one vtable |
+| array | slice | build `{ ptr, len }` |
+
+Every one is explicit because the front end marked it. The backend never guesses.
+
+---
+
+# Chapter 24: Linking and the Runtime
+
+## From IR to executable
+
+```rust
+// src/backend/mod.rs
+let mut command = Command::new("xcrun");
+command.args(["--sdk", "macosx", "clang"]);
+// ... or on Linux
+Command::new("clang")
+```
+
+Skunk writes a `.ll` file and shells out to `clang`, which runs LLVM's optimiser,
+generates machine code, and links. The error message when it is missing is
+explicit about the dependency:
+
+```rust
+// src/backend/mod.rs
+"failed to invoke clang while compiling {}: {}. \
+ Skunk needs clang installed (macOS: `xcode-select --install`, \
+ Linux: install the `clang` package)"
+```
+
+## The runtime
+
+Some things cannot reasonably be generated inline. They live in a small C
+runtime, compiled and linked alongside your program.
+
+```c
+// runtime/skunk_runtime.c — signatures, gathered for reference
+void  skunk_panic_index_out_of_bounds(int64_t index, int64_t length);
+void  skunk_panic_slice_range_out_of_bounds(int64_t start, int64_t end, int64_t length);
+
+void *skunk_system_allocator(void);
+void *skunk_arena_init(void *backing_allocator);
+void *skunk_arena_allocator(void *arena_ptr);
+void  skunk_arena_reset(void *arena_ptr);
+void  skunk_arena_deinit(void *arena_ptr);
+void *skunk_alloc_create(void *allocator_ptr, uint64_t size);
+void *skunk_alloc_buffer(void *allocator_ptr, uint64_t elem_size, int32_t len);
+void  skunk_alloc_destroy(void *allocator_ptr, void *memory);
+void  skunk_alloc_free(void *allocator_ptr, void *memory);
+
+void  skunk_test_begin(const char *name);
+void  skunk_test_expect(_Bool condition);
+int32_t skunk_test_summary(void);
+```
+
+Three groups: panics, memory management, and the test harness. There is a second
+runtime, `skunk_window_runtime.m`, in Objective-C, providing the macOS window and
+input support that `examples/pong.skunk` uses.
+
+## Allocators
+
+Skunk's memory model is explicit — allocation goes through an allocator value:
+
+```skunk
+heap: Allocator = System::allocator();
+counter: *Counter = Counter::create(heap);
+heap.destroy(counter);
+```
+
+An `Arena` is a second allocator that frees everything at once:
+
+```c
+// runtime/skunk_runtime.c
+typedef struct SkunkArenaNode {
+    void *memory;
+    struct SkunkArenaNode *next;
+} SkunkArenaNode;
+
+typedef struct SkunkArena {
+    SkunkArenaNode *head;
+    SkunkAllocator *allocator;
+} SkunkArena;
+```
+
+A linked list of allocations plus the backing allocator. `reset` walks the list
+and frees each node. This is a genuinely useful pattern for
+phase-oriented programs, and it is the reason `Allocator` and `Arena` are
+builtin types rather than library types — the backend needs to know their
+representation.
+
+## The runtime ships inside the compiler
+
+```rust
+// src/backend/mod.rs
+// The C runtime sources are embedded into the compiler binary so an installed
+// release does not depend on the source tree. They are materialized on demand
+// into `$SKUNK_HOME/runtime/<version>/` (default `~/.skunk`).
+const RUNTIME_C_SOURCE: &str = include_str!("../../runtime/skunk_runtime.c");
+```
+
+`include_str!` bakes the C source into the compiler at build time. On first use
+it is written to `~/.skunk/runtime/<version>/` and compiled. Versioning the
+directory means several Skunk versions coexist without fighting over runtime
+files.
+
+The materialisation is careful about concurrency — native tests run in parallel
+and would otherwise race:
+
+```rust
+// src/backend/mod.rs
+// ... embedded runtime. A process ID alone is therefore not enough to make the
+// staging path unique ...
+```
+
+Each write gets a sequence number and is renamed into place atomically. This is
+the kind of detail that produces flaky tests exactly once and then gets fixed
+permanently.
+
+---
+
+# Part VII — Working in the Codebase
+
+---
+
+# Chapter 25: Adding a Language Feature
+
+## The worked example
+
+Let us add a **modulo-assign operator**, `%=`, so that `x %= 3;` means
+`x = x % 3;`.
+
+It is small enough to hold in your head and large enough to touch the front end,
+the semantic layer, and lowering — which is exactly the point.
+
+```mermaid
+flowchart TD
+    G["<b>1 · grammar.pest</b><br/>parse <code>%=</code>"]
+    A["<b>2 · syntax/ast.rs</b><br/>represent it"]
+    P["<b>3 · syntax/parser.rs</b><br/>build the node"]
+    C["<b>4 · specialization/convert.rs</b><br/>both directions"]
+    K["<b>5 · analysis/check.rs</b><br/>type rule"]
+    H["<b>6 · hir/lower.rs + validate.rs</b><br/>lower and check"]
+    M["<b>7 · mir/lower + validate</b><br/>lower and check"]
+    B["<b>8 · backend</b><br/>emit"]
+    T["<b>9 · tests</b>"]
+
+    G --> A --> P --> C --> K --> H --> M --> B --> T
+
+    style G fill:#EAF3F7,stroke:#1F6F8B
+    style T fill:#E9F8F1,stroke:#40C98A
+```
+
+Nine steps. That count is the honest cost of a language feature in Skunk today,
+and Chapter 29 discusses why it is higher than it should be.
+
+## The shortcut worth knowing
+
+Before writing any of it: **can this be desugaring?**
+
+`x %= 3` means exactly `x = x % 3`. If the parser produces an ordinary
+`Assignment` whose value is a `Binary { left: x, operator: Modulo, right: 3 }`,
+then steps 4 through 8 vanish. The checker already types binary modulo. HIR
+lowering already handles assignment. The backend already emits `srem`.
+
+You would touch three files instead of nine.
+
+**Always ask whether a new feature can be expressed in terms of existing ones.**
+The best language features cost almost nothing downstream. Reach for a new IR
+node only when the construct genuinely has no equivalent — because it introduces
+control flow, or a new runtime representation, or a type rule that binary
+operators cannot express.
+
+Skunk already does this in places: `attach` and `conform` are normalised away in
+Chapter 8, so nothing after the front end knows they existed.
+
+For the rest of this chapter, assume `%=` is genuinely new, so we can see the
+full path.
+
+## Step 1 — Grammar
+
+```pest
+// src/syntax/grammar.pest — sketch, this feature does not exist
+mod_assign = { "%=" }
+assignment = { access ~ ("=" | mod_assign) ~ (lambda_expr | expression | func_call) }
+```
+
+**Watch the ordering.** If `"="` came first in that alternation, `%=` would never
+match — the `%` would fail earlier and the whole rule would backtrack oddly.
+Ordered choice, from Chapter 6, is unforgiving here.
+
+## Step 2 — AST
+
+```rust
+// src/syntax/ast.rs — sketch
+pub enum StmtKind {
+    // ...
+    Assignment { target: Expr, value: Expr },
+    CompoundAssignment {
+        target: Expr,
+        operator: BinaryOperator,
+        value: Expr,
+    },
+}
+```
+
+Adding a variant makes every `match` over `StmtKind` fail to compile. That list
+of errors *is* your to-do list. Do not add a catch-all arm to make it quiet.
+
+## Step 3 — Parser
+
+```rust
+// src/syntax/parser.rs — sketch
+Rule::assignment => {
+    let target = self.access(pairs.next().unwrap())?;
+    let operator = match pairs.peek().map(|p| p.as_rule()) {
+        Some(Rule::mod_assign) => { pairs.next(); Some(BinaryOperator::Modulo) }
+        _ => None,
+    };
+    let value = self.expression(pairs.next().unwrap())?;
+    let kind = match operator {
+        Some(operator) => StmtKind::CompoundAssignment { target, operator, value },
+        None => StmtKind::Assignment { target, value },
+    };
+    Ok(Stmt { id: self.next_id(), span, kind })
+}
+```
+
+Allocate a `NodeId`, attach a `Span`. Every node, every time.
+
+## Step 4 — The specialization round trip
+
+Both directions of `convert.rs`, and they must stay inverse:
+
+```rust
+// src/specialization/convert.rs — sketch, to_tree direction
+StmtKind::CompoundAssignment { target, operator, value } => Node::CompoundAssignment {
+    target: Box::new(self.expr(target)),
+    operator: convert_operator(*operator),
+    value: Box::new(self.expr(value)),
+},
+```
+
+...plus the matching `from_tree` arm and a new `Node` variant in `tree.rs`.
+
+This is the step that makes people sigh, and rightly so — it is pure mechanical
+duplication that exists only because of the seam in Chapter 11. If you find
+yourself here, you now understand why retiring that tree matters.
+
+## Step 5 — Type rule
+
+In `check.rs`, `resolve_type`:
+
+```rust
+Node::CompoundAssignment { target, operator, value } => {
+    let target_type = resolve_addressable_access_type(global_scope, symbol_tables, target)?;
+    assert_assignment_target_mutable(global_scope, symbol_tables, target)?;
+    let value_type = resolve_type(global_scope, symbol_tables, value, Some(&target_type))?;
+    let result = resolve_binary(operator, &target_type, &value_type.sk_type)?;
+    if !is_assignable(global_scope, &target_type, &result) {
+        return Err(format!("cannot assign `{}` to `{}`",
+            type_to_string(&result), type_to_string(&target_type)));
+    }
+    Ok(ResolveResult::new(Type::Void))
+}
+```
+
+Three checks, and each maps to a real user mistake: the target must be
+addressable (`5 %= 3` is nonsense), it must be mutable (`const` bindings), and
+the operator must accept the operand types (`"a" %= 1`).
+
+## Step 6 — HIR
+
+If you desugar here, HIR needs nothing new:
+
+```rust
+// src/hir/lower.rs — sketch
+syntax::StmtKind::CompoundAssignment { target, operator, value } => {
+    let target = self.lower_expr(target, None);
+    let value = self.lower_expr(value, Some(target.ty));
+    let combined = hir::Expr {
+        source: statement.id,
+        span: statement.span,
+        ty: target.ty,
+        kind: hir::ExprKind::Binary {
+            left: Box::new(self.clone_expr(&target)),
+            operator: *operator,
+            right: Box::new(value),
+        },
+    };
+    hir::StmtKind::Assignment { target, value: combined }
+}
+```
+
+**This is the right call**, and it is worth stating the principle: *desugar at the
+lowest phase that still has the information you need.* Here HIR has types and
+resolved targets, so it can build the `Binary` node correctly — and everything
+below HIR stays untouched. Steps 7 and 8 disappear.
+
+The one thing to be careful about is double evaluation. `xs[f()] %= 3` must call
+`f()` once. If the target has side effects, lower it to a temporary place first
+rather than duplicating the expression — which is exactly the kind of subtlety
+MIR's `Place` exists to express.
+
+## Step 9 — Tests
+
+Three levels, and you want all three:
+
+```rust
+// unit — the parser produces the right node
+#[test]
+fn parses_compound_assignment() { /* ... */ }
+
+// unit — the checker rejects bad programs
+#[test]
+fn rejects_compound_assignment_to_const() {
+    let source = r#"
+        function main(): void {
+            const x: int = 5;
+            x %= 3;
+        }
+    "#;
+    assert!(check(&ast::parse(source)).is_err());
+}
+
+// integration — it actually runs
+#[test]
+fn runs_compound_assignment() {
+    let stdout = compile_and_run(r#"
+        function main(): void {
+            x: int = 17;
+            x %= 5;
+            print(x);
+        }
+    "#).unwrap();
+    assert_eq!(stdout, "2\n");
+}
+```
+
+The integration test in `src/backend/tests.rs` is the one that proves the feature
+works end to end. Do not skip it.
+
+## The checklist
+
+```
+□ grammar.pest         — rule added, alternative ordering checked
+□ syntax/ast.rs        — node added
+□ syntax/parser.rs     — NodeId allocated, Span attached
+□ specialization/      — convert.rs BOTH directions, tree.rs variant
+□ analysis/check.rs    — type rule
+□ hir/                 — lower.rs, validate.rs
+□ mir/                 — lower/, validate/          (skip if desugared in HIR)
+□ backend/             — emission                    (skip if desugared)
+□ tests                — parser, checker, integration
+□ cargo test           — green
+□ examples/            — still compile
+```
+
+---
+
+# Chapter 26: Debugging Playbook
+
+## The one rule
+
+**Find the earliest representation that is wrong.**
+
+Every bug has a first phase where the data stops matching intent. Everything
+after that is a symptom. Debugging generated LLVM for a resolver bug is hours
+wasted.
+
+```bash
+cargo run -- --debug compile bug.skunk ./bug 2> trace.txt
+```
+
+Then walk the stages in order (the table is in Chapter 5) until one looks wrong.
+That stage owns the bug.
+
+## Symptom to phase
+
+| Symptom | Look at | Chapter |
+|---|---|---|
+| Syntax error on valid code | grammar alternative ordering | 6 |
+| Parses but groups wrongly | Pratt precedence table | 6 |
+| "unknown variable" for a real variable | resolver scopes | 13 |
+| Method not found on a type that has it | normalization, or method indexing in HIR lowering | 8, 16 |
+| Generic not instantiated | expansion discovery | 11 |
+| "type is not concrete" | sealing — expansion missed something | 17 |
+| Wrong type inferred for a literal | expected-type threading | 15 |
+| Wrong evaluation order | MIR lowering | 19 |
+| Wrong field read at runtime | layout or place projection | 22, 23 |
+| `clang` rejects the IR | emitter | 23 |
+| Segfault | layout mismatch, or a bad coercion | 22 |
+
+## Reading `--debug` output
+
+It is `{:#?}`, so it is verbose. Slice it:
+
+```bash
+# stage boundaries
+grep -n "skunk debug" trace.txt
+
+# just the HIR
+sed -n '/debug 09/,/debug 10/p' trace.txt
+
+# find every mention of a type
+grep -n "TypeId(14)" trace.txt | head
+```
+
+A useful trick: run the same program with and without your change and `diff` the
+traces. The first differing stage localises the change's effect immediately.
+
+## Bisecting by phase
+
+If you cannot tell which stage is wrong, cut the program down instead.
+
+1. Delete half the program. Does the bug survive?
+2. Repeat until you have the smallest reproducer.
+3. Now the `--debug` output is small enough to read line by line.
+
+Minimising is almost always faster than reading a large trace, and the minimal
+case becomes your regression test.
+
+## When LLVM rejects the IR
+
+`clang` reports a line in generated IR. To see it:
+
+```bash
+cargo run -- compile bug.skunk ./bug     # writes bug.ll next to the output
+```
+
+Read the offending line and work backwards to the emitter that produced that
+pattern. Common causes, in rough order of frequency:
+
+- **Type mismatch in an operand** — usually a missing `Coerce` in MIR lowering,
+  or a coercion rule that does not handle a case.
+- **Using a value before its definition** — SSA violation; a temporary was
+  reused.
+- **Wrong argument count** — a signature computed differently in two places.
+- **Undefined symbol** — name mangling disagreement between declaration and use.
+
+That last one is worth a warning: `sanitize_name` maps every non-alphanumeric
+character to `_`, so two different Skunk names can collide into one LLVM symbol.
+If a call goes somewhere impossible, check for a mangling collision.
+
+## When a test fails only in parallel
+
+The runtime materialisation described in Chapter 24 had exactly this bug once.
+If you see flakiness only under `cargo test` and never with
+`--test-threads=1`, look for shared filesystem paths — `~/.skunk/runtime/` is
+the usual suspect.
+
+## Assertions as debugging tools
+
+The HIR and MIR validators are debugging instruments, not just gates. If you
+suspect a lowering rule is producing malformed output, the validator will
+usually tell you precisely what — before the backend turns it into something
+inscrutable. Run with `--debug` and watch for validation diagnostics between
+stages.
+
+---
+
+# Chapter 27: Testing
+
+## What exists
+
+266 tests, distributed unevenly:
+
+| Location | Count | Kind |
+|---|---|---|
+| `src/backend/tests.rs` | 104 | Native integration — compile, run, assert stdout |
+| `src/analysis/check.rs` | 51 | Type checker, mostly `assert!(..is_err())` |
+| `src/specialization/expand/tests.rs` | 19 | Generic expansion |
+| `src/main.rs` | 15 | CLI parsing |
+| `src/mir/tests/` | 36 | MIR lowering, by area |
+| `src/analysis/intrinsic_calls.rs` | 9 | Intrinsic signature validation |
+| `src/intrinsics.rs` | 4 | Signature tables |
+| everything else | 28 | Scattered |
+
+## Native integration tests
+
+The backbone. Each compiles a whole program and runs it:
+
+```rust
+// src/backend/tests.rs
+#[test]
+fn runs_compiled_trait_bound_program() {
+    let stdout = compile_and_run(r#"
+        trait Writer    { function write(mut self, value: int): int; }
+        trait Resettable { function reset(mut self): void; }
+
+        struct Counter { value: int; }
+
+        conform Writer for Counter {
+            function write(mut self, value: int): int {
+                self.value = self.value + value;
+                return self.value;
+            }
+        }
+
+        conform Resettable for Counter {
+            function reset(mut self): void { self.value = 0; }
+        }
+
+        function use_counter[T: Writer & Resettable](counter: *T): int {
+            counter.reset();
+            return counter.write(41);
+        }
+
+        function main(): void {
+            heap: Allocator = System::allocator();
+            counter: *Counter = Counter::create(heap);
+            counter.value = 9;
+            print(use_counter(counter));
+            heap.destroy(counter);
+        }
+    "#).unwrap();
+
+    assert_eq!(stdout, "41\n");
+}
+```
+
+These are slow — each spawns `clang` — but they test the thing that actually
+matters: does the program mean what it should? When you change anything in the
+middle of the compiler, these are your safety net.
+
+## Where the coverage is thin
+
+Worth knowing before you trust the suite.
+
+**`hir/lower.rs` has 2 tests across 1,514 lines.** It is one of the most
+consequential files in the compiler.
+
+**`specialization/convert.rs` has 1 test across 1,729 lines.** Mechanical
+translation code is exactly where silent information loss hides.
+
+**The 51 checker tests assert only `.is_err()`.** They confirm a program was
+rejected, never *why*. So a test named `test_struct_field_not_exist` passes even
+if the program is rejected for a completely unrelated reason.
+
+```rust
+// src/analysis/check.rs — the prevailing shape
+#[test]
+fn test_struct_field_not_exist() {
+    let source_code = r#"
+        struct Point { x: int; y: int; }
+        p: Point = Point { x: 0, y: 0 };
+        a = p.z;
+    "#;
+    let program = ast::parse(source_code);
+    assert!(check(&program).is_err());
+}
+```
+
+The consequence: the checker has 113 error sites and 51 tests that cannot
+distinguish between them. If a rule were accidentally deleted, the suite would
+very likely stay green.
+
+## How to test well here
+
+**Assert on the specific error, not just failure.** If the checker gains error
+codes (Chapter 29), assert on the code. Until then, at minimum assert on a
+distinctive substring.
+
+**Test the phase, not the pipeline, when you can.** A unit test on
+`mir::lower` that builds HIR directly is faster and localises failure better than
+a full compile. `src/mir/tests/` shows the pattern.
+
+**Add an integration test for anything user-visible.** If a Skunk programmer
+could notice it, `src/backend/tests.rs` should contain a program that
+demonstrates it.
+
+**Keep the examples compiling.** `examples/*.skunk` are a de-facto test suite.
+`examples/pong.skunk` is the only exercise of the Window/Color/Keyboard surface;
+`examples/c_interop.skunk` is the only exercise of `Memory`, `Bounds`, and
+pointer `cast`/`offset` under `unsafe`.
+
+## Language-level tests
+
+Skunk has its own test blocks, run by `skunk test`:
+
+```skunk
+test "bump adds to the counter" {
+    counter: Counter = Counter::new(41);
+    Testing::expect_eq(42, counter.bump(1));
+}
+```
+
+`src/testing.rs` transforms these into ordinary functions and generates an entry
+point that runs them. Notably, the test prelude is *parsed like ordinary source*:
+
+```rust
+// src/testing.rs
+//! Test declarations are transformed within the canonical syntax AST. The
+//! runtime prelude and generated entry point are parsed like ordinary source,
+//! so test compilation follows the same front-end path as user programs.
+```
+
+Which means the test harness cannot drift from the language — it is built from
+it.
+
+---
+
+# Chapter 28: A Model Extension — The Intrinsic Table
+
+This chapter is a case study. It is the most recent significant change to the
+compiler, and it is a template for how the rest of the legacy checker should be
+dismantled.
+
+## The problem
+
+`Window::create`, `Memory::copy`, `Color::rgb`, `Keyboard::is_down` and friends
+are compiler-provided methods. Until recently, each was validated by hand in
+`check.rs`:
+
+```rust
+// src/analysis/check.rs — the old shape, ×49
+Type::Custom(custom_name) if custom_name == "Window" => {
+    if name != "create" {
+        return Err(format!("error {}:{}: Window does not support static method `{}`",
+            metadata.span.line, metadata.span.start, name));
+    }
+    if arguments.len() != 3 {
+        return Err(format!("error {}:{}: Window::create expects width, height, and title",
+            metadata.span.line, metadata.span.start));
+    }
+    let width = resolve_type(global_scope, symbol_tables, &arguments[0], Some(&Type::Int))?;
+    if !is_integral_type(&width.sk_type) {
+        return Err(format!("error {}:{}: Window::create width must be an integer",
+            metadata.span.line, metadata.span.start));
+    }
+    // ... height, then title, then the return type
+}
+```
+
+Forty-nine of these. Roughly 600 lines. Every one is the same rule — *check a
+call against a fixed signature* — written out longhand.
+
+The tell was in the error messages themselves. `Window::create width must be an
+integer`, `Bounds::check arguments must be integers`, `Color::rgb arguments must
+be integers` — the same sentence, forty-nine times, with the nouns changed.
+
+## The fix
+
+Describe the signatures as data:
+
+```rust
+// src/intrinsics.rs
+pub struct Signature {
+    pub receiver: Recv,
+    pub name: &'static str,
+    pub params: &'static [TyPat],
+    pub returns: Ret,
+    pub requires_unsafe: bool,
+    pub constraint: Option<RecvConstraint>,
+}
+
+pub const STATIC_METHODS: &[Signature] = &[
+    sig(Recv::Any,      "size_of",   &[],                                    Ret::Int),
+    sig(Recv::System,   "allocator", &[],                                    Ret::Allocator),
+    sig(Recv::Window,   "create",    &[TyPat::IntLike, TyPat::IntLike, TyPat::Str], Ret::Window),
+    sig(Recv::Color,    "rgb",       &[TyPat::IntLike, TyPat::IntLike, TyPat::IntLike], Ret::Color),
+    sig(Recv::Keyboard, "is_down",   &[TyPat::Window, TyPat::Char],          Ret::Bool),
+    unsafe_sig(Recv::Memory, "copy",
+        &[TyPat::PointerLike, TyPat::PointerLike, TyPat::IntLike], Ret::Void),
+    // ...
+];
+```
+
+Forty-nine hand-written checks became thirty declarative rows and one validator.
+
+```mermaid
+flowchart LR
+    subgraph OLD["Before"]
+        O["49 match arms<br/>~600 lines<br/>0 unit tests"]
+    end
+    subgraph NEW["After"]
+        T["30 table rows<br/><code>intrinsics.rs</code>"]
+        V["1 validator<br/><code>intrinsic_calls.rs</code>"]
+        U["13 unit tests"]
+    end
+    OLD ==> NEW
+
+    style OLD fill:#FFF4E6,stroke:#D9822B
+    style NEW fill:#E9F8F1,stroke:#40C98A
+```
+
+## The design decision that matters
+
+`TyPat` binds together two things that must never drift apart: the
+*expected-type hint* passed to argument resolution, and the *predicate* the
+resolved type must satisfy.
+
+```rust
+// src/intrinsics.rs
+pub enum TyPat {
+    /// Hints `int`; accepts any integral type.
+    IntLike,
+    /// Hints `byte`; accepts any integral type.
+    ByteLike,
+    /// Hints `double`; accepts any numeric type.
+    NumberLike,
+    /// No hint; accepts a pointer or a reference.
+    PointerLike,
+    /// No hint; requires a pointer specifically, not a reference.
+    StrictPointer,
+    // ...
+}
+```
+
+The old code got this pairing right at every site, but *invisibly* — you had to
+read both the `Some(&Type::Byte)` hint and the `is_integral_type` check to see
+the rule. `Memory::set` hints `byte` but accepts any integral. `draw_rect` hints
+`double` but accepts any numeric. `Allocator.destroy` requires a pointer and
+rejects a reference, while `Memory::copy` accepts either.
+
+Encoding hint and predicate as one indivisible unit means the two cannot be
+changed independently by accident.
+
+## Representation independence
+
+The tables name types in an abstract vocabulary — `IntLike`, `PointerLike` — not
+in `tree::Type`. A thin adapter maps the current representation onto it:
+
+```rust
+// src/analysis/intrinsic_calls.rs
+//! The signatures themselves live in [`crate::intrinsics`] and are described in
+//! a representation-independent vocabulary. This module is the adapter that
+//! maps the transitional `specialization::tree` type representation onto that
+//! vocabulary, and it is the only part that must be rewritten when the checker
+//! moves to the `SemanticModel`/HIR path — the tables carry over unchanged.
+```
+
+This is the part worth copying. When `check.rs` is retired, the ~200-line adapter
+is rewritten and the tables survive untouched. The work is not thrown away.
+
+## Testability
+
+The validator takes its argument resolution through a trait:
+
+```rust
+// src/analysis/intrinsic_calls.rs
+pub(crate) trait IntrinsicCtx {
+    fn resolve(&mut self, node: &Node, hint: Option<&Type>) -> Result<Type, String>;
+    fn is_assignable(&self, expected: &Type, actual: &Type) -> bool;
+    fn in_unsafe_block(&self) -> bool;
+}
+```
+
+So it can be unit tested against a stub, with no parser, no scopes, no pipeline:
+
+```rust
+#[test]
+fn rejects_wrong_argument_type() {
+    let signature = intrinsics::static_method(Recv::Keyboard, "is_down").unwrap();
+    let error = check_call(
+        signature,
+        &Type::Custom("Keyboard".to_string()),
+        &args(2),
+        &mut context(vec![Type::Custom("Window".to_string()), Type::Int]),
+    ).unwrap_err();
+    assert!(error.contains("argument 2 expects a char"));
+}
+```
+
+Thirteen such tests, on a surface that previously had zero. This is the general
+lesson: **inverting a dependency into a trait is what makes a phase testable in
+isolation.** Most of `check.rs` is untestable precisely because it takes a
+`GlobalScope` and a `SymbolTables` and calls the 859-line `resolve_type`.
+
+## Preserving behaviour
+
+One subtlety worth studying. The old code had a permissive hole: static calls on
+primitives, `Allocator`, and pointers fell through to
+
+```rust
+Type::Void => {}
+Type::Int  => {}
+Type::Allocator => {}
+Type::Pointer { .. } => {}
+// ...
+```
+
+and returned the receiver type — so `int::whatever()` type-checks today.
+
+A strict table rejects that. Correct, but it could break programs that currently
+compile. So the wiring deliberately preserves the fall-through:
+
+```rust
+// src/analysis/check.rs
+// A receiver with no table entry, or a method the receiver does not
+// declare, deliberately falls through to the permissive behavior
+// below: static calls on primitives, `Allocator`, and pointers
+// currently accept any method name and return the receiver type.
+// Tightening that is a separate change with its own tests.
+```
+
+**Separate a refactoring from a behaviour change.** If both land in one commit
+and something breaks, you cannot tell which caused it. This is the single most
+useful habit when working in a compiler.
+
+## The result
+
+| Metric | Before | After |
+|---|---|---|
+| Intrinsic error sites in `check.rs` | 49 | ~4 |
+| `check.rs` total lines | 4,204 | 3,847 |
+| `resolve_type` lines | 1,248 | 859 |
+| Error sites in `check.rs` | 179 | 113 |
+| Unit tests on intrinsic validation | 0 | 13 |
+| Cost of adding an intrinsic | a match arm + arity + per-arg checks | one table row |
+
+Note that total codebase size *grew* by about 450 lines. Deleting 414 lines of
+repetitive logic and adding a table, a validator, and thirteen tests is not a
+line-count win. It is a comprehensibility and extensibility win, which is the
+one worth having.
+
+---
+
+# Chapter 29: Known Seams and Where This Is Going
+
+An honest map of the compiler's debt, so you can tell stable ground from
+transitional.
+
+## The seams
+
+```mermaid
+flowchart TD
+    S1["<b>1 · check.rs outside the typed pipeline</b><br/>3,847 lines · string-keyed · no spans<br/><i>Owns most type rules</i>"]
+    S2["<b>2 · The specialization round trip</b><br/>convert.rs 1,729 lines<br/><i>A second AST, string-based</i>"]
+    S3["<b>3 · Name-keyed backend</b><br/><code>HashMap&lt;String, StructLayout&gt;</code><br/><i>Discards TypeId at the boundary</i>"]
+    S4["<b>4 · Two error systems</b><br/>162 <code>Result&lt;_, String&gt;</code> vs 86 Diagnostic"]
+    S5["<b>5 · No backend abstraction</b><br/>IR emitted via <code>format!</code><br/><i>No seam for a second target</i>"]
+
+    S2 -->|"causes"| S1
+    S1 -->|"causes"| S4
+    S3 -->|"causes"| S4
+
+    style S1 fill:#FFF4E6,stroke:#D9822B
+    style S2 fill:#FFF4E6,stroke:#D9822B
+```
+
+Note the arrows. These are not independent. `check.rs` exists *because* the
+specialization tree exists — its whole job is checking that tree. Retiring one
+without the other is possible but leaves the harder half in place.
+
+## Seam 1 — the legacy checker
+
+**What.** `src/analysis/check.rs`, 3,847 lines, one 859-line function.
+String-keyed symbol tables. Returns `Result<(), String>`.
+
+**Cost.** Type errors — the most common thing a user hits — have no source
+locations for roughly two thirds of sites. Type rules are duplicated: `check.rs`
+has `resolve_add`, `resolve_cmp`; `hir/lower.rs` has `binary_result`.
+
+**Fix.** Move the rules onto the `SemanticModel`/HIR path.
+
+**Prerequisite.** The 51 existing tests assert only `.is_err()`. Migrating 113
+error sites with no test able to distinguish them is how you silently drop a
+rule. The test net comes first: error codes on every site, assertions on the
+code, then a dual-run harness comparing old and new checkers. `dev-docs/` has the
+detailed plan.
+
+## Seam 2 — the specialization round trip
+
+**What.** AST → `tree::Node` → AST, with 1,729 lines of conversion.
+
+**Cost.** Every AST change is duplicated in `convert.rs`. Only 8 of 44 node
+variants carry a span. `tree::Span` embeds a full copy of the source text.
+
+**Fix.** Expand generics *after* type analysis, on typed HIR. Then `tree.rs`,
+`convert.rs`, and `check.rs` all disappear together — roughly 4,000 lines.
+
+**Why it is not scheduled.** It is a large change to a working compiler, and it
+requires generic expansion to reason about `TypeId`s rather than string
+substitution — closer to how Rust does it, and substantially more machinery.
+
+## Seam 3 — the name-keyed backend
+
+**What.** All layout tables are `HashMap<String, _>`.
+
+**Cost.** The front end's type safety is discarded at the last boundary.
+`sanitize_name` maps non-alphanumerics to `_`, so `Foo[Bar]` and `Foo_Bar_`
+collide into one symbol.
+
+**Fix.** Key the backend on `TypeId`. Independent of seams 1 and 2, and lower
+risk than either, because the failure mode is a compile error or a test failure
+rather than a silently missing rule.
+
+## Seam 4 — two error systems
+
+**What.** 162 `Result<_, String>` sites versus 86 `Diagnostic` sites. The entire
+backend is String-only.
+
+**Fix.** Mechanical, once seam 1 is underway. `Diagnostic` is well built and
+underused.
+
+## Seam 5 — no backend abstraction
+
+**What.** LLVM IR is produced by `format!` calls scattered through
+`emitter.rs` and `mir_codegen/`.
+
+**Cost.** A second target is not reachable without rewriting `backend/`.
+
+**Fix.** An IR-builder abstraction behind `emitter.rs`. **Do seam 3 first** —
+designing a backend interface while it still speaks `String` would bake the wrong
+vocabulary into the thing you are trying to make swappable.
+
+## Sequencing
+
+```mermaid
+flowchart TD
+    A["<b>Done</b><br/>Intrinsic signature table<br/><i>Ch 28</i>"]
+    B["<b>Next — independent, low risk</b><br/>Seam 3: backend on TypeId<br/>Seam 4: Diagnostic everywhere"]
+    C["<b>Then</b><br/>Seam 5: IR-builder abstraction"]
+    D["<b>Prerequisite</b><br/>Test net: error codes + dual-run harness"]
+    E["<b>The big one</b><br/>Seams 1 + 2 together<br/><i>~4,000 lines deleted</i>"]
+
+    A --> B --> C
+    A --> D --> E
+
+    style A fill:#E9F8F1,stroke:#40C98A
+    style E fill:#FFF4E6,stroke:#D9822B
+```
+
+The backend work (seams 3, 4, 5) is independent of the checker work and carries
+much less risk. The checker work needs its safety net built first.
+
+## What this means for you
+
+**Trust:** `ids.rs`, `source_map.rs`, `diagnostic.rs`, `syntax/ast.rs`,
+`analysis/types.rs`, `analysis/model.rs`, `hir/`, `mir/`, `intrinsics.rs`. These
+are the stable core, and new code should look like them.
+
+**Be careful in:** `analysis/check.rs`, `specialization/`, `backend/`. They work,
+they are load-bearing, and they follow older conventions.
+
+**Never do:** add a new phase that consumes `tree::Node`; extend `tree::Span`;
+add a new `Result<_, String>` error path; key a new map on a type's name.
+
+---
+
+# Appendix A: Glossary
+
+**AST** — Abstract Syntax Tree. A tree mirroring the structure of source code.
+Skunk's is `syntax::ast::Module`.
+
+**Arena** — An allocator that frees everything at once rather than
+per-allocation. A builtin type in Skunk.
+
+**Basic block** — A straight-line statement sequence with one entry and one
+terminator. The unit of a control-flow graph.
+
+**Bidirectional checking** — Type checking that propagates an expected type
+downward while inferring actual types upward. Skunk threads this as
+`expected_type_opt`.
+
+**Bound** — A constraint on a generic parameter, e.g. `T: Writer`.
+
+**CFG** — Control-Flow Graph. Basic blocks as nodes, branches as edges.
+
+**Coercion** — An approved representation change, e.g. `i32` → `i64`, or a
+concrete type to a trait object. Explicit in MIR as `RvalueKind::Coerce`.
+
+**DefId** — Identity of a declaration.
+
+**Desugaring** — Expressing a surface construct in terms of simpler existing
+ones, so later phases need no new cases.
+
+**Diverging** — An expression that never produces a value. Typed `Never`.
+
+**Fat pointer** — A pointer plus extra data in one value. Skunk slices are
+`{ ptr, i32 }`; trait objects are `{ data, vtable }`.
+
+**getelementptr** — The LLVM instruction that computes a field or element address
+without loading it.
+
+**HIR** — High-level Intermediate Representation. Resolved and typed, still
+source-shaped.
+
+**Interning** — Storing one canonical copy of each distinct value so equality
+becomes identity. Skunk interns types in `TypeStore`.
+
+**Intrinsic** — A compiler-provided type or method, e.g. `Window`, `Memory::copy`.
+
+**Lowering** — Converting a higher-level IR to a lower-level one.
+
+**MIR** — Mid-level Intermediate Representation. Explicit control flow, places,
+operands.
+
+**Monomorphization** — Generating a separate concrete copy of generic code per
+instantiation.
+
+**Normalization** — Collapsing several surface forms into one canonical shape.
+
+**Operand** — A value that can be consumed: a copy from a place, or a constant.
+
+**Place** — An addressable location: a base plus projections.
+
+**Projection** — One step in a place: a field, an index, a dereference.
+
+**Rvalue** — A computation producing a value.
+
+**Sealing** — Verifying that no runtime-facing type still mentions a generic
+parameter.
+
+**Shape** — A structural constraint. Any type with matching methods satisfies it,
+with no declaration required. Compile-time only.
+
+**Span** — A byte range in a source file.
+
+**SSA** — Static Single Assignment. Every value assigned exactly once. LLVM
+requires it; MIR deliberately stops short of it.
+
+**Trait** — A nominal interface requiring an explicit `conform`. Can be used as a
+trait object.
+
+**Vtable** — A table of function pointers enabling dynamic dispatch.
+
+---
+
+# Appendix B: File Map
+
+| Path | Lines | Role | Stability |
+|---|---|---|---|
+| `src/lib.rs` | 22 | Crate root | stable |
+| `src/main.rs` | 787 | CLI | stable |
+| `src/pipeline.rs` | 212 | **Phase ordering — start here** | stable |
+| `src/ids.rs` | 81 | ID newtypes | stable |
+| `src/source_map.rs` | 157 | Files and spans | stable |
+| `src/diagnostic.rs` | 151 | Structured errors | stable |
+| `src/intrinsics.rs` | 443 | Intrinsic types **and signature tables** | stable |
+| `src/manifest.rs` | 243 | `skunk.toml` | stable |
+| `src/testing.rs` | 202 | `skunk test` harness | stable |
+| `src/sdk.rs` | — | Toolchain management | stable |
+| `src/syntax/grammar.pest` | 178 | **The grammar** | stable |
+| `src/syntax/parser.rs` | 1,889 | Pest tree → AST | stable |
+| `src/syntax/ast.rs` | 464 | **The AST** | stable |
+| `src/syntax/normalize.rs` | 306 | attach/conform collapse | stable |
+| `src/syntax/loader.rs` | 872 | Imports, mangling | ⚠ mangling is fragile |
+| `src/specialization/tree.rs` | 610 | Transitional AST | ⚠ seam 2 |
+| `src/specialization/convert.rs` | 1,729 | AST ↔ tree | ⚠ seam 2 |
+| `src/specialization/expand/` | ~5,970 | Monomorphization | ⚠ seam 2 |
+| `src/specialization/mod.rs` | 185 | Sealing | stable |
+| `src/analysis/resolver.rs` | 892 | Name resolution | stable |
+| `src/analysis/types.rs` | 144 | `TypeStore`, `TypeKind` | stable |
+| `src/analysis/model.rs` | 661 | `SemanticModel` | stable |
+| `src/analysis/check.rs` | 3,847 | Legacy type checker | ⚠ seam 1 |
+| `src/analysis/intrinsic_calls.rs` | 407 | Intrinsic validator | stable |
+| `src/hir/mod.rs` | 294 | **HIR definition** | stable |
+| `src/hir/lower.rs` | 1,514 | AST → HIR | stable · thin tests |
+| `src/hir/validate.rs` | 485 | HIR invariants | stable |
+| `src/mir/mod.rs` | 349 | **MIR definition** | stable |
+| `src/mir/lower/` | ~1,930 | HIR → MIR | stable |
+| `src/mir/validate/` | ~1,775 | MIR invariants | stable |
+| `src/backend/mod.rs` | 1,400 | Layouts, assembly, clang | ⚠ seams 3, 5 |
+| `src/backend/emitter.rs` | 551 | IR emission | ⚠ seam 5 |
+| `src/backend/coercion.rs` | 447 | Representation changes | ⚠ seam 3 |
+| `src/backend/mir_codegen/` | ~2,100 | Instruction selection | ⚠ seam 3 |
+| `runtime/skunk_runtime.c` | — | Panics, allocators, tests | stable |
+| `runtime/skunk_window_runtime.m` | — | macOS window/input | stable |
+
+---
+
+# Appendix C: Quick Reference
+
+## The pipeline
+
+```
+source → Pest → AST → normalize → load
+       → tree → expand → check
+       → resolve → model → HIR → validate → seal
+       → MIR → validate
+       → layouts → LLVM IR → clang → binary
+```
+
+## The IDs
+
+| ID | Identifies | Allocated by |
+|---|---|---|
+| `FileId` | source file | `SourceMap` |
+| `NodeId` | syntax node (file ⊕ index) | parser |
+| `DefId` | declaration | resolver |
+| `LocalId` | local or parameter | resolver |
+| `FieldId` | struct field | resolver |
+| `VariantId` | enum variant | resolver |
+| `TypeId` | semantic type | `TypeStore` (interned) |
+| `MirLocalId` | MIR slot | `mir::lower` |
+| `MirBlockId` | MIR block | `mir::lower` |
+
+## Which phase owns what
+
+| Question | Phase |
+|---|---|
+| Does this match the grammar? | parser |
+| What node produced this? | AST |
+| How are attach/conform unified? | normalization |
+| Which imported private name is this? | loader |
+| What concrete types does `Box[int]` need? | specialization |
+| Which declaration does `Point` name? | resolver |
+| What is the full type of `&mut Point`? | model |
+| Is this well typed? | check + HIR lowering |
+| In what order do subexpressions run? | MIR lowering |
+| Is this a local, field, index, or deref? | MIR `Place` |
+| How is a trait object laid out? | backend |
+| How does out-of-bounds terminate? | backend + runtime |
+
+## Commands
+
+```bash
+cargo build
+cargo run -- compile f.skunk ./out && ./out
+cargo run -- run f.skunk
+cargo run -- test f.skunk --filter name
+cargo run -- --debug compile f.skunk ./out 2> trace.txt
+cargo test
+cargo test --lib backend
+```
+
+## Debug stages
+
+| # | Phase | Representation |
+|---|---|---|
+| 01 | source loading | syntax AST |
+| 02 | syntax normalization | syntax AST |
+| 03 | pre-expansion resolution | resolution tables |
+| 04 | specialization conversion | expansion tree |
+| 05 | generic specialization | specialized tree |
+| 06 | specialization conversion | specialized AST |
+| 07 | post-expansion resolution | resolution tables |
+| 08 | semantic analysis | semantic model |
+| 09 | HIR lowering | typed HIR |
+| 10 | specialization seal | metadata |
+| 11 | MIR lowering | MIR |
+| 12 | LLVM lowering | LLVM IR |
+
+## Feature checklist
+
+```
+□ grammar.pest      □ ast.rs         □ parser.rs
+□ convert.rs ×2     □ check.rs       □ hir/ lower + validate
+□ mir/ lower + validate              □ backend/
+□ unit + integration tests           □ examples still compile
+```
+
+**Before all of it: can this be desugaring?** If yes, you touch three files
+instead of nine.
+</script>
